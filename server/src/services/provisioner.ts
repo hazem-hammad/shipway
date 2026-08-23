@@ -15,6 +15,7 @@ import { getSetting } from '../db/settings.js';
 import type { SysOps } from '../sysops/types.js';
 import { assertSlug, renderAppUnit, renderNginxVhost, unitNames } from '../system/templates.js';
 import type { DnsClient } from './cloudflare.js';
+import { syncCrontab } from './cron.js';
 
 export interface ProvisionDeps {
   db: ShipwayDb;
@@ -257,10 +258,11 @@ export async function refreshProjectConfig(deps: ProvisionDeps, projectId: numbe
 
 /**
  * Best-effort teardown of everything `provisionProject` may have created, then deletes the project
- * row (its `deployments` rows cascade via the FK). Each step is attempted independently — a failure
- * in one (e.g. nginx already reloaded out from under us) does not stop the rest from running, so a
- * partially-broken host state never blocks the user from deleting the project. Silently returns if
- * the project no longer exists.
+ * row (its `deployments`/`cron_jobs` rows cascade via the FK) and resyncs the host crontab so any
+ * cron entries belonging to the now-deleted project are removed rather than left orphaned. Each step
+ * is attempted independently — a failure in one (e.g. nginx already reloaded out from under us) does
+ * not stop the rest from running, so a partially-broken host state never blocks the user from
+ * deleting the project. Silently returns if the project no longer exists.
  */
 export async function deprovisionProject(deps: ProvisionDeps, projectId: number): Promise<void> {
   const project = deps.db.select().from(projects).where(eq(projects.id, projectId)).get();
@@ -308,4 +310,8 @@ export async function deprovisionProject(deps: ProvisionDeps, projectId: number)
   });
 
   deps.db.delete(projects).where(eq(projects.id, projectId)).run();
+
+  // `cron_jobs` rows for this project just cascaded away with the delete above; resync the host
+  // crontab (best-effort, like every other step here) so its entries don't linger orphaned.
+  await attempt(() => syncCrontab(deps));
 }

@@ -394,6 +394,27 @@ describe('renderCrontabSection', () => {
     ];
     expect(() => renderCrontabSection(lines)).toThrow();
   });
+
+  it('escapes literal % in the command as \\%, since crontab treats an unescaped % as a newline/stdin separator', () => {
+    const lines: CronLine[] = [
+      {
+        id: 1,
+        slug: 'blog',
+        appsDir: '/var/deploy/apps',
+        logsDir: '/var/deploy/logs',
+        schedule: '* * * * *',
+        command: 'date +%Y%m%d',
+      },
+    ];
+    const out = renderCrontabSection(lines);
+    expect(out).toBe(
+      [
+        MARKER_START,
+        '* * * * * cd /var/deploy/apps/blog/current && date +\\%Y\\%m\\%d >> /var/deploy/logs/blog/cron-1.log 2>&1',
+        MARKER_END,
+      ].join('\n'),
+    );
+  });
 });
 
 describe('mergeCrontab', () => {

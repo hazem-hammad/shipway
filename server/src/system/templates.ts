@@ -282,12 +282,22 @@ export interface CronLine {
 const MARKER_START = '# >>> shipway managed >>>';
 const MARKER_END = '# <<< shipway managed <<<';
 
+/**
+ * A real crontab treats an unescaped `%` in a command as a newline — everything after it becomes
+ * stdin for the command instead of part of the command line — so every literal `%` must be escaped
+ * as `\%` when rendering. The DB always stores the command unescaped (as the user wrote it); this
+ * escaping happens only here, at render time.
+ */
+function escapeCronPercent(command: string): string {
+  return command.replace(/%/g, '\\%');
+}
+
 function renderCronLine(line: CronLine): string {
   assertSlug(line.slug);
   assertCronId(line.id);
   assertNoNewlines(line.schedule, 'schedule');
   assertNoNewlines(line.command, 'command');
-  return `${line.schedule} cd ${line.appsDir}/${line.slug}/current && ${line.command} >> ${line.logsDir}/${line.slug}/cron-${line.id}.log 2>&1`;
+  return `${line.schedule} cd ${line.appsDir}/${line.slug}/current && ${escapeCronPercent(line.command)} >> ${line.logsDir}/${line.slug}/cron-${line.id}.log 2>&1`;
 }
 
 /**

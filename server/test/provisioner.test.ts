@@ -5,10 +5,11 @@ import * as path from 'node:path';
 import { eq } from 'drizzle-orm';
 import { openDb, type ShipwayDb } from '../src/db/index.js';
 import { setSetting } from '../src/db/settings.js';
-import { projects } from '../src/db/schema.js';
+import { cronJobs, projects } from '../src/db/schema.js';
 import { loadConfig, type Config } from '../src/config.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { FakeDnsClient, type DnsClient } from '../src/services/cloudflare.js';
+import { syncCrontab } from '../src/services/cron.js';
 import {
   ProvisionError,
   deprovisionProject,
@@ -441,6 +442,8 @@ describe('deprovisionProject', () => {
       'removeFile /etc/nginx/sites-available/shipway-api.conf',
       'removeFile /etc/nginx/sites-enabled/shipway-api.conf',
       'reloadNginx',
+      'readCrontab',
+      'writeCrontab',
     ]);
     expect(dns.calls).toEqual(['deleteARecord api.apps.example.com']);
     expect(dns.records.has('api.apps.example.com')).toBe(false);
@@ -465,6 +468,8 @@ describe('deprovisionProject', () => {
       'removeFile /etc/nginx/sites-available/shipway-shop.conf',
       'removeFile /etc/nginx/sites-enabled/shipway-shop.conf',
       'reloadNginx',
+      'readCrontab',
+      'writeCrontab',
     ]);
   });
 
@@ -493,6 +498,28 @@ describe('deprovisionProject', () => {
     expect(dns.records.has('shop.apps.example.com')).toBe(false);
     expect(fs.existsSync(path.join(cfg.appsDir, 'shop'))).toBe(false);
     expect(db.select().from(projects).where(eq(projects.id, id)).get()).toBeUndefined();
+  });
+
+  it('resyncs the crontab after deleting the project row, so orphaned cron entries are removed from the host', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', publicDir: 'public' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+
+    db.insert(cronJobs).values({ projectId: id, schedule: '* * * * *', command: 'php8.3 artisan schedule:run' }).run();
+    await syncCrontab({ db, cfg, sysops });
+    const before = await sysops.readCrontab();
+    expect(before).toContain('shop/current');
+    expect(before).toContain('artisan schedule:run');
+
+    await deprovisionProject({ db, cfg, sysops, dns }, id);
+
+    const after = await sysops.readCrontab();
+    expect(after).not.toContain('shop/current');
+    expect(after).not.toContain('artisan schedule:run');
   });
 
   it('validates the stored slug before constructing any path, touching sysops/dns, or deleting the row', async () => {
