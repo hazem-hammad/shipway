@@ -6,6 +6,8 @@ import * as path from 'node:path';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
 import { authRoutes } from './routes/auth.js';
+import { settingsRoutes } from './routes/settings.js';
+import { userRoutes } from './routes/users.js';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -95,6 +97,8 @@ export async function buildApp(cfg: Config): Promise<FastifyInstance> {
   });
 
   await app.register(authRoutes);
+  await app.register(userRoutes);
+  await app.register(settingsRoutes);
 
   return app;
 }
