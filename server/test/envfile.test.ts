@@ -131,6 +131,26 @@ describe('buildEnvFile', () => {
     expect(out).toContain('MAIL_HOST=plain.example.com');
   });
 
+  it('escapes backslashes and double quotes in a quoted value, and the escaped form round-trips to the original', () => {
+    const original = 'p@ss"w\\ord';
+    const out = buildEnvFile('', { MAIL_PASSWORD: original });
+
+    expect(out).toContain('MAIL_PASSWORD="p@ss\\"w\\\\ord"');
+
+    // Round-trip: a shell-style unescape of the quoted value (strip outer quotes, then unescape
+    // \\ -> \ and \" -> ") recovers the exact original secret.
+    const match = /^MAIL_PASSWORD="(.*)"$/m.exec(out);
+    expect(match).not.toBeNull();
+    const quoted = match?.[1] ?? '';
+    const unescaped = quoted.replace(/\\(["\\])/g, '$1');
+    expect(unescaped).toBe(original);
+  });
+
+  it('quotes a value containing only a backslash (no space/#/") because it must still be escaped', () => {
+    const out = buildEnvFile('', { TOKEN: 'a\\b' });
+    expect(out).toContain('TOKEN="a\\\\b"');
+  });
+
   it('does not emit a managed key already defined by the user (user wins)', () => {
     const out = buildEnvFile('MAIL_HOST=custom.example.com\n', {
       MAIL_MAILER: 'smtp',

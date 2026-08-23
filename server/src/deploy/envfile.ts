@@ -111,10 +111,18 @@ function parseUserKeys(text: string): Set<string> {
   return keys;
 }
 
-/** `KEY=value`, quoting `value` when it contains a space or `#`. */
+/**
+ * `KEY=value`, quoting `value` when it contains a space, `#`, `"`, or `\`. Quoted values have
+ * backslashes and double quotes escaped (`\\` and `\"`) so the emitted line round-trips through any
+ * shell-style `.env` parser (e.g. a password containing `"` or `\`).
+ */
 function formatAssignment(key: string, value: string): string {
-  const needsQuotes = /[ #]/.test(value);
-  return needsQuotes ? `${key}="${value}"` : `${key}=${value}`;
+  const needsQuotes = /[ #"\\]/.test(value);
+  if (!needsQuotes) {
+    return `${key}=${value}`;
+  }
+  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return `${key}="${escaped}"`;
 }
 
 function renderManagedBlock(entries: Array<[string, string]>): string {
