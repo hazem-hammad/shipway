@@ -33,12 +33,16 @@ interface TestApp {
   dataDir: string;
 }
 
-/** Builds an app wired with DevSysOps + FakeDnsClient test doubles, an authed session, and (unless
- * `configureDomain` is false) base_domain/server_ip settings already set. */
-async function buildProjectsTestApp(opts: { configureDomain?: boolean } = {}): Promise<TestApp> {
+/** Builds an app wired with DevSysOps (or, via `makeSysOps`, a subclass sharing its sandbox root —
+ * e.g. one that fails a particular call) + FakeDnsClient test doubles, an authed session, and
+ * (unless `configureDomain` is false) base_domain/server_ip settings already set. */
+async function buildProjectsTestApp(
+  opts: { configureDomain?: boolean; makeSysOps?: (systemRoot: string) => DevSysOps } = {},
+): Promise<TestApp> {
   const dataDir = tmpDataDir();
   const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir });
-  const sysops = new DevSysOps(path.join(dataDir, 'system'));
+  const systemRoot = path.join(dataDir, 'system');
+  const sysops = opts.makeSysOps ? opts.makeSysOps(systemRoot) : new DevSysOps(systemRoot);
   const dns = new FakeDnsClient();
   const app = await buildApp(cfg, { sysops, dns: () => dns });
 
@@ -72,6 +76,15 @@ const PHP_PAYLOAD = {
   branch: 'main',
   type: 'php',
 };
+
+/** Fails partway through the node/nextjs app-unit step (after the vhost + DNS are already live),
+ * so tests can assert POST /api/projects cleans up everything created before the failure. */
+class DaemonReloadFailsSysOps extends DevSysOps {
+  async daemonReload(): Promise<void> {
+    this.calls.push('daemonReload (attempted)');
+    throw new Error('systemctl daemon-reload failed');
+  }
+}
 
 describe('POST /api/projects', () => {
   it('creates a node project with the documented defaults and provisions it (201)', async () => {
@@ -228,6 +241,28 @@ describe('POST /api/projects', () => {
 
     const res = await app.inject({ method: 'POST', url: '/api/projects', payload: NODE_PAYLOAD });
     expect(res.statusCode).toBe(401);
+
+    await app.close();
+  });
+
+  it('on failure at the app-unit step, deprovisions everything already created (vhost + DNS + dirs) and deletes the row, not just the row', async () => {
+    const { app, cookie, sysops, dns, dataDir } = await buildProjectsTestApp({
+      makeSysOps: (root) => new DaemonReloadFailsSysOps(root),
+    });
+
+    const res = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: NODE_PAYLOAD });
+
+    expect(res.statusCode).toBe(502);
+
+    // The DNS record and vhost were created before the app-unit step failed — both must be torn
+    // down, not just the DB row deleted out from under live/orphaned host state.
+    expect(dns.records.has('api.apps.example.com')).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'system/etc/nginx/sites-available/shipway-api.conf'))).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'system/etc/nginx/sites-enabled/shipway-api.conf'))).toBe(false);
+    expect(sysops.calls.some((c) => c.startsWith('removeFile /etc/nginx/sites-available/shipway-api.conf'))).toBe(true);
+
+    const list = await app.inject({ method: 'GET', url: '/api/projects', headers: { cookie } });
+    expect(list.json()).toEqual([]);
 
     await app.close();
   });

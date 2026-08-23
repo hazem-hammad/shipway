@@ -218,7 +218,11 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     try {
       await provisionProject(deps(), created.id);
     } catch (err) {
-      app.db.delete(projects).where(eq(projects.id, created.id)).run();
+      // Provisioning can fail partway through (e.g. after the DNS record and vhost are already
+      // live, but before the app unit installs) — deprovisionProject tears down whatever got as far
+      // as being created (best-effort, safe to call at any failure point) and deletes the row itself,
+      // rather than orphaning DNS records / directories / a live vhost behind a deleted-looking row.
+      await deprovisionProject(deps(), created.id);
       const step = err instanceof ProvisionError ? err.step : 'unknown';
       return reply.code(502).send({ error: 'provisioning failed', step, detail: toErrorMessage(err) });
     }
@@ -262,7 +266,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'invalid request body' });
     }
 
-    const existing = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, id)).get();
+    // Full row (not just `{id}`): refreshProjectConfig needs the pre-update snapshot to re-render
+    // the previous vhost content, so a failed nginx -t after this update can restore it rather than
+    // deleting a previously-working vhost (see provisioner.ts's writeVhost doc comment).
+    const existing = app.db.select().from(projects).where(eq(projects.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'project not found' });
     }
@@ -279,7 +286,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const needsRefresh = REFRESH_TRIGGER_FIELDS.some((field) => field in parsed.data);
     if (needsRefresh) {
       try {
-        await refreshProjectConfig(deps(), id);
+        await refreshProjectConfig(deps(), id, existing);
       } catch (err) {
         const step = err instanceof ProvisionError ? err.step : 'unknown';
         return reply.code(502).send({ error: 'config refresh failed', step, detail: toErrorMessage(err) });

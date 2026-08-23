@@ -23,7 +23,7 @@ export interface ProvisionDeps {
   dns: DnsClient | null;
 }
 
-type ProjectRow = typeof projects.$inferSelect;
+export type ProjectRow = typeof projects.$inferSelect;
 
 /**
  * Thrown by any provisioning step. `step` identifies which stage failed
@@ -105,14 +105,9 @@ function requireBaseDomain(db: ShipwayDb): string {
   return baseDomain;
 }
 
-/**
- * Renders and installs the nginx vhost to both `sites-available` and `sites-enabled`, runs
- * `nginx -t`, and reloads nginx. On a failed test, removes both files (never leaves nginx pointed at
- * a config it hasn't validated) and throws a `ProvisionError` (step `'nginx-test'`) carrying the raw
- * `nginx -t` output.
- */
-async function writeVhost(deps: ProvisionDeps, project: ProjectRow, domain: string, certName: string): Promise<void> {
-  const content = renderNginxVhost({
+/** Pure render of a project's vhost content — no filesystem/sysops interaction. */
+function renderVhostContent(deps: ProvisionDeps, project: ProjectRow, domain: string, certName: string): string {
+  return renderNginxVhost({
     slug: project.slug,
     domain,
     type: project.type,
@@ -122,6 +117,30 @@ async function writeVhost(deps: ProvisionDeps, project: ProjectRow, domain: stri
     port: project.port ?? undefined,
     certName,
   });
+}
+
+/**
+ * Renders and installs the nginx vhost to both `sites-available` and `sites-enabled`, runs
+ * `nginx -t`, and reloads nginx.
+ *
+ * `nginx -t` validates the *entire* nginx config, not just this vhost, so it can fail for reasons
+ * unrelated to this project. On a failed test:
+ * - `previousContent === null` (fresh provisioning — nothing was there before): removes both files,
+ *   so nginx is never left pointed at a config it hasn't validated.
+ * - `previousContent` set (refreshing an already-provisioned project): RESTORES both files to
+ *   `previousContent` instead of removing them, so a working site is never taken offline by an
+ *   unrelated config error surfaced during an unrelated refresh.
+ *
+ * Either way, throws a `ProvisionError` (step `'nginx-test'`) carrying the raw `nginx -t` output.
+ */
+async function writeVhost(
+  deps: ProvisionDeps,
+  project: ProjectRow,
+  domain: string,
+  certName: string,
+  previousContent: string | null,
+): Promise<void> {
+  const content = renderVhostContent(deps, project, domain, certName);
 
   const availablePath = vhostAvailablePath(project.slug);
   const enabledPath = vhostEnabledPath(project.slug);
@@ -131,8 +150,13 @@ async function writeVhost(deps: ProvisionDeps, project: ProjectRow, domain: stri
 
   const test = await deps.sysops.nginxTest();
   if (!test.ok) {
-    await deps.sysops.removeFile(availablePath);
-    await deps.sysops.removeFile(enabledPath);
+    if (previousContent === null) {
+      await deps.sysops.removeFile(availablePath);
+      await deps.sysops.removeFile(enabledPath);
+    } else {
+      await deps.sysops.installFile(availablePath, previousContent);
+      await deps.sysops.installFile(enabledPath, previousContent);
+    }
     throw new ProvisionError('nginx-test', `nginx config test failed: ${test.output}`, test.output);
   }
 
@@ -197,7 +221,9 @@ export async function provisionProject(deps: ProvisionDeps, projectId: number): 
     throw new ProvisionError('mkdirs', `Failed to create app directories for ${project.slug}: ${errMessage(err)}`);
   }
 
-  await writeVhost(deps, project, domain, baseDomain);
+  // Fresh provisioning: nothing valid was there before, so a failed `nginx -t` removes the files
+  // rather than restoring anything (there's nothing to restore).
+  await writeVhost(deps, project, domain, baseDomain, null);
 
   if (isNodeLike(project.type)) {
     await writeAppUnit(deps, project);
@@ -208,16 +234,21 @@ export async function provisionProject(deps: ProvisionDeps, projectId: number): 
 /**
  * Re-renders and reinstalls the on-host config for a project whose settings changed in a way that
  * affects the vhost (`phpVersion`, `publicDir`) or the app unit (`startCmd`, `nodeVersion`): the
- * nginx vhost (with `nginx -t` + reload, same rollback-on-failure behavior as `provisionProject`),
- * and — for node/nextjs — the app unit + `daemon-reload`. Does not touch DNS, directories, or the
- * unit's enabled state.
+ * nginx vhost (with `nginx -t` + reload), and — for node/nextjs — the app unit + `daemon-reload`.
+ * Does not touch DNS, directories, or the unit's enabled state.
+ *
+ * `previous` must be the project row as it stood *before* the caller applied the change (e.g. the
+ * row a `PATCH` handler read prior to its `UPDATE`) — it's used to re-render the previous vhost
+ * content, so that if the new config fails `nginx -t`, `writeVhost` can restore the site to exactly
+ * what was working before instead of deleting it (see `writeVhost`'s doc comment).
  */
-export async function refreshProjectConfig(deps: ProvisionDeps, projectId: number): Promise<void> {
+export async function refreshProjectConfig(deps: ProvisionDeps, projectId: number, previous: ProjectRow): Promise<void> {
   const project = getProjectOrThrow(deps.db, projectId);
   const baseDomain = requireBaseDomain(deps.db);
   const domain = `${project.slug}.${baseDomain}`;
 
-  await writeVhost(deps, project, domain, baseDomain);
+  const previousContent = renderVhostContent(deps, previous, domain, baseDomain);
+  await writeVhost(deps, project, domain, baseDomain, previousContent);
 
   if (isNodeLike(project.type)) {
     await writeAppUnit(deps, project);
@@ -236,6 +267,9 @@ export async function deprovisionProject(deps: ProvisionDeps, projectId: number)
   if (!project) {
     return;
   }
+  // Validate before constructing any path from `project.slug` (all the paths below interpolate it
+  // directly) — the same defense-in-depth invariant `provisionProject` enforces on the way in.
+  assertSlug(project.slug);
 
   async function attempt(fn: () => Promise<void>): Promise<void> {
     try {

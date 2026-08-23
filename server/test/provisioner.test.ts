@@ -44,6 +44,12 @@ function existsSandboxed(cfg: Config, dest: string): boolean {
   return fs.existsSync(path.join(sysopsRoot(cfg), dest));
 }
 
+function getProjectRow(db: ShipwayDb, id: number): typeof projects.$inferSelect {
+  const row = db.select().from(projects).where(eq(projects.id, id)).get();
+  if (!row) throw new Error(`project ${String(id)} not found`);
+  return row;
+}
+
 interface InsertProjectInput {
   slug: string;
   type: 'php' | 'node' | 'nextjs' | 'static';
@@ -340,8 +346,9 @@ describe('refreshProjectConfig', () => {
     sysops.calls.length = 0;
     dns.calls.length = 0;
 
+    const previous = getProjectRow(db, id);
     db.update(projects).set({ phpVersion: '8.4' }).where(eq(projects.id, id)).run();
-    await refreshProjectConfig({ db, cfg, sysops, dns }, id);
+    await refreshProjectConfig({ db, cfg, sysops, dns }, id, previous);
 
     expect(dns.calls).toEqual([]);
     expect(callNames(sysops)).toEqual([
@@ -364,8 +371,9 @@ describe('refreshProjectConfig', () => {
     await provisionProject({ db, cfg, sysops, dns }, id);
     sysops.calls.length = 0;
 
+    const previous = getProjectRow(db, id);
     db.update(projects).set({ startCmd: 'node dist/server.js' }).where(eq(projects.id, id)).run();
-    await refreshProjectConfig({ db, cfg, sysops, dns }, id);
+    await refreshProjectConfig({ db, cfg, sysops, dns }, id, previous);
 
     expect(callNames(sysops)).toEqual([
       'installFile /etc/nginx/sites-available/shipway-api.conf',
@@ -377,6 +385,38 @@ describe('refreshProjectConfig', () => {
     ]);
     const unit = readSandboxed(cfg, '/etc/systemd/system/shipway-app-api.service');
     expect(unit).toContain("exec node dist/server.js'");
+  });
+
+  it('on a failed nginxTest, restores the previous vhost content at both paths instead of deleting it (unlike fresh provisioning)', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', publicDir: 'public' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    const originalAvailable = readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf');
+    const originalEnabled = readSandboxed(cfg, '/etc/nginx/sites-enabled/shipway-shop.conf');
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ phpVersion: '8.4' }).where(eq(projects.id, id)).run();
+    const failingSysops = new FailingNginxTestSysOps(sysopsRoot(cfg));
+
+    let caught: unknown;
+    try {
+      await refreshProjectConfig({ db, cfg, sysops: failingSysops, dns }, id, previous);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ProvisionError);
+    // Restored, not removed: the files still exist and still hold the ORIGINAL (8.3) content — an
+    // unrelated `nginx -t` failure during refresh must never take a previously-working site offline.
+    expect(existsSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toBe(true);
+    expect(existsSandboxed(cfg, '/etc/nginx/sites-enabled/shipway-shop.conf')).toBe(true);
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toBe(originalAvailable);
+    expect(readSandboxed(cfg, '/etc/nginx/sites-enabled/shipway-shop.conf')).toBe(originalEnabled);
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toContain('php8.3-fpm.sock');
   });
 });
 
@@ -453,5 +493,34 @@ describe('deprovisionProject', () => {
     expect(dns.records.has('shop.apps.example.com')).toBe(false);
     expect(fs.existsSync(path.join(cfg.appsDir, 'shop'))).toBe(false);
     expect(db.select().from(projects).where(eq(projects.id, id)).get()).toBeUndefined();
+  });
+
+  it('validates the stored slug before constructing any path, touching sysops/dns, or deleting the row', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    // Insert directly, bypassing normal slug validation, to simulate a corrupted/tampered row.
+    db.insert(projects)
+      .values({
+        name: 'bad',
+        slug: 'UPPER CASE',
+        repo: 'acme/bad',
+        branch: 'main',
+        type: 'static',
+        sharedPaths: [],
+        autoDeploy: true,
+        smtpMode: 'mailpit',
+      })
+      .run();
+    const row = db.select({ id: projects.id }).from(projects).where(eq(projects.slug, 'UPPER CASE')).get();
+    if (!row) throw new Error('failed to insert test project');
+
+    await expect(deprovisionProject({ db, cfg, sysops, dns }, row.id)).rejects.toThrow();
+
+    expect(sysops.calls).toEqual([]);
+    expect(dns.calls).toEqual([]);
+    expect(db.select().from(projects).where(eq(projects.id, row.id)).get()).toBeDefined();
   });
 });
