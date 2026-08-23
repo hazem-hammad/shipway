@@ -24,9 +24,16 @@ const SESSION_KEY_LENGTH = 32;
 
 /**
  * Path prefixes under `/api/` that do NOT require an authenticated session. Everything else under
- * `/api/` is guarded by the global `onRequest` hook below.
+ * `/api/` is guarded by the global `onRequest` hook below. `/api/health` itself is checked
+ * separately as an exact match (see `isPublicApiPath`), not a prefix, so a future route like
+ * `/api/healthcheck` doesn't accidentally slip through unauthenticated too.
  */
-const PUBLIC_API_PREFIXES = ['/api/health', '/api/auth/', '/api/setup/', '/api/webhooks/'];
+const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/setup/', '/api/webhooks/'];
+
+function isPublicApiPath(path: string): boolean {
+  if (path === '/api/health') return true;
+  return PUBLIC_API_PREFIXES.some((prefix) => path.startsWith(prefix));
+}
 
 /**
  * Loads the session signing/encryption key from `keyPath`. If missing, generates a new random
@@ -74,7 +81,9 @@ export async function buildApp(cfg: Config): Promise<FastifyInstance> {
   // `request.session` is already decoded here.
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/api/')) return;
-    if (PUBLIC_API_PREFIXES.some((prefix) => request.url.startsWith(prefix))) return;
+
+    const path = request.url.split('?')[0]!;
+    if (isPublicApiPath(path)) return;
 
     if (request.session.get('userId') === undefined) {
       reply.code(401).send({ error: 'unauthorized' });

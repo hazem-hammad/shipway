@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
+import { users } from '../src/db/schema.js';
 import { hashPassword, verifyPassword } from '../src/lib/passwords.js';
 
 function tmpDataDir(): string {
@@ -75,6 +76,34 @@ describe('first-run setup + auth', () => {
     await app.close();
   });
 
+  it('POST /api/setup/admin is race-safe: two concurrent requests create exactly one admin', async () => {
+    const app = await buildTestApp();
+
+    // Both requests observe an empty `users` table at their initial (pre-hash) check, then race to
+    // finish their `await hashPassword`. Only the check+insert inside `db.transaction` (see
+    // src/routes/auth.ts) decides who actually wins.
+    const [resA, resB] = await Promise.all([
+      app.inject({
+        method: 'POST',
+        url: '/api/setup/admin',
+        payload: { name: 'Racer A', email: 'racer-a@example.com', password: 'password-a-123' },
+      }),
+      app.inject({
+        method: 'POST',
+        url: '/api/setup/admin',
+        payload: { name: 'Racer B', email: 'racer-b@example.com', password: 'password-b-123' },
+      }),
+    ]);
+
+    const statuses = [resA.statusCode, resB.statusCode].sort((a, b) => a - b);
+    expect(statuses).toEqual([201, 409]);
+
+    const allUsers = app.db.select().from(users).all();
+    expect(allUsers.length).toBe(1);
+
+    await app.close();
+  });
+
   it('POST /api/auth/login: wrong password 401, right password 200 + working session', async () => {
     const app = await buildTestApp();
     await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
@@ -97,6 +126,28 @@ describe('first-run setup + auth', () => {
     const me = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie } });
     expect(me.statusCode).toBe(200);
     expect(me.json()).toMatchObject({ email: ADMIN.email });
+
+    await app.close();
+  });
+
+  it('login for an unknown email still pays the argon2 verify cost (no user-enumeration timing oracle)', async () => {
+    const app = await buildTestApp();
+    await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
+
+    const start = performance.now();
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email: 'nobody-such-user@example.com', password: 'whatever-guess' },
+    });
+    const elapsedMs = performance.now() - start;
+
+    expect(res.statusCode).toBe(401);
+    // A real argon2id verify (the app's default cost params) takes on the order of tens of ms; a
+    // bare "no such row, skip straight to 401" short-circuit would resolve in well under 1ms. This
+    // floor proves the dummy-hash verify actually ran for the unknown-email branch rather than being
+    // skipped, which is what closes the timing side-channel.
+    expect(elapsedMs).toBeGreaterThan(5);
 
     await app.close();
   });

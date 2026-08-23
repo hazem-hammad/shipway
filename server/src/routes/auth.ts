@@ -15,6 +15,16 @@ const loginSchema = z.object({
   password: z.string().min(1),
 });
 
+/**
+ * A static, valid argon2id PHC hash for a password nobody knows (generated once with the same
+ * default cost params `hashPassword` uses). When a login's email doesn't match any user, we still
+ * `verifyPassword` against this instead of short-circuiting straight to 401 — otherwise "unknown
+ * email" would resolve measurably faster than "wrong password for a real user", letting an attacker
+ * enumerate valid emails purely from response timing.
+ */
+const DUMMY_PASSWORD_HASH =
+  '$argon2id$v=19$m=65536,p=4,t=3$hZp9d933yN2wkmJNcfz4Kg$8nXdEajInLRcy1Nb85SnTR8VLn41RcQ4GrlkMJTkJZA';
+
 const MAX_FAILED_ATTEMPTS = 10;
 const WINDOW_MS = 15 * 60 * 1000;
 
@@ -72,17 +82,31 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'invalid request body' });
     }
 
-    const existing = app.db.select({ id: users.id }).from(users).limit(1).get();
-    if (existing) {
+    // Fast path: skip the expensive hash entirely when setup is obviously already done.
+    const alreadySetUp = app.db.select({ id: users.id }).from(users).limit(1).get();
+    if (alreadySetUp) {
       return reply.code(409).send({ error: 'setup already completed' });
     }
 
     const { name, email, password } = parsed.data;
     const passwordHash = await hashPassword(password);
-    app.db.insert(users).values({ name, email, passwordHash }).run();
-    const created = app.db.select().from(users).where(eq(users.email, email)).get();
+
+    // The `await` above yields the event loop, so a second concurrent request could have raced past
+    // the fast-path check too. `db.transaction` on the better-sqlite3 driver runs its callback fully
+    // synchronously (no `await` inside it), so re-checking and inserting here — with no suspension
+    // point in between — is the actual TOCTOU-safe guarantee: only one concurrent caller can ever
+    // observe an empty `users` table inside this block.
+    const created = app.db.transaction((tx) => {
+      const existing = tx.select({ id: users.id }).from(users).limit(1).get();
+      if (existing) {
+        return null;
+      }
+      tx.insert(users).values({ name, email, passwordHash }).run();
+      return tx.select().from(users).where(eq(users.email, email)).get() ?? null;
+    });
+
     if (!created) {
-      throw new Error('failed to read back newly-created admin user');
+      return reply.code(409).send({ error: 'setup already completed' });
     }
 
     request.session.set('userId', created.id);
@@ -102,7 +126,9 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const { email, password } = parsed.data;
     const user = app.db.select().from(users).where(eq(users.email, email)).get();
-    const valid = user ? await verifyPassword(user.passwordHash, password) : false;
+    // Always run a real argon2id verify, even for an unknown email, against DUMMY_PASSWORD_HASH —
+    // see its doc comment. This keeps "unknown email" and "wrong password" 401s equally expensive.
+    const valid = await verifyPassword(user ? user.passwordHash : DUMMY_PASSWORD_HASH, password);
 
     if (!user || !valid) {
       recordFailure(ip);
