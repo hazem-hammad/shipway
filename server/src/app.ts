@@ -6,11 +6,15 @@ import * as path from 'node:path';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
 import { getSetting } from './db/settings.js';
+import { SecretBox } from './lib/secretbox.js';
 import { authRoutes } from './routes/auth.js';
 import { githubRoutes } from './routes/github.js';
+import { projectRoutes } from './routes/projects.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
+import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { GitHubService, type GithubAppConfig } from './services/github.js';
+import { makeSysOps, type SysOps } from './sysops/index.js';
 
 declare module 'fastify' {
   interface FastifyInstance {
@@ -22,8 +26,26 @@ declare module 'fastify' {
      * latest stored credentials/installation id.
      */
     github: () => GitHubService | null;
+    /** All privileged system mutations (nginx/systemd/file installs) go through this. */
+    sysops: SysOps;
+    /** Encrypts/decrypts project secrets at rest (env text, SMTP config). */
+    secretBox: SecretBox;
+    /**
+     * Lazily builds a `DnsClient` from the current `cloudflare_token`/`cloudflare_zone_id`
+     * settings, or `null` when unconfigured. In dev mode, always returns a shared in-process
+     * `FakeDnsClient` so provisioning works offline. Called fresh per use so routes always see the
+     * latest stored credentials.
+     */
+    dns: () => DnsClient | null;
   }
 }
+
+/**
+ * Shared across every dev-mode `buildApp()` call in this process (not per-app), matching a real
+ * Cloudflare zone's behavior of being one durable store rather than reset per request — so
+ * find-then-create DNS idempotency holds the same way it would in production.
+ */
+let sharedDevDnsClient: FakeDnsClient | undefined;
 
 declare module '@fastify/secure-session' {
   interface SessionData {
@@ -68,7 +90,15 @@ function loadOrCreateSessionKey(keyPath: string): Buffer {
 
 export async function buildApp(
   cfg: Config,
-  deps: { fetchImpl?: typeof fetch; githubStateTtlMs?: number } = {},
+  deps: {
+    fetchImpl?: typeof fetch;
+    githubStateTtlMs?: number;
+    /** Test-only override: skips `makeSysOps(cfg)` in favor of an injected double (e.g. `DevSysOps`
+     * built by the test, so it can inspect `.calls`). */
+    sysops?: SysOps;
+    /** Test-only override: skips the default lazy `dns()` in favor of an injected function. */
+    dns?: () => DnsClient | null;
+  } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: cfg.devMode,
@@ -80,6 +110,22 @@ export async function buildApp(
     const githubAppCfg = getSetting<GithubAppConfig>(app.db, 'github_app');
     return githubAppCfg ? new GitHubService(githubAppCfg) : null;
   });
+  app.decorate('sysops', deps.sysops ?? makeSysOps(cfg));
+  app.decorate('secretBox', SecretBox.load(cfg.secretKeyPath));
+  app.decorate(
+    'dns',
+    deps.dns ??
+      ((): DnsClient | null => {
+        if (cfg.devMode) {
+          sharedDevDnsClient ??= new FakeDnsClient();
+          return sharedDevDnsClient;
+        }
+        const token = getSetting<string>(app.db, 'cloudflare_token');
+        const zoneId = getSetting<string>(app.db, 'cloudflare_zone_id');
+        if (!token || !zoneId) return null;
+        return makeCloudflareClient(token, zoneId);
+      }),
+  );
 
   await app.register(secureSession, {
     cookieName: 'shipway',
@@ -116,6 +162,7 @@ export async function buildApp(
   await app.register(userRoutes);
   await app.register(settingsRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
+  await app.register(projectRoutes);
 
   return app;
 }
