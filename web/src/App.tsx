@@ -5,6 +5,7 @@ import Layout from './components/Layout';
 import Login from './pages/Login';
 import SetupWizard from './pages/SetupWizard';
 import ProjectsPage from './pages/Projects';
+import ProjectNewPage from './pages/ProjectNew';
 import DatabasesPage from './pages/Databases';
 import ServerPage from './pages/Server';
 import SettingsPage from './pages/Settings';
@@ -51,6 +52,7 @@ function AuthenticatedGate() {
   return (
     <Layout user={me.data}>
       <Switch>
+        <Route path="/projects/new" component={ProjectNewPage} />
         <Route path="/projects" component={ProjectsPage} />
         <Route path="/databases" component={DatabasesPage} />
         <Route path="/server" component={ServerPage} />

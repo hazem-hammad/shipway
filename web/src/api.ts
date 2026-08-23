@@ -5,11 +5,14 @@
  */
 export class ApiError extends Error {
   readonly status: number;
+  /** The full parsed JSON error body, when present — e.g. a 502's `{ error, step, detail }`. */
+  readonly body: unknown;
 
-  constructor(status: number, message: string) {
+  constructor(status: number, message: string, body?: unknown) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -50,7 +53,7 @@ export async function apiFetch<T>(path: string, opts: ApiFetchOptions = {}): Pro
       payload !== null && typeof payload === 'object' && 'error' in payload && typeof payload.error === 'string'
         ? payload.error
         : response.statusText || `request failed with status ${String(response.status)}`;
-    throw new ApiError(response.status, message);
+    throw new ApiError(response.status, message, payload);
   }
 
   return payload as T;
@@ -148,4 +151,91 @@ export function fetchGithubManifest(baseUrl: string): Promise<GithubManifest> {
 
 export function fetchGithubStatus(): Promise<GithubStatus> {
   return apiFetch<GithubStatus>('/api/github/status');
+}
+
+export interface GithubRepo {
+  fullName: string;
+  defaultBranch: string;
+  private: boolean;
+}
+
+export function fetchGithubRepos(): Promise<GithubRepo[]> {
+  return apiFetch<GithubRepo[]>('/api/github/repos');
+}
+
+export function fetchGithubBranches(repo: string): Promise<string[]> {
+  return apiFetch<string[]>(`/api/github/branches?repo=${encodeURIComponent(repo)}`);
+}
+
+// ---- Projects ----
+
+export type ProjectType = 'php' | 'node' | 'nextjs' | 'static';
+
+export type DeploymentStatus = 'queued' | 'running' | 'success' | 'failed' | 'rolled_back' | 'canceled';
+
+/** Whether a deployment's status means it's still in flight (queued or actively running). */
+export function isPendingDeploymentStatus(status: DeploymentStatus | null | undefined): boolean {
+  return status === 'queued' || status === 'running';
+}
+
+export interface Project {
+  id: number;
+  name: string;
+  slug: string;
+  repo: string;
+  branch: string;
+  type: ProjectType;
+  phpVersion: string | null;
+  nodeVersion: string | null;
+  publicDir: string | null;
+  port: number | null;
+  installCmd: string | null;
+  buildCmd: string | null;
+  startCmd: string | null;
+  preDeployScript: string | null;
+  postDeployScript: string | null;
+  sharedPaths: string[];
+  healthCheckPath: string | null;
+  autoDeploy: boolean;
+  smtpMode: 'mailpit' | 'custom' | 'none';
+  notifyWebhookUrl: string | null;
+  createdAt: number;
+}
+
+export interface LastDeployment {
+  status: DeploymentStatus;
+  finishedAt: number | null;
+  commitSha: string | null;
+}
+
+export interface ProjectListItem extends Project {
+  lastDeployment: LastDeployment | null;
+}
+
+export interface CreateProjectBody {
+  name: string;
+  slug: string;
+  repo: string;
+  branch: string;
+  type: ProjectType;
+  phpVersion?: string;
+  nodeVersion?: string;
+  publicDir?: string;
+  installCmd?: string;
+  buildCmd?: string;
+  startCmd?: string;
+  healthCheckPath?: string | null;
+  autoDeploy?: boolean;
+}
+
+export function fetchProjects(): Promise<ProjectListItem[]> {
+  return apiFetch<ProjectListItem[]>('/api/projects');
+}
+
+export function createProject(body: CreateProjectBody): Promise<Project> {
+  return apiFetch<Project>('/api/projects', { method: 'POST', body });
+}
+
+export function deployProject(id: number): Promise<{ deploymentId: number }> {
+  return apiFetch<{ deploymentId: number }>(`/api/projects/${String(id)}/deploy`, { method: 'POST' });
 }

@@ -3,7 +3,7 @@
  * reinventing them: tokens, buttons, inputs, skeletons, empty states, the berth light, and the
  * setup wizard's progress rail.
  */
-import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, TextareaHTMLAttributes } from 'react';
+import type { ButtonHTMLAttributes, InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from 'react';
 import { Link } from 'wouter';
 
 // ---------------------------------------------------------------------------
@@ -112,6 +112,19 @@ export interface TextareaProps extends TextareaHTMLAttributes<HTMLTextAreaElemen
 
 export function Textarea({ mono = false, className = '', ...rest }: TextareaProps) {
   return <textarea {...rest} className={`${FIELD_CLASSES} ${mono ? 'font-mono' : ''} ${className}`} />;
+}
+
+export interface SelectProps extends SelectHTMLAttributes<HTMLSelectElement> {
+  /** Machine-ish values (branch names, repo full names) render in IBM Plex Mono per DESIGN.md. */
+  mono?: boolean;
+}
+
+export function Select({ mono = false, className = '', children, ...rest }: SelectProps) {
+  return (
+    <select {...rest} className={`${FIELD_CLASSES} ${mono ? 'font-mono' : ''} ${className}`}>
+      {children}
+    </select>
+  );
 }
 
 export interface FieldProps {
