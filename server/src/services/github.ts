@@ -62,11 +62,16 @@ export class GitHubService {
   private cachedToken: CachedToken | null = null;
 
   constructor(private readonly cfg: GithubAppConfig) {
-    this.auth = createAppAuth({
-      appId: cfg.appId,
-      privateKey: cfg.privateKey,
-      installationId: cfg.installationId,
-    });
+    // `@octokit/auth-app`'s createAppAuth treats a *present-but-undefined* `installationId` key as
+    // an error ("installationId is set to a falsy value") — distinct from omitting the key
+    // entirely, which is how it's told "app-only, no installation yet" (the normal state before
+    // `resolveInstallationId`/`resolve-installation` has run). So the key must only be included
+    // when actually set, not passed through as `installationId: cfg.installationId`.
+    this.auth = createAppAuth(
+      cfg.installationId === undefined
+        ? { appId: cfg.appId, privateKey: cfg.privateKey }
+        : { appId: cfg.appId, privateKey: cfg.privateKey, installationId: cfg.installationId },
+    );
   }
 
   /** Returns a cached installation access token, minting/refreshing one when needed. */

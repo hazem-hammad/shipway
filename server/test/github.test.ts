@@ -7,7 +7,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { getSetting, setSetting } from '../src/db/settings.js';
-import { cloneUrl, verifyWebhookSignature } from '../src/services/github.js';
+import { cloneUrl, GitHubService, verifyWebhookSignature } from '../src/services/github.js';
 
 describe('verifyWebhookSignature', () => {
   const secret = 'top-secret-webhook-key';
@@ -58,6 +58,20 @@ describe('cloneUrl', () => {
   });
 });
 
+describe('GitHubService construction', () => {
+  it('does not throw when installationId is unset — the normal "configured but not yet installed" state', () => {
+    // Regression test: @octokit/auth-app's createAppAuth treats a *present-but-undefined*
+    // `installationId` option as invalid ("installationId is set to a falsy value"), distinct from
+    // omitting the key entirely. Passing `installationId: cfg.installationId` straight through would
+    // make constructing a GitHubService for an app that hasn't been installed yet — the exact state
+    // `resolveInstallationId`/`POST /api/github/resolve-installation` exists to resolve — throw
+    // synchronously at construction time, before any auth/network call is even attempted.
+    expect(
+      () => new GitHubService({ appId: 123456, privateKey: 'irrelevant-for-this-check', webhookSecret: 'whsec' }),
+    ).not.toThrow();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Route tests
 // ---------------------------------------------------------------------------
@@ -66,10 +80,15 @@ function tmpDataDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-github-test-'));
 }
 
-async function buildTestApp(fetchImpl?: typeof fetch): Promise<FastifyInstance> {
+interface TestAppDeps {
+  fetchImpl?: typeof fetch;
+  githubStateTtlMs?: number;
+}
+
+async function buildTestApp(deps: TestAppDeps = {}): Promise<FastifyInstance> {
   const dataDir = tmpDataDir();
   const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir });
-  return buildApp(cfg, { fetchImpl });
+  return buildApp(cfg, deps);
 }
 
 function sessionCookie(res: LightMyRequestResponse): string {
@@ -83,11 +102,31 @@ function sessionCookie(res: LightMyRequestResponse): string {
 
 const ADMIN = { name: 'Ada Lovelace', email: 'ada@example.com', password: 'correct-horse-battery' };
 
-async function buildAuthedApp(fetchImpl?: typeof fetch): Promise<{ app: FastifyInstance; cookie: string }> {
-  const app = await buildTestApp(fetchImpl);
+async function buildAuthedApp(deps: TestAppDeps = {}): Promise<{ app: FastifyInstance; cookie: string }> {
+  const app = await buildTestApp(deps);
   const create = await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
   const cookie = sessionCookie(create);
   return { app, cookie };
+}
+
+/** Extracts the `state` query param minted by `GET /api/github/manifest`'s `postUrl`. */
+function extractState(postUrl: string): string {
+  const state = new URL(postUrl).searchParams.get('state');
+  if (!state) {
+    throw new Error(`expected a state param in postUrl, got: ${postUrl}`);
+  }
+  return state;
+}
+
+/** Calls the authed manifest route to mint a fresh CSRF state nonce for the callback flow. */
+async function mintState(app: FastifyInstance, cookie: string): Promise<string> {
+  const res = await app.inject({
+    method: 'GET',
+    url: '/api/github/manifest?baseUrl=https://deploy.example.com',
+    headers: { cookie },
+  });
+  const body = res.json() as { postUrl: string };
+  return extractState(body.postUrl);
 }
 
 const GITHUB_APP_CFG = {
@@ -147,7 +186,7 @@ function setSettingGithubApp(app: FastifyInstance, cfg: Record<string, unknown>)
 }
 
 describe('GET /api/github/manifest', () => {
-  it('returns a postUrl and a manifestJson with the expected fields', async () => {
+  it('returns a postUrl carrying a fresh CSRF state param, and a manifestJson with the expected fields', async () => {
     const { app, cookie } = await buildAuthedApp();
 
     const res = await app.inject({
@@ -158,7 +197,7 @@ describe('GET /api/github/manifest', () => {
     expect(res.statusCode).toBe(200);
 
     const body = res.json() as { postUrl: string; manifestJson: string };
-    expect(body.postUrl).toBe('https://github.com/settings/apps/new');
+    expect(body.postUrl).toMatch(/^https:\/\/github\.com\/settings\/apps\/new\?state=[0-9a-f]{32}$/);
 
     const manifest = JSON.parse(body.manifestJson) as Record<string, unknown>;
     expect(manifest.name).toMatch(/^shipway-[0-9a-f]{4}$/);
@@ -198,16 +237,17 @@ describe('GET /api/setup/github/callback', () => {
     return { fetch: stub, calls };
   }
 
-  it('exchanges the code, stores the github_app setting, and redirects — with no session cookie required', async () => {
+  it('exchanges the code, stores the github_app setting, and redirects — the callback itself needs no session cookie, only a state minted by the authed manifest route', async () => {
     const { fetch: stub, calls } = makeStubFetch({
       id: 777,
       pem: '-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----',
       webhook_secret: 'whsec_generated',
       slug: 'shipway-xy12',
     });
-    const app = await buildTestApp(stub);
+    const { app, cookie } = await buildAuthedApp({ fetchImpl: stub });
+    const state = await mintState(app, cookie);
 
-    const res = await app.inject({ method: 'GET', url: '/api/setup/github/callback?code=abc123' });
+    const res = await app.inject({ method: 'GET', url: `/api/setup/github/callback?code=abc123&state=${state}` });
 
     expect(calls).toEqual([{ url: 'https://api.github.com/app-manifests/abc123/conversions', method: 'POST' }]);
     expect(res.statusCode).toBe(302);
@@ -231,11 +271,64 @@ describe('GET /api/setup/github/callback', () => {
     await app.close();
   });
 
+  it('403s "invalid state" when state is missing (code present), without calling the exchange', async () => {
+    const { fetch: stub, calls } = makeStubFetch({});
+    const app = await buildTestApp({ fetchImpl: stub });
+
+    const res = await app.inject({ method: 'GET', url: '/api/setup/github/callback?code=abc123' });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: 'invalid state' });
+    expect(calls).toEqual([]);
+
+    await app.close();
+  });
+
+  it('403s "invalid state" for a state that was never issued, without calling the exchange', async () => {
+    const { fetch: stub, calls } = makeStubFetch({});
+    const app = await buildTestApp({ fetchImpl: stub });
+
+    const res = await app.inject({ method: 'GET', url: '/api/setup/github/callback?code=abc123&state=deadbeefdeadbeefdeadbeefdeadbeef' });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: 'invalid state' });
+    expect(calls).toEqual([]);
+
+    await app.close();
+  });
+
+  it('403s "invalid state" when a state is reused — single-use, consumed on first use', async () => {
+    const { fetch: stub } = makeStubFetch({ id: 1, pem: 'pem', webhook_secret: 'whsec', slug: 'shipway-aa11' });
+    const { app, cookie } = await buildAuthedApp({ fetchImpl: stub });
+    const state = await mintState(app, cookie);
+
+    const first = await app.inject({ method: 'GET', url: `/api/setup/github/callback?code=abc123&state=${state}` });
+    expect(first.statusCode).toBe(302);
+
+    const second = await app.inject({ method: 'GET', url: `/api/setup/github/callback?code=abc123&state=${state}` });
+    expect(second.statusCode).toBe(403);
+    expect(second.json()).toEqual({ error: 'invalid state' });
+
+    await app.close();
+  });
+
+  it('403s "invalid state" once the state has expired', async () => {
+    const { app, cookie } = await buildAuthedApp({ githubStateTtlMs: 10 });
+    const state = await mintState(app, cookie);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const res = await app.inject({ method: 'GET', url: `/api/setup/github/callback?code=abc123&state=${state}` });
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: 'invalid state' });
+
+    await app.close();
+  });
+
   it('502s when the exchange fails, and does not store a setting', async () => {
     const { fetch: stub } = makeStubFetch({ message: 'not found' }, 404);
-    const app = await buildTestApp(stub);
+    const { app, cookie } = await buildAuthedApp({ fetchImpl: stub });
+    const state = await mintState(app, cookie);
 
-    const res = await app.inject({ method: 'GET', url: '/api/setup/github/callback?code=bad' });
+    const res = await app.inject({ method: 'GET', url: `/api/setup/github/callback?code=bad&state=${state}` });
     expect(res.statusCode).toBe(502);
     expect(getSetting(app.db, 'github_app')).toBeNull();
 
@@ -297,6 +390,38 @@ describe('PUT /api/github/app', () => {
   it('is 401 without a session', async () => {
     const app = await buildTestApp();
     const res = await app.inject({ method: 'PUT', url: '/api/github/app', payload: GITHUB_APP_CFG });
+    expect(res.statusCode).toBe(401);
+    await app.close();
+  });
+});
+
+describe('POST /api/github/resolve-installation', () => {
+  it('503s "not configured" when no github_app setting exists', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    const res = await app.inject({ method: 'POST', url: '/api/github/resolve-installation', headers: { cookie } });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'github app not configured' });
+    await app.close();
+  });
+
+  it('502s "failed to resolve installation" (sanitized) when the underlying auth fails — a malformed private key fails JWT signing locally, without touching the network', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    setSettingGithubApp(app, { appId: 123456, privateKey: 'not-a-valid-pem', webhookSecret: 'whsec_test' });
+
+    const res = await app.inject({ method: 'POST', url: '/api/github/resolve-installation', headers: { cookie } });
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toEqual({ error: 'failed to resolve installation' });
+
+    // The failed attempt must not have stored a bogus installationId.
+    const stored = getSetting<{ installationId?: number }>(app.db, 'github_app');
+    expect(stored?.installationId).toBeUndefined();
+
+    await app.close();
+  });
+
+  it('is 401 without a session', async () => {
+    const app = await buildTestApp();
+    const res = await app.inject({ method: 'POST', url: '/api/github/resolve-installation' });
     expect(res.statusCode).toBe(401);
     await app.close();
   });

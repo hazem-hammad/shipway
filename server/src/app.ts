@@ -66,7 +66,10 @@ function loadOrCreateSessionKey(keyPath: string): Buffer {
   return key;
 }
 
-export async function buildApp(cfg: Config, deps: { fetchImpl?: typeof fetch } = {}): Promise<FastifyInstance> {
+export async function buildApp(
+  cfg: Config,
+  deps: { fetchImpl?: typeof fetch; githubStateTtlMs?: number } = {},
+): Promise<FastifyInstance> {
   const app = Fastify({
     logger: cfg.devMode,
   });
@@ -112,7 +115,7 @@ export async function buildApp(cfg: Config, deps: { fetchImpl?: typeof fetch } =
   await app.register(authRoutes);
   await app.register(userRoutes);
   await app.register(settingsRoutes);
-  await app.register(githubRoutes, { fetchImpl: deps.fetchImpl });
+  await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
 
   return app;
 }
