@@ -1,0 +1,16 @@
+{
+  "name": "shipway",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Shipway — a fast, native-process deployment dashboard",
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "test": "npm run test -w server",
+    "typecheck": "npm run typecheck -w server",
+    "build": "npm run build -w server"
+  },
+  "license": "ISC"
+}
