@@ -15,6 +15,7 @@ import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
 import { makeRunShell } from './deploy/runshell.js';
 import { SecretBox } from './lib/secretbox.js';
 import { authRoutes } from './routes/auth.js';
+import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
 import { projectRoutes } from './routes/projects.js';
@@ -22,6 +23,7 @@ import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
+import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { makeGitOps } from './services/git.js';
 import { cloneUrl, GitHubService, type GithubAppConfig } from './services/github.js';
 import { sendDeployNotification } from './services/notify.js';
@@ -50,6 +52,8 @@ declare module 'fastify' {
     dns: () => DnsClient | null;
     /** Schedules and tracks deploy/rollback jobs; wired to `runDeploy` in `buildApp`. */
     queue: DeployQueue;
+    /** Provisions/deprovisions MySQL/Postgres databases; backed by `mysql_admin_url`/`postgres_admin_url` settings. */
+    dbAdmin: DbAdmin;
   }
 }
 
@@ -113,6 +117,9 @@ export async function buildApp(
     dns?: () => DnsClient | null;
     /** Test-only override: replaces the real `runDeploy`-backed queue `run` with a fake. */
     queueRun?: DeployQueueDeps['run'];
+    /** Test-only override: replaces the real mysql2/pg-backed `DbAdmin` with a fake (e.g. one that
+     * records calls and can be made to throw), so database route tests never touch a real server. */
+    dbAdmin?: DbAdmin;
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -127,6 +134,14 @@ export async function buildApp(
   });
   app.decorate('sysops', deps.sysops ?? makeSysOps(cfg));
   app.decorate('secretBox', SecretBox.load(cfg.secretKeyPath));
+  app.decorate(
+    'dbAdmin',
+    deps.dbAdmin ??
+      makeDbAdmin(() => ({
+        mysqlUrl: getSetting<string>(app.db, 'mysql_admin_url') ?? undefined,
+        postgresUrl: getSetting<string>(app.db, 'postgres_admin_url') ?? undefined,
+      })),
+  );
   app.decorate(
     'dns',
     deps.dns ??
@@ -258,6 +273,8 @@ export async function buildApp(
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);
+  await app.register(databaseRoutes);
+  await app.register(servicesRoutes);
   await app.register(webhookRoutes);
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
