@@ -550,11 +550,13 @@ async function runPostActivate(
   commitMessage: string | null,
 ): Promise<'success' | 'failed' | 'canceled'> {
   let previousReleasePath: string | null = null;
+  let activated = false;
 
   try {
     logger.section('activate');
     checkAborted(signal);
     previousReleasePath = activateRelease(projectDir, releaseDir);
+    activated = true;
 
     logger.section('restart');
     checkAborted(signal);
@@ -567,6 +569,15 @@ async function runPostActivate(
       throw new HealthCheckFailedError();
     }
   } catch (err) {
+    // An abort observed at the very first stage boundary, before `activate` actually ran: `current`
+    // was never touched, so this is indistinguishable from a pre-activate cancellation — report it
+    // the same way, rather than as a 'failed' deploy with a (no-op) rollback attempt.
+    if (!activated && signal.aborted) {
+      logger.line(`ERROR: ${errMessage(err)}`);
+      patchDeployment(deps.db, deploymentId, { status: 'canceled', finishedAt: Date.now() });
+      logger.close();
+      return 'canceled';
+    }
     return await handlePostActivateFailure(deps, logger, project, projectDir, deploymentId, previousReleasePath, err);
   }
 
@@ -621,6 +632,21 @@ async function runDeployInner(
         project,
         deploymentId,
         new Error(`rollback deployment ${String(deploymentId)} has no releasePath`),
+      );
+    }
+    // The release a rollback targets may have since been pruned (prune only keeps the 5 newest,
+    // but a deployment row's releasePath is never updated when its release is deleted). Activating
+    // a dangling symlink would leave the site broken while still reporting success (health checks
+    // for php/static without a healthCheckPath pass unconditionally) — so this must be caught here,
+    // before activate, not discovered later.
+    if (!fs.existsSync(deploymentRow.releasePath)) {
+      return await handlePreActivateFailure(
+        deps,
+        logger,
+        signal,
+        project,
+        deploymentId,
+        new Error(`release no longer on disk — it was pruned: ${deploymentRow.releasePath}`),
       );
     }
     releaseDir = deploymentRow.releasePath;

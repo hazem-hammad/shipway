@@ -516,6 +516,31 @@ describe('runDeploy — cancel', () => {
     expect(fs.existsSync(row.releasePath as string)).toBe(false);
     expect(notifications).toHaveLength(0);
   });
+
+  it('an abort observed before activate ever runs is reported canceled, not failed, and current is untouched', async () => {
+    const { cfg, db, sysops, notifications, logger, deps } = makeHarness({ gitOps: poisonedGitOps() });
+
+    const projectId = insertProject(db, { slug: 'cancel-before-activate', type: 'static' });
+    const existingRelease = path.join(cfg.appsDir, 'cancel-before-activate', 'releases', '20200101_000000');
+    fs.mkdirSync(existingRelease, { recursive: true });
+
+    // Rollback trigger skips straight to the post-activate phase, so aborting up front lands
+    // exactly on the narrow pre-activate window inside runPostActivate.
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'rollback', releasePath: existingRelease });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    expect(result).toBe('canceled');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    // current was never touched — activate never ran
+    expect(readCurrentTarget(cfg, 'cancel-before-activate')).toBeNull();
+    expect(sysops.calls).toEqual([]);
+    expect(notifications).toHaveLength(0);
+  });
 });
 
 describe('runDeploy — rollback trigger', () => {
@@ -552,5 +577,42 @@ describe('runDeploy — rollback trigger', () => {
     expect(sysops.calls.filter((c) => c.startsWith('unitAction') || c.startsWith('reloadPhpFpm'))).toEqual([]);
 
     expect(notifications).toEqual([{ project: 'reroll', status: 'success', deploymentId, message: 'rollback to old release' }]);
+  });
+
+  it('fails cleanly (does not activate a dangling symlink) when the target release was since pruned off disk', async () => {
+    const { cfg, db, sysops, notifications, logger, deps } = makeHarness({ gitOps: poisonedGitOps() });
+
+    const projectId = insertProject(db, { slug: 'reroll-pruned', type: 'static' });
+
+    // A pre-existing "current" release, standing in for whatever is live right now.
+    const liveRelease = path.join(cfg.appsDir, 'reroll-pruned', 'releases', '20200105_000000');
+    fs.mkdirSync(liveRelease, { recursive: true });
+    fs.mkdirSync(path.dirname(currentPath(cfg, 'reroll-pruned')), { recursive: true });
+    fs.symlinkSync(liveRelease, currentPath(cfg, 'reroll-pruned'));
+
+    // The rollback target's directory does NOT exist on disk (e.g. prune deleted it after this
+    // deployment row's releasePath was recorded) — deliberately never created.
+    const prunedRelease = path.join(cfg.appsDir, 'reroll-pruned', 'releases', '20200101_000000');
+
+    const deploymentId = insertDeployment(db, {
+      projectId,
+      trigger: 'rollback',
+      releasePath: prunedRelease,
+      commitMessage: 'rollback to pruned release',
+    });
+
+    const result = await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+
+    expect(result).toBe('failed');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('failed');
+
+    // current untouched — never pointed at the missing release
+    expect(readCurrentTarget(cfg, 'reroll-pruned')).toBe(liveRelease);
+    // activate/restart never ran
+    expect(sysops.calls).toEqual([]);
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.status).toBe('failed');
   });
 });
