@@ -505,6 +505,71 @@ describe('project env', () => {
   });
 });
 
+describe('GET /api/projects/:id/env/preview', () => {
+  it('returns the mailpit managed block by default', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const res = await app.inject({ method: 'GET', url: `/api/projects/${id}/env/preview`, headers: { cookie } });
+
+    expect(res.statusCode).toBe(200);
+    const { content } = res.json() as { content: string };
+    expect(content).toContain('MAIL_HOST=127.0.0.1');
+    expect(content).toContain('SMTP_PORT=1025');
+    expect(content).toContain('# >>> shipway managed');
+
+    await app.close();
+  });
+
+  it('returns the decrypted custom SMTP config once mode is "custom"', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${id}/smtp`,
+      headers: { cookie },
+      payload: { mode: 'custom', config: { host: 'smtp.example.com', port: 587, username: 'bot', password: 'hunter2' } },
+    });
+
+    const res = await app.inject({ method: 'GET', url: `/api/projects/${id}/env/preview`, headers: { cookie } });
+
+    expect(res.statusCode).toBe(200);
+    const { content } = res.json() as { content: string };
+    expect(content).toContain('MAIL_HOST=smtp.example.com');
+    expect(content).toContain('MAIL_USERNAME=bot');
+    expect(content).toContain('MAIL_PASSWORD=hunter2');
+
+    await app.close();
+  });
+
+  it('returns an empty preview when SMTP mode is "none"', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    await app.inject({ method: 'PUT', url: `/api/projects/${id}/smtp`, headers: { cookie }, payload: { mode: 'none' } });
+
+    const res = await app.inject({ method: 'GET', url: `/api/projects/${id}/env/preview`, headers: { cookie } });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ content: '' });
+
+    await app.close();
+  });
+
+  it('404s for an unknown id', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({ method: 'GET', url: '/api/projects/999999/env/preview', headers: { cookie } });
+    expect(res.statusCode).toBe(404);
+
+    await app.close();
+  });
+});
+
 describe('PUT /api/projects/:id/smtp', () => {
   it('rejects mode "custom" without a config with 400', async () => {
     const { app, cookie } = await buildProjectsTestApp();

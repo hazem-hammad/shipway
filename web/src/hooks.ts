@@ -1,17 +1,24 @@
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import {
   apiFetch,
+  fetchDeployment,
+  fetchDeployments,
   fetchGithubBranches,
   fetchGithubRepos,
   fetchGithubStatus,
   fetchMe,
+  fetchProject,
+  fetchProjectEnv,
+  fetchProjectEnvPreview,
   fetchProjects,
   fetchSettings,
   fetchSetupStatus,
   isPendingDeploymentStatus,
+  type Deployment,
   type GithubRepo,
   type GithubStatus,
   type Me,
+  type Project,
   type ProjectListItem,
   type Settings,
   type SetupStatus,
@@ -75,5 +82,41 @@ export function useGithubBranches(repo: string | null): UseQueryResult<string[]>
     queryKey: ['github-branches', repo],
     queryFn: () => fetchGithubBranches(repo ?? ''),
     enabled: repo !== null,
+  });
+}
+
+// ---- Project detail ----
+
+export function useProject(id: number): UseQueryResult<Project> {
+  return useQuery({ queryKey: ['project', id], queryFn: () => fetchProject(id) });
+}
+
+export function useProjectEnv(id: number): UseQueryResult<{ content: string }> {
+  return useQuery({ queryKey: ['project-env', id], queryFn: () => fetchProjectEnv(id) });
+}
+
+/** The read-only managed-block preview (task 24's new `env/preview` route). */
+export function useProjectEnvPreview(id: number): UseQueryResult<{ content: string }> {
+  return useQuery({ queryKey: ['project-env-preview', id], queryFn: () => fetchProjectEnvPreview(id) });
+}
+
+/**
+ * A project's deployment history (Deployments tab). Polls every 3s while any row is queued/running,
+ * else every 15s per the task-24 controller ruling.
+ */
+export function useDeployments(projectId: number): UseQueryResult<Deployment[]> {
+  return useQuery({
+    queryKey: ['deployments', projectId],
+    queryFn: () => fetchDeployments(projectId),
+    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 3_000 : 15_000),
+  });
+}
+
+/** A single deployment's status (DeploymentLog header). Polls every 3s while queued/running. */
+export function useDeployment(id: number): UseQueryResult<Deployment> {
+  return useQuery({
+    queryKey: ['deployment', id],
+    queryFn: () => fetchDeployment(id),
+    refetchInterval: (query) => (isPendingDeploymentStatus(query.state.data?.status) ? 3_000 : false),
   });
 }

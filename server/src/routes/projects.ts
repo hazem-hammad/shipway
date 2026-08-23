@@ -2,6 +2,7 @@ import { desc, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
+import { buildEnvFile, buildManagedVars, type SmtpConfig } from '../deploy/envfile.js';
 import { ProvisionError, deprovisionProject, provisionProject, refreshProjectConfig, type ProvisionDeps } from '../services/provisioner.js';
 import { allocatePort } from '../system/ports.js';
 import { SLUG_RE } from '../system/templates.js';
@@ -362,6 +363,29 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     app.db.update(projects).set({ envEncrypted }).where(eq(projects.id, id)).run();
 
     return reply.code(204).send();
+  });
+
+  // Read-only preview of what Shipway will append to this project's .env on the next deploy —
+  // the same managed block writeReleaseEnv (deploy/pipeline.ts) writes, computed the same way, but
+  // against an empty userEnv so only the managed block itself comes back (task 24, EnvEditor tab).
+  app.get('/api/projects/:id/env/preview', async (request, reply) => {
+    const paramsParsed = projectIdParamsSchema.safeParse(request.params);
+    if (!paramsParsed.success) {
+      return reply.code(404).send({ error: 'project not found' });
+    }
+
+    const project = app.db.select().from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
+    if (!project) {
+      return reply.code(404).send({ error: 'project not found' });
+    }
+
+    const smtpConfig = project.smtpConfigEncrypted
+      ? (JSON.parse(app.secretBox.decrypt(project.smtpConfigEncrypted)) as SmtpConfig)
+      : undefined;
+    const managed = buildManagedVars({ smtpMode: project.smtpMode, smtpConfig });
+    const content = buildEnvFile('', managed);
+
+    return { content };
   });
 
   app.put('/api/projects/:id/smtp', async (request, reply) => {

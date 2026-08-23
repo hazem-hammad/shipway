@@ -26,3 +26,11 @@ export function formatRelativeTime(epochMs: number): string {
   }
   return relativeTimeFormat.format(diffSeconds, 'second');
 }
+
+/** Formats a millisecond duration as "1m 42s" / "8s", for deployment durations. */
+export function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${String(minutes)}m ${String(seconds)}s` : `${String(seconds)}s`;
+}

@@ -6,11 +6,12 @@
  * word.
  */
 import { useState } from 'react';
-import { Link, useLocation } from 'wouter';
+import { Link, useLocation, useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import { ApiError, deployProject, type LastDeployment, type ProjectListItem } from '../api';
 import { useProjects, useSettings } from '../hooks';
 import { StatusBadge } from '../components/StatusBadge';
+import { ProjectUrl } from '../components/ProjectUrl';
 import { Button, Chip, EmptyState, PageHeader, Skeleton } from '../components/ui';
 import { formatRelativeTime, shortSha } from '../lib/format';
 
@@ -19,10 +20,12 @@ export default function ProjectsPage() {
   const settingsQuery = useSettings();
   const queryClient = useQueryClient();
   const [, navigate] = useLocation();
+  const search = useSearch();
   const [deployingId, setDeployingId] = useState<number | null>(null);
   const [deployError, setDeployError] = useState<string | null>(null);
 
   const baseDomain = settingsQuery.data?.base_domain ?? null;
+  const deletedSlug = new URLSearchParams(search).get('deleted');
 
   async function handleDeploy(project: ProjectListItem) {
     setDeployError(null);
@@ -51,6 +54,12 @@ export default function ProjectsPage() {
           </Link>
         }
       />
+
+      {deletedSlug && (
+        <p role="status" className="mb-4 flex items-center gap-2 text-sm text-go">
+          Project <Chip>{deletedSlug}</Chip> deleted.
+        </p>
+      )}
 
       {deployError && (
         <p role="alert" className="mb-4 text-sm text-stop">
@@ -142,24 +151,6 @@ function ProjectRow({
         </Button>
       </td>
     </tr>
-  );
-}
-
-function ProjectUrl({ slug, baseDomain }: { slug: string; baseDomain: string | null }) {
-  if (!baseDomain) {
-    return <span className="font-mono text-xs text-ink-soft">{slug}</span>;
-  }
-
-  const host = `${slug}.${baseDomain}`;
-  return (
-    <a
-      href={`https://${host}`}
-      target="_blank"
-      rel="noreferrer noopener"
-      className="font-mono text-xs text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-    >
-      {host}
-    </a>
   );
 }
 

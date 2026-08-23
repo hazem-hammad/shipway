@@ -236,6 +236,106 @@ export function createProject(body: CreateProjectBody): Promise<Project> {
   return apiFetch<Project>('/api/projects', { method: 'POST', body });
 }
 
+export function fetchProject(id: number): Promise<Project> {
+  return apiFetch<Project>(`/api/projects/${String(id)}`);
+}
+
+/** Every field `PATCH /api/projects/:id` accepts (slug/repo/type are immutable, so absent here). */
+export interface PatchProjectBody {
+  name?: string;
+  branch?: string;
+  phpVersion?: string;
+  nodeVersion?: string;
+  publicDir?: string;
+  installCmd?: string;
+  buildCmd?: string;
+  startCmd?: string;
+  preDeployScript?: string | null;
+  postDeployScript?: string | null;
+  sharedPaths?: string[];
+  healthCheckPath?: string | null;
+  autoDeploy?: boolean;
+  notifyWebhookUrl?: string | null;
+}
+
+export function patchProject(id: number, body: PatchProjectBody): Promise<Project> {
+  return apiFetch<Project>(`/api/projects/${String(id)}`, { method: 'PATCH', body });
+}
+
+export function deleteProject(id: number, confirmName: string): Promise<void> {
+  return apiFetch<void>(`/api/projects/${String(id)}`, { method: 'DELETE', body: { confirmName } });
+}
+
+export function fetchProjectEnv(id: number): Promise<{ content: string }> {
+  return apiFetch<{ content: string }>(`/api/projects/${String(id)}/env`);
+}
+
+export function putProjectEnv(id: number, content: string): Promise<void> {
+  return apiFetch<void>(`/api/projects/${String(id)}/env`, { method: 'PUT', body: { content } });
+}
+
+/** `content` is the rendered managed block only (task 24: `GET /api/projects/:id/env/preview`). */
+export function fetchProjectEnvPreview(id: number): Promise<{ content: string }> {
+  return apiFetch<{ content: string }>(`/api/projects/${String(id)}/env/preview`);
+}
+
+export interface SmtpConfig {
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  fromAddress?: string;
+  encryption?: string;
+}
+
+export interface SmtpPutBody {
+  mode: 'mailpit' | 'custom' | 'none';
+  config?: SmtpConfig;
+}
+
+export function putProjectSmtp(id: number, body: SmtpPutBody): Promise<void> {
+  return apiFetch<void>(`/api/projects/${String(id)}/smtp`, { method: 'PUT', body });
+}
+
 export function deployProject(id: number): Promise<{ deploymentId: number }> {
   return apiFetch<{ deploymentId: number }>(`/api/projects/${String(id)}/deploy`, { method: 'POST' });
+}
+
+// ---- Deployments ----
+
+export interface Deployment {
+  id: number;
+  projectId: number;
+  status: DeploymentStatus;
+  trigger: 'push' | 'manual' | 'rollback';
+  commitSha: string | null;
+  commitMessage: string | null;
+  releasePath: string | null;
+  logPath: string | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+/** `GET /api/projects/:id/deployments` — newest first, capped at 50 server-side. */
+export function fetchDeployments(projectId: number): Promise<Deployment[]> {
+  return apiFetch<Deployment[]>(`/api/projects/${String(projectId)}/deployments`);
+}
+
+export function fetchDeployment(id: number): Promise<Deployment> {
+  return apiFetch<Deployment>(`/api/deployments/${String(id)}`);
+}
+
+export function cancelDeployment(id: number): Promise<void> {
+  return apiFetch<void>(`/api/deployments/${String(id)}/cancel`, { method: 'POST' });
+}
+
+export function rollbackProject(id: number, releasePath: string): Promise<{ deploymentId: number }> {
+  return apiFetch<{ deploymentId: number }>(`/api/projects/${String(id)}/rollback`, {
+    method: 'POST',
+    body: { releasePath },
+  });
+}
+
+export function fetchDeploymentLog(id: number): Promise<{ content: string }> {
+  return apiFetch<{ content: string }>(`/api/deployments/${String(id)}/log`);
 }
