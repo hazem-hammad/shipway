@@ -1,19 +1,29 @@
+import fastifyWebsocket from '@fastify/websocket';
 import secureSession from '@fastify/secure-session';
+import { eq } from 'drizzle-orm';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
+import { deployments, projects } from './db/schema.js';
 import { getSetting } from './db/settings.js';
+import { DeployQueue, type DeployQueueDeps } from './deploy/queue.js';
+import type { DeployLogger } from './deploy/logger.js';
+import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
+import { makeRunShell } from './deploy/runshell.js';
 import { SecretBox } from './lib/secretbox.js';
 import { authRoutes } from './routes/auth.js';
+import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
 import { projectRoutes } from './routes/projects.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
-import { GitHubService, type GithubAppConfig } from './services/github.js';
+import { makeGitOps } from './services/git.js';
+import { cloneUrl, GitHubService, type GithubAppConfig } from './services/github.js';
+import { sendDeployNotification } from './services/notify.js';
 import { makeSysOps, type SysOps } from './sysops/index.js';
 
 declare module 'fastify' {
@@ -37,6 +47,8 @@ declare module 'fastify' {
      * latest stored credentials.
      */
     dns: () => DnsClient | null;
+    /** Schedules and tracks deploy/rollback jobs; wired to `runDeploy` in `buildApp`. */
+    queue: DeployQueue;
   }
 }
 
@@ -98,6 +110,8 @@ export async function buildApp(
     sysops?: SysOps;
     /** Test-only override: skips the default lazy `dns()` in favor of an injected function. */
     dns?: () => DnsClient | null;
+    /** Test-only override: replaces the real `runDeploy`-backed queue `run` with a fake. */
+    queueRun?: DeployQueueDeps['run'];
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -127,6 +141,70 @@ export async function buildApp(
       }),
   );
 
+  const fetchImpl = deps.fetchImpl ?? fetch;
+
+  // Resolves a project's `repo` ("owner/name") to an authenticated HTTPS clone URL via the
+  // configured GitHub App's installation token. Throws a clear error (surfaced in the deploy log,
+  // see pipeline.ts's `handlePreActivateFailure`) if the app isn't configured/installed yet, rather
+  // than letting a confusing git/auth failure be the first sign something's wrong.
+  async function getCloneUrl(repo: string): Promise<string> {
+    const github = app.github();
+    if (!github) {
+      throw new Error('cannot deploy: the GitHub App is not configured');
+    }
+    const token = await github.getInstallationToken();
+    return cloneUrl(repo, token);
+  }
+
+  // Resolves the webhook to notify for a given deploy: the project's own `notifyWebhookUrl` if
+  // set, else the global `notify_webhook_url` setting; skips silently (no webhook configured
+  // anywhere) and skips `'success'` notifications unless `notify_on_success` is set — failures are
+  // always sent regardless of that setting.
+  async function notify(p: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string }): Promise<void> {
+    if (p.status === 'success' && getSetting<boolean>(app.db, 'notify_on_success') !== true) {
+      return;
+    }
+
+    const deploymentRow = app.db.select({ projectId: deployments.projectId }).from(deployments).where(eq(deployments.id, p.deploymentId)).get();
+    const projectRow = deploymentRow
+      ? app.db.select({ notifyWebhookUrl: projects.notifyWebhookUrl }).from(projects).where(eq(projects.id, deploymentRow.projectId)).get()
+      : undefined;
+
+    const webhookUrl = projectRow?.notifyWebhookUrl ?? getSetting<string>(app.db, 'notify_webhook_url');
+    if (!webhookUrl) {
+      return;
+    }
+
+    await sendDeployNotification(fetchImpl, webhookUrl, p);
+  }
+
+  const pipelineDeps: PipelineDeps = {
+    cfg,
+    db: app.db,
+    sysops: app.sysops,
+    gitOps: makeGitOps(),
+    secretBox: app.secretBox,
+    getCloneUrl,
+    runShell: makeRunShell(),
+    fetchHttp: async (url) => ({ status: (await fetchImpl(url)).status }),
+    notify,
+    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  };
+
+  app.decorate(
+    'queue',
+    new DeployQueue({
+      db: app.db,
+      cfg,
+      concurrency: 2,
+      run:
+        deps.queueRun ??
+        (async (deploymentId: number, signal: AbortSignal, logger: DeployLogger) => {
+          await runDeploy(pipelineDeps, deploymentId, logger, signal);
+        }),
+    }),
+  );
+
   await app.register(secureSession, {
     cookieName: 'shipway',
     key: loadOrCreateSessionKey(cfg.sessionKeyPath),
@@ -138,11 +216,26 @@ export async function buildApp(
     },
   });
 
+  // Registered before both the global auth guard below and any route using `{websocket: true}`
+  // (see routes/deployments.ts's log stream). Order relative to the auth guard matters, not just
+  // "before routes": `@fastify/websocket` adds its own onRequest hook that unconditionally flags
+  // `request.ws` (needed by its onResponse hook, which destroys the raw upgrade socket once a
+  // non-101 response is sent) and an onResponse hook that acts on that flag. Fastify skips
+  // subsequent onRequest hooks once one of them sends a reply — so if the auth guard below were
+  // registered first, it would short-circuit an unauthenticated WS upgrade before `request.ws` is
+  // ever set, the onResponse hook's `if (request.ws)` check would see `null`, and the socket behind
+  // the 401 response would be left open on `Connection: keep-alive` instead of being closed —
+  // silently hanging the client forever instead of surfacing the rejection.
+  await app.register(fastifyWebsocket);
+
   // Global auth guard: registered as a plain onRequest hook (not nested in a sub-plugin) so it runs
   // for every request under `/api/`, including ones that don't match any route — Fastify copies
   // root-level onRequest hooks into the 404 handler's context too, so this 401s before routing ever
   // gets a chance to 404. Runs after the secure-session plugin's own onRequest hook, so
-  // `request.session` is already decoded here.
+  // `request.session` is already decoded here. This also covers WebSocket upgrade requests (see the
+  // `@fastify/websocket` registration above for why it must come first): the onRequest hook runs
+  // before the upgrade completes, so an unauthenticated client gets a 401 HTTP response — and the
+  // connection is actually closed afterward — instead of a successful upgrade.
   app.addHook('onRequest', async (request, reply) => {
     if (!request.url.startsWith('/api/')) return;
 
@@ -163,6 +256,11 @@ export async function buildApp(
   await app.register(settingsRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
+  await app.register(deploymentRoutes);
+
+  // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
+  // every route is registered, since it can start deploys immediately via the queue's `run`.
+  app.queue.recoverOnBoot();
 
   return app;
 }
