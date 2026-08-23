@@ -15,6 +15,7 @@ import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
 import { makeRunShell } from './deploy/runshell.js';
 import { SecretBox } from './lib/secretbox.js';
 import { authRoutes } from './routes/auth.js';
+import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
@@ -277,6 +278,7 @@ export async function buildApp(
   await app.register(databaseRoutes);
   await app.register(servicesRoutes);
   await app.register(workerRoutes);
+  await app.register(cronRoutes);
   await app.register(webhookRoutes);
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
