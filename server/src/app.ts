@@ -5,14 +5,23 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
+import { getSetting } from './db/settings.js';
 import { authRoutes } from './routes/auth.js';
+import { githubRoutes } from './routes/github.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
+import { GitHubService, type GithubAppConfig } from './services/github.js';
 
 declare module 'fastify' {
   interface FastifyInstance {
     cfg: Config;
     db: ShipwayDb;
+    /**
+     * Lazily builds a `GitHubService` from the current `github_app` setting, or `null` when
+     * unconfigured. Called fresh per use (not cached on the instance) so routes always see the
+     * latest stored credentials/installation id.
+     */
+    github: () => GitHubService | null;
   }
 }
 
@@ -57,13 +66,17 @@ function loadOrCreateSessionKey(keyPath: string): Buffer {
   return key;
 }
 
-export async function buildApp(cfg: Config): Promise<FastifyInstance> {
+export async function buildApp(cfg: Config, deps: { fetchImpl?: typeof fetch } = {}): Promise<FastifyInstance> {
   const app = Fastify({
     logger: cfg.devMode,
   });
 
   app.decorate('cfg', cfg);
   app.decorate('db', openDb(cfg.dbPath));
+  app.decorate('github', () => {
+    const githubAppCfg = getSetting<GithubAppConfig>(app.db, 'github_app');
+    return githubAppCfg ? new GitHubService(githubAppCfg) : null;
+  });
 
   await app.register(secureSession, {
     cookieName: 'shipway',
@@ -99,6 +112,7 @@ export async function buildApp(cfg: Config): Promise<FastifyInstance> {
   await app.register(authRoutes);
   await app.register(userRoutes);
   await app.register(settingsRoutes);
+  await app.register(githubRoutes, { fetchImpl: deps.fetchImpl });
 
   return app;
 }
