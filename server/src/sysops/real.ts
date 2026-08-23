@@ -1,5 +1,5 @@
 import { execa } from 'execa';
-import { assertUnitName } from './types.js';
+import { assertUnitName, assertUnitPattern } from './types.js';
 import type { SysOps, UnitAction, UnitStatus } from './types.js';
 
 const PHP_VERSION_RE = /^8\.[0-9]+$/;
@@ -66,7 +66,7 @@ export class RealSysOps implements SysOps {
   }
 
   async journalTail(unit: string, lines: number): Promise<string> {
-    assertUnitName(unit);
+    assertUnitPattern(unit);
     const clamped = Math.min(MAX_JOURNAL_LINES, Math.max(MIN_JOURNAL_LINES, Math.trunc(lines)));
     const result = await this.run('journalctl', ['-u', unit, '-n', String(clamped), '--no-pager']);
     return result.stdout;

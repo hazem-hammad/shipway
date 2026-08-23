@@ -47,3 +47,17 @@ export function assertUnitName(unit: string): void {
     throw new Error(`Invalid unit name: ${unit}`);
   }
 }
+
+const UNIT_PATTERN_RE = /^shipway-[a-z0-9@.*-]+$/;
+
+/**
+ * Like {@link assertUnitName}, but also allows `*` — a `journalctl -u`
+ * glob, used to tail every instance of a worker's template unit at once
+ * (e.g. `shipway-worker-<slug>-<name>@*`). Only `journalTail` accepts a
+ * pattern this loose; `unitAction`/`unitStatus` stay on `assertUnitName`.
+ */
+export function assertUnitPattern(pattern: string): void {
+  if (!UNIT_PATTERN_RE.test(pattern)) {
+    throw new Error(`Invalid unit pattern: ${pattern}`);
+  }
+}

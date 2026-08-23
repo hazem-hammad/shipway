@@ -20,11 +20,12 @@ import { connect } from 'node:net';
 import * as path from 'node:path';
 import type { Config } from '../config.js';
 import type { ShipwayDb } from '../db/index.js';
-import { deployments, projects } from '../db/schema.js';
+import { deployments, projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import type { SecretBox } from '../lib/secretbox.js';
 import type { GitOps } from '../services/git.js';
 import { nodeBinDir } from '../services/provisioner.js';
+import { workerInstances } from '../services/workers.js';
 import type { SysOps } from '../sysops/types.js';
 import { unitNames } from '../system/templates.js';
 import { buildEnvFile, buildManagedVars, type SmtpConfig } from './envfile.js';
@@ -32,6 +33,7 @@ import type { DeployLogger } from './logger.js';
 
 type DeploymentRow = typeof deployments.$inferSelect;
 type ProjectRow = typeof projects.$inferSelect;
+type WorkerRow = typeof workers.$inferSelect;
 
 export interface PipelineDeps {
   cfg: Config;
@@ -307,6 +309,19 @@ async function restartRuntime(deps: PipelineDeps, project: ProjectRow): Promise<
   }
 }
 
+function getProjectWorkers(db: ShipwayDb, projectId: number): WorkerRow[] {
+  return db.select().from(workers).where(eq(workers.projectId, projectId)).all();
+}
+
+/** Restarts every instance of every worker in `rows`. */
+async function restartWorkers(deps: PipelineDeps, project: ProjectRow, rows: WorkerRow[]): Promise<void> {
+  for (const worker of rows) {
+    for (const unit of workerInstances(project.slug, worker.name, worker.processes)) {
+      await deps.sysops.unitAction('restart', unit);
+    }
+  }
+}
+
 const HEALTH_CHECK_TRIES = 5;
 const HEALTH_CHECK_INTERVAL_MS = 3000;
 const WAIT_FOR_PORT_TIMEOUT_MS = 15000;
@@ -561,6 +576,13 @@ async function runPostActivate(
     logger.section('restart');
     checkAborted(signal);
     await restartRuntime(deps, project);
+
+    const workerRows = getProjectWorkers(deps.db, project.id);
+    if (workerRows.length > 0) {
+      logger.section('workers');
+      checkAborted(signal);
+      await restartWorkers(deps, project, workerRows);
+    }
 
     logger.section('health');
     checkAborted(signal);

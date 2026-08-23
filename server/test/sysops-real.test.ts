@@ -200,6 +200,18 @@ describe('RealSysOps command assembly', () => {
     expect(calls).toEqual([]);
   });
 
+  it('journalTail accepts a systemd unit glob pattern (for tailing every instance of a template unit)', async () => {
+    const { run, calls } = makeStubRun({ stdout: 'log line\n' });
+    const sysops = new RealSysOps(run);
+
+    const output = await sysops.journalTail('shipway-worker-shop-mailer@*', 50);
+
+    expect(output).toBe('log line\n');
+    expect(calls).toEqual([
+      { file: 'journalctl', args: ['-u', 'shipway-worker-shop-mailer@*', '-n', '50', '--no-pager'], options: undefined },
+    ]);
+  });
+
   it('readCrontab runs crontab -l without sudo and returns stdout on success', async () => {
     const { run, calls } = makeStubRun({ stdout: '* * * * * /bin/true\n' });
     const sysops = new RealSysOps(run);

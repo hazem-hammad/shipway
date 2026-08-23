@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { assertUnitName } from './types.js';
+import { assertUnitName, assertUnitPattern } from './types.js';
 import type { SysOps, UnitAction, UnitStatus } from './types.js';
 
 /**
@@ -59,7 +59,7 @@ export class DevSysOps implements SysOps {
   }
 
   async journalTail(unit: string, lines: number): Promise<string> {
-    assertUnitName(unit);
+    assertUnitPattern(unit);
     this.calls.push(`journalTail ${unit} ${lines}`);
     return '';
   }

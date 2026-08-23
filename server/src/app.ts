@@ -22,6 +22,7 @@ import { projectRoutes } from './routes/projects.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
+import { workerRoutes } from './routes/workers.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { makeGitOps } from './services/git.js';
@@ -275,6 +276,7 @@ export async function buildApp(
   await app.register(deploymentRoutes);
   await app.register(databaseRoutes);
   await app.register(servicesRoutes);
+  await app.register(workerRoutes);
   await app.register(webhookRoutes);
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after

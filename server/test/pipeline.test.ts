@@ -5,9 +5,10 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { openDb, type ShipwayDb } from '../src/db/index.js';
-import { deployments, projects } from '../src/db/schema.js';
+import { deployments, projects, workers } from '../src/db/schema.js';
 import { loadConfig, type Config } from '../src/config.js';
 import { DevSysOps } from '../src/sysops/dev.js';
+import type { UnitAction } from '../src/sysops/types.js';
 import { makeGitOps, type GitOps } from '../src/services/git.js';
 import { SecretBox } from '../src/lib/secretbox.js';
 import { DeployLogger } from '../src/deploy/logger.js';
@@ -192,10 +193,17 @@ interface BaseHarness {
   deps: PipelineDeps;
 }
 
-function makeHarness(opts: { fetchHttp?: (url: string) => Promise<{ status: number }>; gitOps?: GitOps } = {}): BaseHarness {
+function makeHarness(
+  opts: {
+    fetchHttp?: (url: string) => Promise<{ status: number }>;
+    gitOps?: GitOps;
+    /** Test-only override: builds the harness's sysops from `cfg` instead of a plain `DevSysOps`. */
+    sysopsFactory?: (cfg: Config) => DevSysOps;
+  } = {},
+): BaseHarness {
   const cfg = makeCfg();
   const db = makeDb(cfg);
-  const sysops = new DevSysOps(sysopsRoot(cfg));
+  const sysops = opts.sysopsFactory ? opts.sysopsFactory(cfg) : new DevSysOps(sysopsRoot(cfg));
   const gitOps = opts.gitOps ?? makeGitOps();
   const shell = new RecordingShell();
   const secretBox = makeSecretBox(cfg);
@@ -221,6 +229,24 @@ function makeHarness(opts: { fetchHttp?: (url: string) => Promise<{ status: numb
   };
 
   return { cfg, db, sysops, gitOps, shell, secretBox, notifications, fetchHttp, logger, deps };
+}
+
+/** Fails `unitAction` for exactly one unit name (e.g. a worker instance), succeeding for everything else. */
+class FailingUnitActionSysOps extends DevSysOps {
+  constructor(
+    root: string,
+    private readonly failUnit: string,
+  ) {
+    super(root);
+  }
+
+  override async unitAction(action: UnitAction, unit: string): Promise<void> {
+    if (unit === this.failUnit) {
+      this.calls.push(`unitAction ${action} ${unit} (FAILS)`);
+      throw new Error(`systemctl ${action} ${unit}: failed`);
+    }
+    return super.unitAction(action, unit);
+  }
 }
 
 function currentPath(cfg: Config, slug: string): string {
@@ -611,6 +637,112 @@ describe('runDeploy — rollback trigger', () => {
     expect(readCurrentTarget(cfg, 'reroll-pruned')).toBe(liveRelease);
     // activate/restart never ran
     expect(sysops.calls).toEqual([]);
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.status).toBe('failed');
+  });
+});
+
+describe('runDeploy — workers', () => {
+  it('restarts every instance of every project worker after the runtime restart, sectioned between restart and health', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, sysops, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'queue-app', type: 'static' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    db.insert(workers).values({ projectId, name: 'mailer', command: 'php artisan queue:work', processes: 2 }).run();
+
+    const lines: string[] = [];
+    logger.on('line', (l: string) => lines.push(l));
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+    const result = await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+
+    expect(result).toBe('success');
+    expect(sysops.calls).toContain('unitAction restart shipway-worker-queue-app-mailer@1.service');
+    expect(sysops.calls).toContain('unitAction restart shipway-worker-queue-app-mailer@2.service');
+
+    const sections = lines.filter((l) => l.includes('==>')).map((l) => l.replace(/^\[[\d:]+\] ==> /, ''));
+    expect(sections).toEqual([
+      'resolve',
+      'export',
+      'shared',
+      'env',
+      'pre_deploy',
+      'build',
+      'activate',
+      'restart',
+      'workers',
+      'health',
+      'post_deploy',
+      'prune',
+    ]);
+  });
+
+  it('restarts instances for every worker of the project, not just the first', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, sysops, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'multi-worker', type: 'static' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    db.insert(workers).values({ projectId, name: 'mailer', command: 'php artisan queue:work', processes: 1 }).run();
+    db.insert(workers).values({ projectId, name: 'reaper', command: 'php artisan schedule:work', processes: 1 }).run();
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+    const result = await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+
+    expect(result).toBe('success');
+    expect(sysops.calls).toContain('unitAction restart shipway-worker-multi-worker-mailer@1.service');
+    expect(sysops.calls).toContain('unitAction restart shipway-worker-multi-worker-reaper@1.service');
+  });
+
+  it('skips the workers stage silently (no "workers" log section) when the project has no workers', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'no-workers', type: 'static' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+
+    const lines: string[] = [];
+    logger.on('line', (l: string) => lines.push(l));
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+    const result = await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+
+    expect(result).toBe('success');
+    const sections = lines.filter((l) => l.includes('==>')).map((l) => l.replace(/^\[[\d:]+\] ==> /, ''));
+    expect(sections).not.toContain('workers');
+  });
+
+  it('a worker restart failure triggers rollback the same way a runtime restart failure would', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const failUnit = 'shipway-worker-queue-fail-mailer@1.service';
+    const { cfg, db, notifications, logger, deps } = makeHarness({
+      sysopsFactory: (cfg) => new FailingUnitActionSysOps(sysopsRoot(cfg), failUnit),
+    });
+
+    const projectId = insertProject(db, { slug: 'queue-fail', type: 'static' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    db.insert(workers).values({ projectId, name: 'mailer', command: 'php artisan queue:work', processes: 1 }).run();
+
+    const prevReleaseDir = path.join(cfg.appsDir, 'queue-fail', 'releases', 'prev-release');
+    fs.mkdirSync(prevReleaseDir, { recursive: true });
+    fs.mkdirSync(path.dirname(currentPath(cfg, 'queue-fail')), { recursive: true });
+    fs.symlinkSync(prevReleaseDir, currentPath(cfg, 'queue-fail'));
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+    const result = await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+
+    expect(result).toBe('failed');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('failed');
+
+    // rolled back to the previous release, same as a runtime restart failure would
+    expect(readCurrentTarget(cfg, 'queue-fail')).toBe(prevReleaseDir);
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');

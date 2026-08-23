@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DevSysOps } from '../src/sysops/dev.js';
-import { assertUnitName } from '../src/sysops/types.js';
+import { assertUnitName, assertUnitPattern } from '../src/sysops/types.js';
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'sysops-dev-test-'));
@@ -34,6 +34,25 @@ describe('assertUnitName', () => {
   ])('rejects %s', (unit) => {
     expect(() => assertUnitName(unit)).toThrow();
   });
+});
+
+describe('assertUnitPattern', () => {
+  it.each([
+    'shipway-app-foo',
+    'shipway-worker-bar-baz@1.service',
+    'shipway-worker-bar-baz@*',
+    'shipway-worker-bar-baz@*.service',
+    'shipway-*',
+  ])('accepts %s', (pattern) => {
+    expect(() => assertUnitPattern(pattern)).not.toThrow();
+  });
+
+  it.each(['nginx', 'shipway-', 'shipway', 'Shipway-App-Foo', 'shipway-app foo', 'shipway-app_foo', 'shipway-app/../etc', ''])(
+    'rejects %s',
+    (pattern) => {
+      expect(() => assertUnitPattern(pattern)).toThrow();
+    },
+  );
 });
 
 describe('DevSysOps', () => {
@@ -147,6 +166,15 @@ describe('DevSysOps', () => {
     const sysops = new DevSysOps(tmpDir());
 
     await expect(sysops.journalTail('not-a-shipway-unit', 50)).rejects.toThrow();
+  });
+
+  it('journalTail accepts a systemd unit glob pattern (for tailing every instance of a template unit)', async () => {
+    const sysops = new DevSysOps(tmpDir());
+
+    const output = await sysops.journalTail('shipway-worker-shop-mailer@*', 50);
+
+    expect(output).toBe('');
+    expect(sysops.calls).toContain('journalTail shipway-worker-shop-mailer@* 50');
   });
 
   it('readCrontab returns "" before anything has been written', async () => {
