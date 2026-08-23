@@ -83,6 +83,35 @@ describe('makeGitOps (real git integration)', () => {
     );
   });
 
+  it('fetchBranchTip resolves the branch tip, not a same-named tag pointing at an older commit', async () => {
+    const fixtureDir = tmpDir('shipway-git-fixture');
+    const olderSha = await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    // A tag named "main" — same simple name as the branch — pointing at the older commit.
+    // `git rev-parse` alone disambiguates refs/tags/* before refs/heads/*, so a naive
+    // `rev-parse main` would resolve to this tag instead of the branch tip.
+    await execa('git', ['tag', 'main', olderSha], { cwd: fixtureDir });
+    const branchSha = await addCommit(fixtureDir, '<h1>v2</h1>\n', 'second commit');
+    const projectDir = tmpDir('shipway-git-project');
+    const gitOps = makeGitOps();
+
+    const result = await gitOps.fetchBranchTip(projectDir, fileUrl(fixtureDir), 'main');
+
+    expect(result.sha).toBe(branchSha);
+    expect(result.sha).not.toBe(olderSha);
+    expect(result.message).toBe('second commit');
+  });
+
+  it.each(['-x', '--help'])('fetchBranchTip rejects a flag-like branch name %s', async (branch) => {
+    const fixtureDir = tmpDir('shipway-git-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const projectDir = tmpDir('shipway-git-project');
+    const gitOps = makeGitOps();
+
+    await expect(gitOps.fetchBranchTip(projectDir, fileUrl(fixtureDir), branch)).rejects.toThrow(
+      /invalid branch name/,
+    );
+  });
+
   it('fetchBranchTip redacts credentials from thrown error messages', async () => {
     const url = 'https://x-access-token:super-secret-token@example.com/acme/repo.git';
     const stubRun = (async (file: string, args: readonly string[] = []) => {
@@ -123,5 +152,13 @@ describe('makeGitOps (real git integration)', () => {
     await gitOps.exportRelease(projectDir, firstSha, releaseDir);
 
     expect(fs.readFileSync(path.join(releaseDir, 'index.html'), 'utf8')).toBe('<h1>v1</h1>\n');
+  });
+
+  it.each(['-x', 'not-a-sha', 'abc123'])('exportRelease rejects an invalid sha %s without spawning git', async (sha) => {
+    const projectDir = tmpDir('shipway-git-project');
+    const gitOps = makeGitOps();
+    const releaseDir = path.join(tmpDir('shipway-git-release'), 'release-bad');
+
+    await expect(gitOps.exportRelease(projectDir, sha, releaseDir)).rejects.toThrow(/invalid sha/);
   });
 });

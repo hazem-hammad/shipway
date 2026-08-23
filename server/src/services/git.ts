@@ -21,11 +21,15 @@ import { join } from 'node:path';
 export interface GitOps {
   /**
    * Ensures `<projectDir>/repo` is a bare mirror of `url`, up to date, then resolves `branch`'s
-   * tip. Clones on first use; fetches (after updating the remote URL) on subsequent calls. Throws
-   * a clear `Error` if `branch` doesn't exist.
+   * tip strictly from `refs/heads/<branch>` (never falling back to a same-named tag or other
+   * ref). Clones on first use; fetches (after updating the remote URL) on subsequent calls.
+   * Throws a clear `Error` if `branch` doesn't exist or looks flag-like (starts with `-`).
    */
   fetchBranchTip(projectDir: string, url: string, branch: string): Promise<{ sha: string; message: string }>;
-  /** Exports the tree at `sha` from `<projectDir>/repo` into `releaseDir` (created if missing), without `.git`. */
+  /**
+   * Exports the tree at `sha` from `<projectDir>/repo` into `releaseDir` (created if missing),
+   * without `.git`. Throws if `sha` isn't a full 40-character hex object id.
+   */
   exportRelease(projectDir: string, sha: string, releaseDir: string): Promise<void>;
 }
 
@@ -40,10 +44,19 @@ function sanitizeError(err: unknown, url: string): Error {
   return new Error(raw.split(url).join(redactUrl(url)));
 }
 
+/** Matches a full 40-character lowercase-hex git object sha. */
+const SHA_RE = /^[0-9a-f]{40}$/;
+
 /** Builds the real `GitOps`. `run` defaults to `execa`; tests may inject a stub. */
 export function makeGitOps(run: typeof execa = execa): GitOps {
   return {
     async fetchBranchTip(projectDir, url, branch) {
+      // Reject flag-like branch names up front — belt-and-suspenders on top of the
+      // `refs/heads/` prefix below, which already stops them being interpreted as flags.
+      if (branch.startsWith('-')) {
+        throw new Error(`invalid branch name: "${branch}"`);
+      }
+
       const repoDir = join(projectDir, 'repo');
 
       try {
@@ -58,9 +71,13 @@ export function makeGitOps(run: typeof execa = execa): GitOps {
         throw sanitizeError(err, url);
       }
 
+      // `--verify refs/heads/<branch>` (rather than a bare `rev-parse <branch>`) is required:
+      // plain `rev-parse <name>` disambiguates refs/tags/<name> BEFORE refs/heads/<name> (see
+      // gitrevisions(7)), so a tag sharing the branch's name would silently win and resolve to
+      // the wrong commit. Mirror clones keep branches under refs/heads/, same as any clone.
       let sha: string;
       try {
-        const result = await run('git', ['-C', repoDir, 'rev-parse', branch]);
+        const result = await run('git', ['-C', repoDir, 'rev-parse', '--verify', `refs/heads/${branch}`]);
         sha = result.stdout.trim();
       } catch {
         throw new Error(`branch "${branch}" not found at ${redactUrl(url)}`);
@@ -71,6 +88,10 @@ export function makeGitOps(run: typeof execa = execa): GitOps {
     },
 
     async exportRelease(projectDir, sha, releaseDir) {
+      if (!SHA_RE.test(sha)) {
+        throw new Error(`invalid sha: "${sha}"`);
+      }
+
       const repoDir = join(projectDir, 'repo');
       await mkdir(releaseDir, { recursive: true });
       await run('git', ['-C', repoDir, 'archive', sha]).pipe('tar', ['-x', '-C', releaseDir]);
