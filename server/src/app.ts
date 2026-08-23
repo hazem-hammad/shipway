@@ -20,6 +20,7 @@ import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
 import { projectRoutes } from './routes/projects.js';
+import { serverRoutes } from './routes/server.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
@@ -279,6 +280,7 @@ export async function buildApp(
   await app.register(servicesRoutes);
   await app.register(workerRoutes);
   await app.register(cronRoutes);
+  await app.register(serverRoutes);
   await app.register(webhookRoutes);
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after

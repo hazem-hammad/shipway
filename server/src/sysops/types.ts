@@ -27,6 +27,13 @@ export interface SysOps {
   unitAction(action: UnitAction, unit: string): Promise<void>;
   /** Reads the current status of a Shipway-managed unit. Never throws. */
   unitStatus(unit: string): Promise<UnitStatus>;
+  /**
+   * Reads the current status of a shared system unit (one of `SYSTEM_UNITS` — nginx, php-fpm,
+   * mysql, postgresql, redis, mailpit). These aren't Shipway-managed (no `shipway-` prefix), so they
+   * go through this separate method rather than `unitStatus`, which enforces that prefix. Never
+   * throws.
+   */
+  systemUnitStatus(unit: string): Promise<UnitStatus>;
   /** Tails the last `lines` lines of a unit's journal. */
   journalTail(unit: string, lines: number): Promise<string>;
   /** Reads the current user's crontab, or `''` if none is set. */
@@ -59,5 +66,31 @@ const UNIT_PATTERN_RE = /^shipway-[a-z0-9@.*-]+$/;
 export function assertUnitPattern(pattern: string): void {
   if (!UNIT_PATTERN_RE.test(pattern)) {
     throw new Error(`Invalid unit pattern: ${pattern}`);
+  }
+}
+
+/**
+ * The shared (non-Shipway-managed) systemd units `GET /api/server/stats` reports status for. Unlike
+ * `assertUnitName`'s `shipway-`-prefixed units, these are services Shipway only observes, never
+ * installs — so `systemUnitStatus` validates against this fixed allowlist instead.
+ */
+export const SYSTEM_UNITS = [
+  'nginx',
+  'php8.1-fpm',
+  'php8.2-fpm',
+  'php8.3-fpm',
+  'php8.4-fpm',
+  'mysql',
+  'postgresql',
+  'redis-server',
+  'mailpit',
+] as const;
+
+export type SystemUnit = (typeof SYSTEM_UNITS)[number];
+
+/** Throws if `unit` isn't one of `SYSTEM_UNITS`. */
+export function assertSystemUnit(unit: string): asserts unit is SystemUnit {
+  if (!(SYSTEM_UNITS as readonly string[]).includes(unit)) {
+    throw new Error(`Invalid system unit: ${unit}`);
   }
 }

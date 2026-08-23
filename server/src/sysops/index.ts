@@ -4,8 +4,8 @@ import { DevSysOps } from './dev.js';
 import { RealSysOps } from './real.js';
 import type { SysOps } from './types.js';
 
-export type { SysOps, UnitAction, UnitStatus } from './types.js';
-export { assertUnitName, assertUnitPattern } from './types.js';
+export type { SysOps, UnitAction, UnitStatus, SystemUnit } from './types.js';
+export { assertUnitName, assertUnitPattern, assertSystemUnit, SYSTEM_UNITS } from './types.js';
 export { DevSysOps } from './dev.js';
 export { RealSysOps } from './real.js';
 

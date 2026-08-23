@@ -1,6 +1,6 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { assertUnitName, assertUnitPattern } from './types.js';
+import { assertSystemUnit, assertUnitName, assertUnitPattern } from './types.js';
 import type { SysOps, UnitAction, UnitStatus } from './types.js';
 
 /**
@@ -55,6 +55,12 @@ export class DevSysOps implements SysOps {
   async unitStatus(unit: string): Promise<UnitStatus> {
     assertUnitName(unit);
     this.calls.push(`unitStatus ${unit}`);
+    return 'unknown';
+  }
+
+  async systemUnitStatus(unit: string): Promise<UnitStatus> {
+    assertSystemUnit(unit);
+    this.calls.push(`systemUnitStatus ${unit}`);
     return 'unknown';
   }
 

@@ -1,5 +1,5 @@
 import { execa } from 'execa';
-import { assertUnitName, assertUnitPattern } from './types.js';
+import { assertSystemUnit, assertUnitName, assertUnitPattern } from './types.js';
 import type { SysOps, UnitAction, UnitStatus } from './types.js';
 
 const PHP_VERSION_RE = /^8\.[0-9]+$/;
@@ -53,6 +53,16 @@ export class RealSysOps implements SysOps {
 
   async unitStatus(unit: string): Promise<UnitStatus> {
     assertUnitName(unit);
+    return this.queryIsActive(unit);
+  }
+
+  async systemUnitStatus(unit: string): Promise<UnitStatus> {
+    assertSystemUnit(unit);
+    return this.queryIsActive(unit);
+  }
+
+  /** Shared `systemctl is-active <unit>` query behind `unitStatus`/`systemUnitStatus`. No sudo; never throws. */
+  private async queryIsActive(unit: string): Promise<UnitStatus> {
     try {
       const result = await this.run('systemctl', ['is-active', unit], { reject: false });
       const status = result.stdout.trim();

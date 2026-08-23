@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { DevSysOps } from '../src/sysops/dev.js';
-import { assertUnitName, assertUnitPattern } from '../src/sysops/types.js';
+import { SYSTEM_UNITS, assertSystemUnit, assertUnitName, assertUnitPattern } from '../src/sysops/types.js';
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'sysops-dev-test-'));
@@ -53,6 +53,16 @@ describe('assertUnitPattern', () => {
       expect(() => assertUnitPattern(pattern)).toThrow();
     },
   );
+});
+
+describe('SYSTEM_UNITS / assertSystemUnit', () => {
+  it.each(SYSTEM_UNITS)('accepts %s', (unit) => {
+    expect(() => assertSystemUnit(unit)).not.toThrow();
+  });
+
+  it.each(['evil-unit', 'shipway-app-foo', 'NGINX', 'nginx; rm -rf /', 'php8.5-fpm', ''])('rejects %s', (unit) => {
+    expect(() => assertSystemUnit(unit)).toThrow();
+  });
 });
 
 describe('DevSysOps', () => {
@@ -151,6 +161,22 @@ describe('DevSysOps', () => {
     const sysops = new DevSysOps(tmpDir());
 
     await expect(sysops.unitStatus('not-a-shipway-unit')).rejects.toThrow();
+  });
+
+  it('systemUnitStatus always returns "unknown" for an allowlisted unit and records the call', async () => {
+    const sysops = new DevSysOps(tmpDir());
+
+    const status = await sysops.systemUnitStatus('mysql');
+
+    expect(status).toBe('unknown');
+    expect(sysops.calls).toContain('systemUnitStatus mysql');
+  });
+
+  it('systemUnitStatus rejects a unit outside the SYSTEM_UNITS allowlist and does not record the call', async () => {
+    const sysops = new DevSysOps(tmpDir());
+
+    await expect(sysops.systemUnitStatus('evil-unit')).rejects.toThrow();
+    expect(sysops.calls).toEqual([]);
   });
 
   it('journalTail always returns "" for a valid unit and records the call', async () => {

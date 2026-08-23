@@ -165,6 +165,45 @@ describe('RealSysOps command assembly', () => {
     expect(calls).toEqual([]);
   });
 
+  it('systemUnitStatus runs systemctl is-active <unit> without sudo, for shared (non-shipway-prefixed) units', async () => {
+    const { run, calls } = makeStubRun({ stdout: 'active\n' });
+    const sysops = new RealSysOps(run);
+
+    const status = await sysops.systemUnitStatus('nginx');
+
+    expect(status).toBe('active');
+    expect(calls).toEqual([{ file: 'systemctl', args: ['is-active', 'nginx'], options: { reject: false } }]);
+  });
+
+  it.each([
+    ['inactive\n', 'inactive'],
+    ['failed\n', 'failed'],
+    ['activating\n', 'unknown'],
+    ['', 'unknown'],
+  ])('systemUnitStatus maps stdout %j to %s', async (stdout, expected) => {
+    const { run } = makeStubRun({ stdout });
+    const sysops = new RealSysOps(run);
+
+    expect(await sysops.systemUnitStatus('mailpit')).toBe(expected);
+  });
+
+  it('systemUnitStatus returns "unknown" instead of throwing when the run fails', async () => {
+    const run = vi.fn(async () => {
+      throw new Error('spawn failed');
+    }) as unknown as typeof execa;
+    const sysops = new RealSysOps(run);
+
+    await expect(sysops.systemUnitStatus('nginx')).resolves.toBe('unknown');
+  });
+
+  it('systemUnitStatus rejects a unit outside the SYSTEM_UNITS allowlist, without shelling out', async () => {
+    const { run, calls } = makeStubRun();
+    const sysops = new RealSysOps(run);
+
+    await expect(sysops.systemUnitStatus('evil-unit')).rejects.toThrow();
+    expect(calls).toEqual([]);
+  });
+
   it('journalTail runs journalctl without sudo and clamps lines into [1, 1000]', async () => {
     const { run, calls } = makeStubRun({ stdout: 'log line\n' });
     const sysops = new RealSysOps(run);
