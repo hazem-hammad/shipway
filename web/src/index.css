@@ -1,0 +1,99 @@
+@import 'tailwindcss';
+
+@import '@fontsource/ibm-plex-sans/400.css';
+@import '@fontsource/ibm-plex-sans/500.css';
+@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+
+/*
+ * Design tokens, straight from DESIGN.md. OKLCH, neutrals tinted toward the harbor hue (220-240).
+ * Naming these under Tailwind's `--color-*` / `--font-*` / `--text-*` namespaces auto-generates
+ * matching utilities (bg-paper, text-ink-soft, border-line, font-mono, text-base, ...) — no need to
+ * hand-roll a config file for the palette or the type scale.
+ */
+@theme {
+  --color-ink: oklch(0.25 0.02 240);
+  --color-ink-soft: oklch(0.45 0.015 235);
+  --color-paper: oklch(0.977 0.004 220);
+  --color-panel: oklch(0.945 0.006 225);
+  --color-line: oklch(0.88 0.008 225);
+  --color-accent: oklch(0.52 0.1 215);
+  --color-accent-soft: oklch(0.93 0.03 215);
+  --color-go: oklch(0.6 0.15 150);
+  --color-stop: oklch(0.55 0.18 25);
+  --color-hold: oklch(0.7 0.13 75);
+  --color-term: oklch(0.21 0.02 235);
+  --color-term-text: oklch(0.88 0.02 160);
+
+  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Fixed rem scale, ratio ~1.2: 12 / 13 / 14 (base) / 16 / 20 / 24 — weight does hierarchy work
+     before size does (see DESIGN.md's Typography section). Mapped onto Tailwind's usual size
+     names so component code still reads as `text-sm`, `text-lg`, etc. */
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.875rem;
+  --text-lg: 1rem;
+  --text-xl: 1.25rem;
+  --text-2xl: 1.5rem;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+  }
+}
+
+/* Berth-light pulse: the one recurring identity mark (DESIGN.md, Signature). 1.6s ease-in-out,
+   infinite, applied only to running/queued lamps — and switched off entirely for anyone who asked
+   for reduced motion. */
+@keyframes berth-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.berth-pulse {
+  animation: berth-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .berth-pulse {
+    animation: none;
+  }
+}
+
+/* Skeleton loading: a panel-tint shimmer, never a centered spinner (DESIGN.md, Components). */
+@keyframes shimmer {
+  0% {
+    background-position: 150% 0;
+  }
+  100% {
+    background-position: -50% 0;
+  }
+}
+
+.skeleton {
+  background-image: linear-gradient(
+    100deg,
+    var(--color-panel) 30%,
+    color-mix(in oklch, var(--color-panel), var(--color-line) 65%) 50%,
+    var(--color-panel) 70%
+  );
+  background-size: 300% 100%;
+  animation: shimmer 1.8s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+  }
+}

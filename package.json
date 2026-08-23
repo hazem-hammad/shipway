@@ -9,8 +9,8 @@
   ],
   "scripts": {
     "test": "npm run test -w server",
-    "typecheck": "npm run typecheck -w server",
-    "build": "npm run build -w server"
+    "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
+    "build": "npm run build -w server && npm run build -w web"
   },
   "license": "ISC"
 }

@@ -1,3 +1,4 @@
+import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import secureSession from '@fastify/secure-session';
 import { eq } from 'drizzle-orm';
@@ -5,6 +6,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
 import { deployments, projects } from './db/schema.js';
@@ -15,6 +17,7 @@ import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
 import { makeRunShell } from './deploy/runshell.js';
 import { SecretBox } from './lib/secretbox.js';
 import { authRoutes } from './routes/auth.js';
+import { cloudflareRoutes } from './routes/cloudflare.js';
 import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
@@ -75,6 +78,15 @@ declare module '@fastify/secure-session' {
 
 const SESSION_KEY_LENGTH = 32;
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * The built web SPA's `dist` directory. This file lives at `src/app.ts` (compiles to
+ * `dist/app.js`), so in both cases the sibling `web` package is two levels up: `src`/`dist` ->
+ * `server` -> repo root -> `web/dist`.
+ */
+const DEFAULT_WEB_DIST_DIR = path.resolve(__dirname, '../../web/dist');
+
 /**
  * Path prefixes under `/api/` that do NOT require an authenticated session. Everything else under
  * `/api/` is guarded by the global `onRequest` hook below. `/api/health` itself is checked
@@ -123,6 +135,10 @@ export async function buildApp(
     /** Test-only override: replaces the real mysql2/pg-backed `DbAdmin` with a fake (e.g. one that
      * records calls and can be made to throw), so database route tests never touch a real server. */
     dbAdmin?: DbAdmin;
+    /** Test-only override: path to the built web SPA's `dist` directory, in place of the real
+     * `web/dist` sibling package. Lets tests exercise the SPA-fallback static serving (present and
+     * absent) without depending on whether `web` has actually been built in the checkout. */
+    webDistDir?: string;
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -273,6 +289,7 @@ export async function buildApp(
   await app.register(authRoutes);
   await app.register(userRoutes);
   await app.register(settingsRoutes);
+  await app.register(cloudflareRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);
@@ -282,6 +299,39 @@ export async function buildApp(
   await app.register(cronRoutes);
   await app.register(serverRoutes);
   await app.register(webhookRoutes);
+
+  // Serves the built web SPA (see `web/`, Task 22) when present. Guarded on existence so dev mode
+  // — where `web/dist` may not exist yet, since `web` ships its own Vite dev server instead — never
+  // errors: buildApp just skips static serving entirely, and every non-`/api` request falls through
+  // to Fastify's plain JSON 404 as it always did.
+  const webDistDir = deps.webDistDir ?? DEFAULT_WEB_DIST_DIR;
+  if (fs.existsSync(webDistDir)) {
+    await app.register(fastifyStatic, {
+      root: webDistDir,
+      // `index.html` is served explicitly below (for `/`) and by the SPA-fallback 404 handler
+      // (for every other client-side route) instead of by this plugin's own index-serving/
+      // directory-listing behavior — with `index` left at its default, a bare `GET /` falls into
+      // `@fastify/static`'s own directory handling and 403s instead of reaching either handler.
+      index: false,
+    });
+
+    // `@fastify/static`'s wildcard route (`{prefix}*`) doesn't cover the exact empty path, so `/`
+    // needs its own explicit handler alongside the 404-based fallback below for every other route.
+    app.get('/', (_request, reply) => reply.sendFile('index.html'));
+
+    // Registered at the root level (not nested in a sub-plugin), so it applies across every
+    // prefix. The global auth guard's onRequest hook above already lets non-`/api` requests
+    // through unauthenticated (see its own comment) — the SPA shell must load before any client-
+    // side auth check can run. Non-GET or `/api/*` requests that fall through routing (no matching
+    // route registered, and — for `/api/*` — no static file either) still get a plain JSON 404
+    // instead of the HTML shell.
+    app.setNotFoundHandler((request, reply) => {
+      if (request.method !== 'GET' || request.url.startsWith('/api/')) {
+        return reply.code(404).send({ error: 'not found' });
+      }
+      return reply.sendFile('index.html');
+    });
+  }
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
   // every route is registered, since it can start deploys immediately via the queue's `run`.
