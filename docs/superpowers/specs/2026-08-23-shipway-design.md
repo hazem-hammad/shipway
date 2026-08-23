@@ -197,4 +197,4 @@ Design: clean dark-capable dashboard; no heavy component library — Tailwind + 
 
 ## 15. Tech stack summary
 
-TypeScript everywhere. Fastify 5, `@fastify/websocket`, `@fastify/secure-session`, zod. Drizzle ORM + better-sqlite3. Octokit (`@octokit/auth-app`, `@octokit/rest`). Cloudflare REST via `cloudflare` npm pkg. `execa` for processes. React 18 + Vite + Tailwind CSS 4, TanStack Router/Query. argon2. Monorepo layout: `server/`, `web/`, `setup/`, `docs/`.
+TypeScript everywhere. Fastify 5, `@fastify/websocket`, `@fastify/secure-session`, zod. Drizzle ORM + better-sqlite3. Octokit (`@octokit/auth-app`, `@octokit/rest`). Cloudflare REST via `cloudflare` npm pkg. `execa` for processes. React 18 + Vite + Tailwind CSS, wouter (router) + TanStack Query. argon2. Monorepo layout: `server/`, `web/`, `setup/`, `docs/`.
