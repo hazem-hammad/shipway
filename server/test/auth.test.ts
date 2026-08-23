@@ -201,13 +201,16 @@ describe('first-run setup + auth', () => {
     await app.close();
   });
 
-  it('GET /api/health and unimplemented /api/webhooks/* routes stay reachable (404, not 401) without a session', async () => {
+  it('GET /api/health and /api/webhooks/* routes stay reachable (not 401) without a session', async () => {
     const app = await buildTestApp();
     const health = await app.inject({ method: 'GET', url: '/api/health' });
     expect(health.statusCode).toBe(200);
 
+    // /api/webhooks/github is a real route (see routes/webhooks.ts) — it 503s here because this
+    // test app has no github_app setting configured, not because the auth guard blocked it (that
+    // would be 401). The 503 is itself the evidence the guard-exempt prefix let the request through.
     const hook = await app.inject({ method: 'POST', url: '/api/webhooks/github' });
-    expect(hook.statusCode).toBe(404);
+    expect(hook.statusCode).toBe(503);
 
     await app.close();
   });

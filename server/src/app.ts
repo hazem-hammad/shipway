@@ -20,6 +20,7 @@ import { githubRoutes } from './routes/github.js';
 import { projectRoutes } from './routes/projects.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
+import { webhookRoutes } from './routes/webhooks.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeGitOps } from './services/git.js';
 import { cloneUrl, GitHubService, type GithubAppConfig } from './services/github.js';
@@ -257,6 +258,7 @@ export async function buildApp(
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);
+  await app.register(webhookRoutes);
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
   // every route is registered, since it can start deploys immediately via the queue's `run`.
