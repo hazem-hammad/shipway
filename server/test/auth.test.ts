@@ -294,4 +294,49 @@ describe('trustProxy (B4)', () => {
 
     await app.close();
   });
+
+  it('keys the rate limiter on the right-most (nginx-appended) X-Forwarded-For hop, not a client-spoofed left-most one', async () => {
+    // nginx's $proxy_add_x_forwarded_for APPENDS to whatever X-Forwarded-For the client already
+    // sent — it does not replace it. So an external attacker can send their own
+    // `X-Forwarded-For: <anything>` on every request; what reaches Shipway is
+    // `X-Forwarded-For: <attacker value>, <real peer nginx saw>`. If `trustProxy` trusted the whole
+    // chain (`true`), `request.ip` would resolve to the LEFT-MOST (attacker-controlled) entry, so
+    // an attacker could pick a fresh spoofed prefix on every login attempt and get a fresh
+    // rate-limit bucket every time — bypassing the limiter entirely. Pinning `trustProxy` to the
+    // loopback address (`'127.0.0.1'`) instead makes Fastify walk the chain from the right and stop
+    // at the first hop NOT in the trusted list — nginx's own appended value — which the client
+    // cannot influence.
+    //
+    // This test asserts on the right-most/nginx-appended IP by varying only the left-most/spoofed
+    // prefix across attempts while holding the real (right-most) IP fixed: it must FAIL under
+    // `trustProxy: true` (each attempt lands in a different bucket, so the 11th "attacker" attempt
+    // below would still succeed) and PASS under `trustProxy: '127.0.0.1'`.
+    const app = await buildTestApp();
+    await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
+
+    const realNginxObservedIp = '203.0.113.9';
+
+    const attemptWithSpoofedPrefix = (password: string, spoofSuffix: number) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        remoteAddress: '127.0.0.1',
+        headers: { 'x-forwarded-for': `6.6.6.${String(spoofSuffix)}, ${realNginxObservedIp}` },
+        payload: { email: ADMIN.email, password },
+      });
+
+    for (let i = 0; i < 10; i++) {
+      const res = await attemptWithSpoofedPrefix('nope', i);
+      expect(res.statusCode).toBe(401);
+    }
+
+    // A fresh spoofed prefix (never used above) — if the limiter were keyed on the attacker-
+    // controlled left-most entry, this would look like a brand-new client and succeed (200),
+    // bypassing the limiter. Keyed on the real, nginx-appended right-most entry, it's still the
+    // same bucket as the 10 failures above, so it must be blocked.
+    const blocked = await attemptWithSpoofedPrefix(ADMIN.password, 999);
+    expect(blocked.statusCode).toBe(429);
+
+    await app.close();
+  });
 });

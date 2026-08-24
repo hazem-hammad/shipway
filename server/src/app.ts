@@ -144,11 +144,20 @@ export async function buildApp(
   const app = Fastify({
     logger: cfg.devMode,
     // The server process only ever binds 127.0.0.1 (see docs/server-setup.md) — nginx is the sole
-    // caller, and its dashboard/mailpit vhost templates always set X-Forwarded-For (see
-    // setup/templates/nginx-dashboard.conf). Without this, every request's `request.ip` is nginx's
-    // own loopback address in production, so per-IP logic (the login rate limiter in
-    // routes/auth.ts) collapses onto one shared bucket for every real client.
-    trustProxy: true,
+    // caller, and its dashboard/mailpit vhost templates always set X-Forwarded-For via
+    // $proxy_add_x_forwarded_for (see setup/templates/nginx-dashboard.conf), which APPENDS to
+    // whatever X-Forwarded-For a client already sent rather than replacing it. Without any
+    // trustProxy, every request's `request.ip` is nginx's own loopback address in production, so
+    // per-IP logic (the login rate limiter in routes/auth.ts) collapses onto one shared bucket for
+    // every real client. But `trustProxy: true` trusts the WHOLE chain and resolves `request.ip` to
+    // the LEFT-MOST entry — which is client-supplied, so any external caller could set
+    // `X-Forwarded-For: 1.2.3.4` themselves and have nginx simply append its own hop after it,
+    // spoofing an arbitrary rate-limit bucket on every request. Pinning trustProxy to the loopback
+    // address instead (`@fastify/proxy-addr` semantics: walk the chain from the right, stop at the
+    // first hop that ISN'T in the trusted list) makes Fastify stop at nginx's own appended hop — the
+    // right-most, untrusted-but-nginx-written entry — which is exactly the real client IP nginx saw
+    // on the actual TCP connection, and can't be overridden by anything the client puts in the header.
+    trustProxy: '127.0.0.1',
   });
 
   app.decorate('cfg', cfg);
