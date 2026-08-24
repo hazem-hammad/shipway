@@ -13,6 +13,10 @@
  *   carries don't sit on disk on an already-booted server.
  * - If the file doesn't exist (already imported, or a dev-mode checkout that never had one), this
  *   is a no-op — the database is never touched.
+ * - If the file exists but is malformed (unreadable or invalid JSON), the read/parse is caught,
+ *   a clear warning is logged, and the file is left in place — the server still boots normally.
+ *   Deleting a bootstrap file we failed to parse would silently strand the operator's provisioned
+ *   credentials; leaving it lets a future fixed/valid file (or manual inspection) still work.
  */
 import * as fs from 'node:fs';
 import type { Config } from '../config.js';
@@ -67,7 +71,14 @@ export function importBootstrap(db: ShipwayDb, cfg: Config): void {
     return;
   }
 
-  const parsed = JSON.parse(fs.readFileSync(bootstrapPath, 'utf8')) as BootstrapFile;
+  let parsed: BootstrapFile;
+  try {
+    parsed = JSON.parse(fs.readFileSync(bootstrapPath, 'utf8')) as BootstrapFile;
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.error(`bootstrap: failed to read/parse ${bootstrapPath} — skipping import, leaving file in place: ${detail}`);
+    return;
+  }
 
   for (const key of BOOTSTRAP_KEYS) {
     const value = parsed[key];

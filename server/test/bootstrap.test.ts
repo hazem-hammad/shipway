@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -108,5 +108,25 @@ describe('importBootstrap', () => {
     expect(getSetting(db, 'server_ip')).toBe('203.0.113.10');
     expect(getSetting(db, 'mysql_admin_url')).toBeNull();
     expect(getSetting(db, 'redis_info')).toBeNull();
+  });
+
+  it('logs a warning and leaves the file in place (no throw, db untouched) when bootstrap.json is malformed JSON', () => {
+    const dataDir = tmpDataDir();
+    const bootstrapPath = path.join(dataDir, 'bootstrap.json');
+    fs.writeFileSync(bootstrapPath, '{ this is not valid json');
+    const cfg = makeCfg(dataDir);
+    const db = makeDb();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    expect(() => importBootstrap(db, cfg)).not.toThrow();
+
+    expect(getSetting(db, 'base_domain')).toBeNull();
+    // The malformed file is NOT deleted — deleting it would silently strand the operator's
+    // provisioned credentials with no way to recover or fix them.
+    expect(fs.existsSync(bootstrapPath)).toBe(true);
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy.mock.calls[0]?.[0]).toContain(bootstrapPath);
+
+    errorSpy.mockRestore();
   });
 });

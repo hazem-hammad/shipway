@@ -13,6 +13,11 @@ type ProjectType = ProjectRow['type'];
 /** `owner/name`, mirroring the shape GitHub App installs surface repos in. */
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
 
+/** PHP versions the host has installed side-by-side (ondrej/php) and grants sudoers reloads for. */
+const PHP_VERSION_ENUM = z.enum(['8.1', '8.2', '8.3', '8.4']);
+/** Node versions the host has installed (via nvm/system) for `node`/`nextjs` projects. */
+const NODE_VERSION_ENUM = z.enum(['18', '20', '22']);
+
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
 
 const createProjectSchema = z.object({
@@ -21,8 +26,8 @@ const createProjectSchema = z.object({
   repo: z.string().regex(REPO_RE),
   branch: z.string().min(1),
   type: z.enum(['php', 'node', 'nextjs', 'static']),
-  phpVersion: z.string().min(1).optional(),
-  nodeVersion: z.string().min(1).optional(),
+  phpVersion: PHP_VERSION_ENUM.optional(),
+  nodeVersion: NODE_VERSION_ENUM.optional(),
   publicDir: z.string().optional(),
   installCmd: z.string().optional(),
   buildCmd: z.string().optional(),
@@ -40,8 +45,8 @@ const patchProjectSchema = z
   .object({
     name: z.string().min(1),
     branch: z.string().min(1),
-    phpVersion: z.string().min(1),
-    nodeVersion: z.string().min(1),
+    phpVersion: PHP_VERSION_ENUM,
+    nodeVersion: NODE_VERSION_ENUM,
     publicDir: z.string(),
     installCmd: z.string(),
     buildCmd: z.string(),
