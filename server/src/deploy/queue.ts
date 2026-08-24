@@ -12,6 +12,13 @@
  * still queued (not yet running) cancels that older queued push and drops it from the queue before
  * the new one is added. `'manual'`/`'rollback'` enqueues never supersede anything and are never
  * superseded themselves — they always queue behind whatever's already there.
+ *
+ * `isCancelRequested` exposes, in memory only, whether `cancel()` was called on a still-*running*
+ * deployment (aborting its signal) but the run hasn't settled to a terminal status yet — the window
+ * during which the pipeline is unwinding. A queued deployment's cancel is synchronous (the row goes
+ * straight to `canceled`), so it never needs this. Deliberately not persisted: it's a UI nicety
+ * ("Canceling…"), and a deployment left `canceling` across a server restart is already dead anyway
+ * (see Ruling 2, `.superpowers/sdd/2026-08-25-shipway-v3/progress.md`).
  */
 import { eq } from 'drizzle-orm';
 import * as path from 'node:path';
@@ -61,6 +68,9 @@ export class DeployQueue {
   private readonly queue: QueueItem[] = [];
   private readonly running = new Map<number, RunningEntry>();
   private readonly loggers = new Map<number, DeployLogger>();
+  /** Deployment ids currently running with `cancel()` already called on them — see
+   * `isCancelRequested`'s doc comment above. */
+  private readonly cancelRequested = new Set<number>();
 
   constructor(deps: DeployQueueDeps) {
     this.deps = deps;
@@ -103,6 +113,7 @@ export class DeployQueue {
   cancel(deploymentId: number): void {
     const runningEntry = this.running.get(deploymentId);
     if (runningEntry) {
+      this.cancelRequested.add(deploymentId);
       runningEntry.controller.abort();
       return;
     }
@@ -113,6 +124,13 @@ export class DeployQueue {
     }
     this.queue.splice(idx, 1);
     this.markCanceled(deploymentId);
+  }
+
+  /** True from the moment `cancel()` aborts a *running* deployment's signal until that run settles
+   * (success/failed/canceled) — see the class doc comment. Always `false` for a deployment that
+   * isn't currently running (queued, or already terminal). */
+  isCancelRequested(deploymentId: number): boolean {
+    return this.cancelRequested.has(deploymentId);
   }
 
   /**
@@ -220,6 +238,7 @@ export class DeployQueue {
         logger.close(); // idempotent — a no-op if the pipeline already closed it
         this.running.delete(item.id);
         this.loggers.delete(item.id);
+        this.cancelRequested.delete(item.id);
         this.pump();
       });
   }

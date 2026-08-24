@@ -27,6 +27,27 @@ function readLogFile(logPath: string | null): string {
   return fs.readFileSync(logPath, 'utf8');
 }
 
+type DeploymentRow = typeof deployments.$inferSelect;
+
+/** A deployment row's status is terminal once it's one of these — never `cancelRequested`. */
+const TERMINAL_STATUSES = new Set<DeploymentRow['status']>(['success', 'failed', 'rolled_back', 'canceled']);
+
+/**
+ * Adds the queue's in-memory `cancelRequested` flag (Task 2's "Canceling…" UI hint) to a
+ * deployment row: `true` only while `queue.cancel()` has been called on this deployment's actually-
+ * *running* entry but the run hasn't settled yet (`DeployQueue.isCancelRequested`'s own contract
+ * already scopes it that tightly — it's never true for a merely-queued row). The terminal-status
+ * check here is belt-and-suspenders against the narrow window where a row has just been patched to
+ * its final status but the queue's own bookkeeping hasn't cleared yet: a terminal row must never
+ * report `cancelRequested: true`, full stop.
+ */
+function withCancelRequested<T extends Pick<DeploymentRow, 'id' | 'status'>>(
+  app: FastifyInstance,
+  row: T,
+): T & { cancelRequested: boolean } {
+  return { ...row, cancelRequested: !TERMINAL_STATUSES.has(row.status) && app.queue.isCancelRequested(row.id) };
+}
+
 /**
  * Registers the deployment routes: kicking off/canceling/rolling back deploys, listing a project's
  * deployment history, and reading a single deployment's log (as a snapshot, or live over a
@@ -132,13 +153,14 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    return app.db
+    const rows = app.db
       .select()
       .from(deployments)
       .where(eq(deployments.projectId, project.id))
       .orderBy(desc(deployments.id))
       .limit(DEPLOYMENTS_LIST_LIMIT)
       .all();
+    return rows.map((row) => withCancelRequested(app, row));
   });
 
   app.get('/api/deployments/:id', async (request, reply) => {
@@ -151,7 +173,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     if (!row) {
       return reply.code(404).send({ error: 'deployment not found' });
     }
-    return row;
+    return withCancelRequested(app, row);
   });
 
   app.post('/api/deployments/:id/cancel', async (request, reply) => {

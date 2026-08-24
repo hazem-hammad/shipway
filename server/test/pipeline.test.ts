@@ -584,6 +584,164 @@ describe('runDeploy — cancel', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Task 2: cancellation reaches every previously-unabortable await (root cause fix)
+// ---------------------------------------------------------------------------
+
+describe('runDeploy — cancel during git resolve (root cause: GitOps never got the signal)', () => {
+  it('a gitOps.fetchBranchTip that only settles on abort returns canceled promptly, not after a long hang', async () => {
+    const controller = new AbortController();
+    // Simulates a slow/unreachable remote: never settles on its own — only the signal it was given
+    // unsticks it, exactly like the fixed real `GitOps` (see git.ts). If the pipeline still failed
+    // to thread `signal` through to this call, this promise — and the test — would hang forever.
+    const hangingGitOps: GitOps = {
+      fetchBranchTip: (_projectDir, _url, _branch, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () => {
+              reject(new Error('git operation canceled'));
+            },
+            { once: true },
+          );
+        }),
+      exportRelease: () => Promise.reject(new Error('exportRelease must not be called — resolve never got past fetchBranchTip')),
+    };
+
+    const { db, notifications, logger, deps } = makeHarness({ gitOps: hangingGitOps });
+    const projectId = insertProject(db, { slug: 'slow-remote', type: 'static' });
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    setTimeout(() => {
+      controller.abort();
+    }, 30);
+
+    const start = Date.now();
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('canceled');
+    expect(elapsed).toBeLessThan(1000);
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
+  });
+});
+
+describe('runDeploy — cancel during the health-check retry sleep', () => {
+  it('returns canceled fast instead of waiting out the 5x3s retry budget', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const controller = new AbortController();
+
+    // A "real" abortable sleep (mirrors app.ts's production `PipelineDeps.sleep` wiring) — the
+    // harness's default `noopSleep` resolves instantly regardless of its signal, which would make
+    // this test pass trivially without actually exercising the new abort-aware sleep behavior.
+    const realishSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+
+    // The health check's first fetch always fails (so the loop is headed into a 3s retry sleep)
+    // and, the instant it's actually called — i.e. once the pipeline has genuinely reached the
+    // health stage, whatever the real timing of resolve/export/activate/restart turned out to be —
+    // schedules the cancel, so the abort lands squarely inside the retry sleep.
+    const failThenCancel = async (): Promise<{ status: number }> => {
+      setTimeout(() => {
+        controller.abort();
+      }, 0);
+      return { status: 500 };
+    };
+
+    const { db, notifications, logger, deps } = makeHarness({ fetchHttp: failThenCancel });
+    deps.sleep = realishSleep;
+
+    const projectId = insertProject(db, { slug: 'health-cancel', type: 'static', healthCheckPath: '/health' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    const start = Date.now();
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('canceled');
+    expect(elapsed).toBeLessThan(2000);
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
+  }, 10000);
+});
+
+describe('runDeploy — waitForPort bails on abort', () => {
+  it('a node project relying on the default TCP-poll waitForPort cancels fast, not after its 15s timeout', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const controller = new AbortController();
+    const { db, notifications, logger, deps } = makeHarness();
+    deps.waitForPort = undefined; // exercise the pipeline's real `defaultWaitForPort`, not the harness stub
+
+    logger.on('line', (l: string) => {
+      if (l.includes('==> health')) {
+        // Deferred a tick so the `checkAborted` right after this section header still sees an
+        // un-aborted signal — the point is to cancel *during* the port poll, not before the
+        // pipeline ever reaches it.
+        setTimeout(() => {
+          controller.abort();
+        }, 0);
+      }
+    });
+
+    const projectId = insertProject(db, { slug: 'wait-for-port-cancel', type: 'node', nodeVersion: '22', port: 58211 });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    const start = Date.now();
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('canceled');
+    expect(elapsed).toBeLessThan(2000);
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
+  }, 10000);
+});
+
+describe('runDeploy — cancel-requested log line', () => {
+  it('writes a "==> cancel requested" section to the live log the moment the signal aborts', async () => {
+    const { db, logger, deps } = makeHarness();
+
+    // A rollback deploy whose releasePath doesn't exist on disk fails fast, pre-activate — plenty
+    // for this test, which only cares about the log line a pre-aborted signal produces, not which
+    // stage it lands in.
+    const projectId = insertProject(db, { slug: 'cancel-log', type: 'static' });
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'rollback', releasePath: '/nonexistent' });
+
+    const lines: string[] = [];
+    logger.on('line', (l: string) => lines.push(l));
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    expect(lines.some((l) => l.includes('==> cancel requested'))).toBe(true);
+    expect(lines.some((l) => l.includes('stopping after the current step'))).toBe(true);
+  });
+});
+
 describe('runDeploy — rollback trigger', () => {
   it('reuses the existing release without calling gitOps, and leaves commitSha/commitMessage untouched', async () => {
     const { cfg, db, sysops, notifications, logger, deps } = makeHarness({ gitOps: poisonedGitOps() });

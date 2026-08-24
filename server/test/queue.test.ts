@@ -272,6 +272,55 @@ describe('DeployQueue', () => {
     expect(signal.aborted).toBe(true);
   });
 
+  it('isCancelRequested is false before cancel, true while a canceled run is still settling, and false again once it settles', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const fakeRun = new FakeRun();
+    const queue = makeQueue(db, cfg, 1, fakeRun);
+    const projectId = insertProject(db, 'proj-cancel-requested');
+
+    const running = queue.enqueue({ projectId, trigger: 'push' });
+    await flush();
+
+    expect(queue.isCancelRequested(running)).toBe(false);
+
+    queue.cancel(running);
+    expect(queue.isCancelRequested(running)).toBe(true);
+
+    fakeRun.resolve(running);
+    await flush();
+
+    expect(queue.isCancelRequested(running)).toBe(false);
+  });
+
+  it('isCancelRequested stays false for a queued (not running) deployment, even after cancel', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const fakeRun = new FakeRun();
+    const queue = makeQueue(db, cfg, 1, fakeRun);
+    const projectId = insertProject(db, 'proj-cancel-requested-queued');
+
+    const running = queue.enqueue({ projectId, trigger: 'push' });
+    await flush();
+    const queued = queue.enqueue({ projectId, trigger: 'push' });
+
+    expect(queue.isCancelRequested(queued)).toBe(false);
+    queue.cancel(queued);
+    expect(queue.isCancelRequested(queued)).toBe(false);
+
+    fakeRun.resolve(running);
+    await flush();
+  });
+
+  it('isCancelRequested is false for an unknown deployment id', () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const fakeRun = new FakeRun();
+    const queue = makeQueue(db, cfg, 2, fakeRun);
+
+    expect(queue.isCancelRequested(999999)).toBe(false);
+  });
+
   it('cancel on an unknown deployment id is a no-op', () => {
     const cfg = makeCfg();
     const db = makeDb(cfg);

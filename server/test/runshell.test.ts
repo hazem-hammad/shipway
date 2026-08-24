@@ -86,4 +86,38 @@ describe('makeRunShell', () => {
     expect(result.exitCode).not.toBe(0);
     expect(elapsed).toBeLessThan(5000);
   }, 10000);
+
+  // `killDescendants` sends the abort's SIGTERM to the whole process group: the `sleep` in the loop
+  // below (which does NOT trap it) dies on that first SIGTERM, but the `trap '' TERM` shell keeps
+  // looping past it regardless — an ignored-SIGTERM child that only `forceKillAfterDelay`'s SIGKILL
+  // escalation (5s after the abort, see runshell.ts) can actually stop. If that escalation weren't
+  // wired up, this loop — and the test — would hang until vitest's own timeout killed the worker.
+  it('force-kills a child that ignores SIGTERM, roughly forceKillAfterDelay (5s) after the abort', async () => {
+    const runShell = makeRunShell();
+    const controller = new AbortController();
+
+    const promise = runShell('trap "" TERM; while true; do sleep 0.2; done', {
+      cwd: process.cwd(),
+      env: {},
+      signal: controller.signal,
+      onOutput: () => {
+        // no-op
+      },
+    });
+
+    setTimeout(() => {
+      controller.abort();
+    }, 50);
+
+    const start = Date.now();
+    const result = await promise;
+    const elapsed = Date.now() - start;
+
+    expect(result.exitCode).not.toBe(0);
+    // A plain SIGTERM alone would never kill this loop (it's trapped) — only the SIGKILL escalation
+    // does, ~5s after the abort. Bounded loosely above and below to absorb scheduler jitter without
+    // masking a regression (an escalation that never fires would blow well past the upper bound).
+    expect(elapsed).toBeGreaterThan(4500);
+    expect(elapsed).toBeLessThan(9000);
+  }, 15000);
 });

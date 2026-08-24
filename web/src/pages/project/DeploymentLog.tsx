@@ -72,7 +72,11 @@ function appendChunk(prev: string, chunk: string): string {
 export default function DeploymentLogPage({ deploymentId }: DeploymentLogProps) {
   const deploymentQuery = useDeployment(deploymentId);
   const [logText, setLogText] = useState('');
-  const [cancelling, setCancelling] = useState(false);
+  // Optimistic: flips true the instant Cancel is clicked, before the request even lands. Stays
+  // true until either the server confirms it (deployment.cancelRequested, once the poll picks it
+  // up) or the deployment goes terminal (the button/hint disappear entirely) — reset only on a
+  // failed request, so the user can retry.
+  const [cancelClicked, setCancelClicked] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
 
   const status = deploymentQuery.data?.status;
@@ -113,16 +117,20 @@ export default function DeploymentLogPage({ deploymentId }: DeploymentLogProps) 
 
   async function handleCancel() {
     setCancelError(null);
-    setCancelling(true);
+    setCancelClicked(true);
     try {
       await cancelDeployment(deploymentId);
       await deploymentQuery.refetch();
     } catch (err) {
       setCancelError(err instanceof ApiError ? err.message : 'Could not cancel the deploy.');
-    } finally {
-      setCancelling(false);
+      setCancelClicked(false);
     }
   }
+
+  // Gated on the status being pending too: once the row goes terminal, `cancelClicked` may not have
+  // been reset yet (nothing resets it on success) — without this it would show a stuck "canceling…"
+  // hint/button forever.
+  const canceling = isPendingDeploymentStatus(status) && (cancelClicked || (deploymentQuery.data?.cancelRequested ?? false));
 
   return (
     <div className="flex flex-col gap-4">
@@ -141,7 +149,7 @@ export default function DeploymentLogPage({ deploymentId }: DeploymentLogProps) 
           Could not load this deployment.
         </p>
       ) : (
-        <DeploymentHeader deployment={deploymentQuery.data} cancelling={cancelling} onCancel={() => void handleCancel()} />
+        <DeploymentHeader deployment={deploymentQuery.data} canceling={canceling} onCancel={() => void handleCancel()} />
       )}
 
       {cancelError && (
@@ -157,11 +165,11 @@ export default function DeploymentLogPage({ deploymentId }: DeploymentLogProps) 
 
 function DeploymentHeader({
   deployment,
-  cancelling,
+  canceling,
   onCancel,
 }: {
   deployment: Deployment;
-  cancelling: boolean;
+  canceling: boolean;
   onCancel: () => void;
 }) {
   // "Cancel button when running" (ruling) — read loosely as "still in flight", so a queued
@@ -176,13 +184,14 @@ function DeploymentHeader({
         <span className={`text-base font-semibold ${DEPLOY_STATUS_TEXT_CLASS[deployment.status]}`}>
           {DEPLOY_STATUS_LABEL[deployment.status]}
         </span>
+        {canceling && <span className="text-sm text-soft">canceling…</span>}
         {deployment.commitSha && <Chip>{shortSha(deployment.commitSha)}</Chip>}
         <Badge>{TRIGGER_LABEL[deployment.trigger]}</Badge>
         <DurationText deployment={deployment} />
       </div>
       {inFlight && (
-        <Button variant="danger" size="sm" loading={cancelling} onClick={onCancel}>
-          Cancel
+        <Button variant="danger" size="sm" loading={canceling} disabled={canceling} onClick={onCancel}>
+          {canceling ? 'Canceling…' : 'Cancel'}
         </Button>
       )}
     </Card>

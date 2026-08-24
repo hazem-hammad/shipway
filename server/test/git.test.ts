@@ -124,6 +124,35 @@ describe('makeGitOps (real git integration)', () => {
     await expect(gitOps.fetchBranchTip(projectDir, url, 'main')).rejects.not.toThrow(/super-secret-token/);
   });
 
+  it('fetchBranchTip passes the signal through as cancelSignal and surfaces a clear canceled error when aborted mid-clone', async () => {
+    // A stub `run` that never settles on its own — only the `cancelSignal` it was given (execa's
+    // real behavior on abort) rejects it — simulating a slow/unreachable remote, the root cause
+    // this fix targets. The raw rejection message is deliberately confusing/generic (the way a real
+    // execa/DOMException abort error can be) to prove `fetchBranchTip` replaces it with a clear one.
+    const stubRun = ((_file: string, _args: readonly string[] = [], opts?: { cancelSignal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        opts?.cancelSignal?.addEventListener(
+          'abort',
+          () => {
+            reject(new Error('This operation was aborted'));
+          },
+          { once: true },
+        );
+      })) as unknown as typeof execa;
+    const gitOps = makeGitOps(stubRun);
+    const projectDir = tmpDir('shipway-git-project');
+    const controller = new AbortController();
+
+    const promise = gitOps.fetchBranchTip(projectDir, 'https://example.com/acme/repo.git', 'main', controller.signal);
+    setTimeout(() => {
+      controller.abort();
+    }, 20);
+
+    const start = Date.now();
+    await expect(promise).rejects.toThrow(/canceled/);
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+
   it('exportRelease produces the working tree without .git', async () => {
     const fixtureDir = tmpDir('shipway-git-fixture');
     await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');

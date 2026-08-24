@@ -333,6 +333,10 @@ export interface Deployment {
   logPath: string | null;
   startedAt: number | null;
   finishedAt: number | null;
+  /** `true` only while the deploy is actually running and a cancel has already been requested for
+   * it but hasn't taken effect yet (in-memory queue state) — always `false` once terminal. Drives
+   * the "Canceling…" hint alongside the optimistic local state set the moment Cancel is clicked. */
+  cancelRequested: boolean;
 }
 
 /** `GET /api/projects/:id/deployments` — newest first, capped at 50 server-side. */
