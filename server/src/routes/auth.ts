@@ -114,7 +114,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
 
     request.session.set('userId', created.id);
-    return reply.code(201).send({ id: created.id, name: created.name, email: created.email });
+    return reply.code(201).send({ id: created.id, name: created.name, email: created.email, role: created.role });
   });
 
   app.post('/api/auth/login', async (request, reply) => {
@@ -153,7 +153,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     resetAttempts(ip);
     request.session.set('userId', user.id);
-    return { id: user.id, name: user.name, email: user.email };
+    return { id: user.id, name: user.name, email: user.email, role: user.role };
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
@@ -172,6 +172,6 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(401).send({ error: 'unauthorized' });
     }
 
-    return { id: user.id, name: user.name, email: user.email };
+    return { id: user.id, name: user.name, email: user.email, role: user.role };
   });
 }
