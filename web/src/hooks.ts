@@ -8,6 +8,7 @@ import {
   fetchGithubBranches,
   fetchGithubRepos,
   fetchGithubStatus,
+  fetchGlobalDeployments,
   fetchMe,
   fetchOverview,
   fetchProject,
@@ -26,6 +27,7 @@ import {
   type Deployment,
   type GithubRepo,
   type GithubStatus,
+  type GlobalDeployment,
   type Me,
   type Overview,
   type Project,
@@ -84,6 +86,18 @@ export function useProjects(): UseQueryResult<ProjectListItem[]> {
     queryFn: fetchProjects,
     refetchInterval: (query) =>
       query.state.data?.some((project) => isPendingDeploymentStatus(project.lastDeployment?.status)) ? 10_000 : false,
+  });
+}
+
+/**
+ * The global Deployments page's list (`GET /api/deployments`, Task 5/7). Polls every 10s while any
+ * row is queued/running, else every 30s.
+ */
+export function useGlobalDeployments(): UseQueryResult<GlobalDeployment[]> {
+  return useQuery({
+    queryKey: ['deployments-global'],
+    queryFn: () => fetchGlobalDeployments(),
+    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 10_000 : 30_000),
   });
 }
 

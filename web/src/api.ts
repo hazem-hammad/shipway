@@ -340,6 +340,28 @@ export function fetchDeploymentLog(id: number): Promise<{ content: string }> {
   return apiFetch<{ content: string }>(`/api/deployments/${String(id)}/log`);
 }
 
+/** A row of `GET /api/deployments` (Task 5's global list, Task 7's Deployments page): a deployment
+ * joined with its owning project's name/slug. */
+export interface GlobalDeployment {
+  id: number;
+  projectId: number;
+  projectName: string;
+  projectSlug: string;
+  status: DeploymentStatus;
+  trigger: 'push' | 'manual' | 'rollback';
+  commitSha: string | null;
+  commitMessage: string | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+/** `GET /api/deployments` — recent deployments across every project, newest first; capped at 50
+ * server-side unless `limit` is given (server max 100). */
+export function fetchGlobalDeployments(limit?: number): Promise<GlobalDeployment[]> {
+  const query = limit !== undefined ? `?limit=${String(limit)}` : '';
+  return apiFetch<GlobalDeployment[]>(`/api/deployments${query}`);
+}
+
 // ---- Overview (Home dashboard) ----
 
 export interface OverviewRecentProject {
