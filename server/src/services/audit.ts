@@ -79,6 +79,46 @@ export function purgeAudit(db: ShipwayDb, retentionDays: number): void {
 }
 
 /**
+ * Runs one retention-purge pass right now: a no-op when auditing is disabled (`audit_enabled ===
+ * false`), otherwise `purgeAudit` at the currently configured `audit_retention_days` (defaulting to
+ * `DEFAULT_AUDIT_RETENTION_DAYS`). This is the single function both the boot-time purge and the
+ * hourly timer below call, so "purge on boot" and "purge every hour" always apply the exact same
+ * enabled/retention rules.
+ */
+export function runAuditPurgeOnce(db: ShipwayDb): void {
+  if (!getAuditEnabled(db)) return;
+  purgeAudit(db, getAuditRetentionDays(db));
+}
+
+export interface AuditPurgeHandle {
+  /** Stops the interval. Idempotent. */
+  stop: () => void;
+  /** Runs one purge pass immediately, outside the interval schedule — lets tests drive the timer
+   * deterministically (an injectable `intervalMs` set far in the future + manual `.tick()` calls),
+   * mirroring `services/servicewatch.ts`'s `ServiceWatchHandle`. */
+  tick: () => void;
+}
+
+/**
+ * Starts the hourly audit-retention purge timer (spec's Audit log row: "automatic purge (hourly
+ * timer + boot)"). `app.ts` wires this the same way it wires `startServiceWatch`: injectable
+ * `intervalMs` for tests, skipped entirely under `NODE_ENV=test` unless a test opts in, and stopped
+ * via an `onClose` hook so a leaked `setInterval` never keeps the process (or vitest) alive.
+ */
+export function startAuditPurge(db: ShipwayDb, intervalMs: number): AuditPurgeHandle {
+  const tick = (): void => runAuditPurgeOnce(db);
+
+  const timer = setInterval(tick, intervalMs);
+
+  return {
+    tick,
+    stop: () => {
+      clearInterval(timer);
+    },
+  };
+}
+
+/**
  * Resolves the acting user for an audit row from a session `userId` (or `undefined` when there's no
  * session, e.g. a login-failure or webhook-triggered action). Route handlers pass
  * `request.session.get('userId')` here once per request. A `userId` that no longer resolves to a row

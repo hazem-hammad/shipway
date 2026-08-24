@@ -15,7 +15,14 @@ import { SYSTEM_UNITS, type SysOps, type SystemUnit, type UnitStatus } from '../
 
 const DOWN_STATUSES: readonly UnitStatus[] = ['failed', 'inactive'];
 
-function isDown(status: UnitStatus): boolean {
+/** `true` for a "down" unit status (`'failed'`/`'inactive'`); `'active'` and `'unknown'` are both
+ * "not down" — `'unknown'` deliberately counts as up rather than down (dev mode's `DevSysOps`
+ * always reports `'unknown'`, and a status Shipway simply couldn't determine shouldn't be flagged
+ * as a live outage). Exported so `routes/overview.ts` (Task 5's `GET /api/overview` `servicesDown`)
+ * classifies a unit's LIVE status exactly the same way this poller's `service_down`/
+ * `service_recovered` transition detection does, instead of a second, potentially drifting copy of
+ * this rule. */
+export function isDown(status: UnitStatus): boolean {
   return (DOWN_STATUSES as readonly string[]).includes(status);
 }
 

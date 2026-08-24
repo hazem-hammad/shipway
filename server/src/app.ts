@@ -16,6 +16,7 @@ import type { DeployLogger } from './deploy/logger.js';
 import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
 import { makeRunShell } from './deploy/runshell.js';
 import { SecretBox } from './lib/secretbox.js';
+import { auditRoutes } from './routes/audit.js';
 import { authRoutes } from './routes/auth.js';
 import { cloudflareRoutes } from './routes/cloudflare.js';
 import { cronRoutes } from './routes/cron.js';
@@ -23,13 +24,14 @@ import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
 import { notificationRoutes } from './routes/notifications.js';
+import { overviewRoutes } from './routes/overview.js';
 import { projectRoutes } from './routes/projects.js';
 import { serverRoutes } from './routes/server.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { workerRoutes } from './routes/workers.js';
-import { recordAudit } from './services/audit.js';
+import { recordAudit, runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle } from './services/audit.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
@@ -66,6 +68,10 @@ declare module 'fastify' {
     /** The 60s service-status poller's handle (Task 4), or `undefined` when it isn't running — see
      * `buildApp`'s `deps.serviceWatch` for when that is. `app.close()` stops it via an `onClose` hook. */
     serviceWatch: ServiceWatchHandle | undefined;
+    /** The hourly audit-retention purge timer's handle (Task 5), or `undefined` when it isn't
+     * running — see `buildApp`'s `deps.auditPurge` for when that is. `app.close()` stops it via an
+     * `onClose` hook. A purge also always runs once synchronously at boot regardless of this. */
+    auditPurge: AuditPurgeHandle | undefined;
   }
 }
 
@@ -131,6 +137,9 @@ function loadOrCreateSessionKey(keyPath: string): Buffer {
 /** How often the service-status poller reads `SYSTEM_UNITS` in production (Task 4). */
 const SERVICE_WATCH_INTERVAL_MS = 60_000;
 
+/** How often the audit-retention purge timer runs in production (Task 5, spec: "hourly timer + boot"). */
+const AUDIT_PURGE_INTERVAL_MS = 60 * 60 * 1000;
+
 /**
  * One-time migration (Task 4, spec §2's notifybus bullet): if the legacy global
  * `notify_webhook_url` setting is set and no notification channel exists yet, creates a "Default"
@@ -185,6 +194,12 @@ export async function buildApp(
      * `intervalMs`, a fake `fetchImpl`) deterministically. In production this is never passed; the
      * poller always runs at `SERVICE_WATCH_INTERVAL_MS`. */
     serviceWatch?: { intervalMs: number; fetchImpl?: typeof fetch };
+    /** Test-only override: starts the Task 5 hourly audit-retention purge timer at this interval
+     * instead of the default "skip entirely under `NODE_ENV=test`" behavior — lets tests drive it
+     * deterministically via `.tick()`. In production this is never passed; the timer always runs at
+     * `AUDIT_PURGE_INTERVAL_MS`. The boot-time purge itself is unconditional either way (see
+     * `runAuditPurgeOnce(app.db)` below, right after `migrateLegacyWebhookChannel`). */
+    auditPurge?: { intervalMs: number };
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -209,6 +224,10 @@ export async function buildApp(
   app.decorate('cfg', cfg);
   app.decorate('db', openDb(cfg.dbPath));
   migrateLegacyWebhookChannel(app.db);
+  // Task 5's boot-time audit-retention purge: unconditional (not gated by test mode, unlike the
+  // hourly timer below) since it's a single cheap DELETE — mirrors `migrateLegacyWebhookChannel`
+  // running unconditionally on every boot too.
+  runAuditPurgeOnce(app.db);
   app.decorate('github', () => {
     const githubAppCfg = getSetting<GithubAppConfig>(app.db, 'github_app');
     return githubAppCfg ? new GitHubService(githubAppCfg) : null;
@@ -363,6 +382,8 @@ export async function buildApp(
   await app.register(serverRoutes);
   await app.register(webhookRoutes);
   await app.register(notificationRoutes, { fetchImpl: deps.fetchImpl });
+  await app.register(auditRoutes);
+  await app.register(overviewRoutes);
 
   // Serves the built web SPA (see `web/`, Task 22) when present. Guarded on existence so dev mode
   // — where `web/dist` may not exist yet, since `web` ships its own Vite dev server instead — never
@@ -416,6 +437,16 @@ export async function buildApp(
   );
   app.addHook('onClose', () => {
     app.serviceWatch?.stop();
+  });
+
+  // Hourly audit-retention purge timer (Task 5): same test-gating shape as the service-status
+  // poller just above — skipped under `NODE_ENV=test` unless a test injects `deps.auditPurge`, and
+  // stopped via `onClose`. The boot-time purge itself already ran unconditionally, right after
+  // `migrateLegacyWebhookChannel` above, regardless of this timer's on/off state.
+  const auditPurgeEnabled = deps.auditPurge !== undefined || process.env.NODE_ENV !== 'test';
+  app.decorate('auditPurge', auditPurgeEnabled ? startAuditPurge(app.db, deps.auditPurge?.intervalMs ?? AUDIT_PURGE_INTERVAL_MS) : undefined);
+  app.addHook('onClose', () => {
+    app.auditPurge?.stop();
   });
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after

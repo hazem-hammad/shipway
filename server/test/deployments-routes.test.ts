@@ -546,3 +546,68 @@ describe('WS /api/deployments/:id/logs/stream', () => {
     await app.close();
   });
 });
+
+describe('GET /api/deployments (global list, Task 5)', () => {
+  it('returns deployments across all projects, newest first, joined with project name/slug', async () => {
+    const { app, cookie } = await buildDeploymentsTestApp();
+    const projectAId = await createProject(app, cookie, 'app-a');
+    const projectBId = await createProject(app, cookie, 'app-b');
+
+    app.db
+      .insert(deployments)
+      .values({ projectId: projectAId, status: 'success', trigger: 'manual', commitSha: 'aaa111', commitMessage: 'first', startedAt: 1, finishedAt: 2 })
+      .run();
+    app.db
+      .insert(deployments)
+      .values({ projectId: projectBId, status: 'failed', trigger: 'push', commitSha: 'bbb222', commitMessage: 'second', startedAt: 3, finishedAt: 4 })
+      .run();
+
+    const res = await app.inject({ method: 'GET', url: '/api/deployments', headers: { cookie } });
+    expect(res.statusCode).toBe(200);
+    const rows = res.json() as Record<string, unknown>[];
+    expect(rows.length).toBeGreaterThanOrEqual(2);
+    // newest first (desc by id)
+    expect(rows[0]!.id as number).toBeGreaterThan(rows[1]!.id as number);
+
+    const bRow = rows.find((r) => r.projectId === projectBId);
+    expect(bRow).toMatchObject({
+      projectId: projectBId,
+      projectName: 'app-b',
+      projectSlug: 'app-b',
+      status: 'failed',
+      trigger: 'push',
+      commitSha: 'bbb222',
+      commitMessage: 'second',
+      startedAt: 3,
+      finishedAt: 4,
+    });
+
+    await app.close();
+  });
+
+  it('defaults limit to 50 and clamps a requested limit to 100', async () => {
+    const { app, cookie } = await buildDeploymentsTestApp();
+    const projectId = await createProject(app, cookie);
+    for (let i = 0; i < 5; i += 1) {
+      app.db.insert(deployments).values({ projectId, status: 'success', trigger: 'manual' }).run();
+    }
+
+    const defaultRes = await app.inject({ method: 'GET', url: '/api/deployments', headers: { cookie } });
+    expect((defaultRes.json() as unknown[]).length).toBe(5);
+
+    const clampedRes = await app.inject({ method: 'GET', url: '/api/deployments?limit=5000', headers: { cookie } });
+    expect((clampedRes.json() as unknown[]).length).toBeLessThanOrEqual(100);
+
+    const explicitRes = await app.inject({ method: 'GET', url: '/api/deployments?limit=2', headers: { cookie } });
+    expect((explicitRes.json() as unknown[]).length).toBe(2);
+
+    await app.close();
+  });
+
+  it('unauthenticated requests are 401', async () => {
+    const { app } = await buildDeploymentsTestApp();
+    const res = await app.inject({ method: 'GET', url: '/api/deployments' });
+    expect(res.statusCode).toBe(401);
+    await app.close();
+  });
+});

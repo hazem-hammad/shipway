@@ -12,6 +12,13 @@ const rollbackBodySchema = z.object({ releasePath: z.string().min(1) });
 /** `GET /api/projects/:id/deployments` returns at most this many rows, newest first. */
 const DEPLOYMENTS_LIST_LIMIT = 50;
 
+/** `GET /api/deployments` (Task 5's global list): default/max `limit`, mirroring the audit list's
+ * pagination limits (`routes/audit.ts`). */
+const GLOBAL_DEPLOYMENTS_DEFAULT_LIMIT = 50;
+const GLOBAL_DEPLOYMENTS_MAX_LIMIT = 100;
+
+const globalListQuerySchema = z.object({ limit: z.coerce.number().int().positive().optional() });
+
 /** Full text of a deployment's log file, or `''` if `logPath` is unset or the file doesn't exist. */
 function readLogFile(logPath: string | null): string {
   if (!logPath || !fs.existsSync(logPath)) {
@@ -27,6 +34,37 @@ function readLogFile(logPath: string | null): string {
  * WebSocket upgrade route, since `buildApp`'s `onRequest` hook runs before the upgrade completes.
  */
 export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
+  // Task 5's global deployments list (spec §1's "Global deployments" row / §2's
+  // `GET /api/deployments?limit=100`): recent deployments across every project, newest first, with
+  // the owning project's name/slug joined in — distinct from `/api/projects/:id/deployments` above
+  // (one project's history), which Fastify's router never confuses with this exact-path route.
+  app.get('/api/deployments', async (request, reply) => {
+    const parsedQuery = globalListQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) {
+      return reply.code(400).send({ error: 'invalid query' });
+    }
+    const limit = Math.min(parsedQuery.data.limit ?? GLOBAL_DEPLOYMENTS_DEFAULT_LIMIT, GLOBAL_DEPLOYMENTS_MAX_LIMIT);
+
+    return app.db
+      .select({
+        id: deployments.id,
+        projectId: deployments.projectId,
+        projectName: projects.name,
+        projectSlug: projects.slug,
+        status: deployments.status,
+        trigger: deployments.trigger,
+        commitSha: deployments.commitSha,
+        commitMessage: deployments.commitMessage,
+        startedAt: deployments.startedAt,
+        finishedAt: deployments.finishedAt,
+      })
+      .from(deployments)
+      .innerJoin(projects, eq(deployments.projectId, projects.id))
+      .orderBy(desc(deployments.id))
+      .limit(limit)
+      .all();
+  });
+
   app.post('/api/projects/:id/deploy', async (request, reply) => {
     const paramsParsed = projectIdParamsSchema.safeParse(request.params);
     if (!paramsParsed.success) {
