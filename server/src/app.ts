@@ -9,7 +9,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
-import { deployments, projects } from './db/schema.js';
+import { notificationChannels, notificationSubscriptions } from './db/schema.js';
 import { getSetting } from './db/settings.js';
 import { DeployQueue, type DeployQueueDeps } from './deploy/queue.js';
 import type { DeployLogger } from './deploy/logger.js';
@@ -22,17 +22,20 @@ import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
+import { notificationRoutes } from './routes/notifications.js';
 import { projectRoutes } from './routes/projects.js';
 import { serverRoutes } from './routes/server.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { workerRoutes } from './routes/workers.js';
+import { recordAudit } from './services/audit.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
+import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
 import { makeGitOps } from './services/git.js';
 import { cloneUrl, GitHubService, type GithubAppConfig } from './services/github.js';
-import { sendDeployNotification } from './services/notify.js';
+import { startServiceWatch, type ServiceWatchHandle } from './services/servicewatch.js';
 import { makeSysOps, type SysOps } from './sysops/index.js';
 
 declare module 'fastify' {
@@ -60,6 +63,9 @@ declare module 'fastify' {
     queue: DeployQueue;
     /** Provisions/deprovisions MySQL/Postgres databases; backed by `mysql_admin_url`/`postgres_admin_url` settings. */
     dbAdmin: DbAdmin;
+    /** The 60s service-status poller's handle (Task 4), or `undefined` when it isn't running — see
+     * `buildApp`'s `deps.serviceWatch` for when that is. `app.close()` stops it via an `onClose` hook. */
+    serviceWatch: ServiceWatchHandle | undefined;
   }
 }
 
@@ -122,6 +128,39 @@ function loadOrCreateSessionKey(keyPath: string): Buffer {
   return key;
 }
 
+/** How often the service-status poller reads `SYSTEM_UNITS` in production (Task 4). */
+const SERVICE_WATCH_INTERVAL_MS = 60_000;
+
+/**
+ * One-time migration (Task 4, spec §2's notifybus bullet): if the legacy global
+ * `notify_webhook_url` setting is set and no notification channel exists yet, creates a "Default"
+ * channel with that URL subscribed to `deploy_failed` — carrying v1's "the configured webhook fires
+ * on deploy failure" behavior forward as a Task 4 channel. Naturally idempotent — once ANY channel
+ * exists (this migration's own "Default", or one a user created by hand first), it never runs again
+ * — so this can just be called unconditionally on every boot.
+ */
+function migrateLegacyWebhookChannel(db: ShipwayDb): void {
+  const webhookUrl = getSetting<string>(db, 'notify_webhook_url');
+  if (!webhookUrl) return;
+
+  const existingChannel = db.select({ id: notificationChannels.id }).from(notificationChannels).limit(1).get();
+  if (existingChannel) return;
+
+  db.insert(notificationChannels).values({ name: 'Default', url: webhookUrl }).run();
+  const created = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, 'Default')).get();
+  if (!created) return; // unreachable: just inserted this row above
+
+  db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: created.id }).run();
+
+  recordAudit(db, {
+    actorId: null,
+    actorName: 'system',
+    action: 'notification.migrated',
+    targetType: 'notification_channel',
+    targetName: 'Default',
+  });
+}
+
 export async function buildApp(
   cfg: Config,
   deps: {
@@ -141,6 +180,11 @@ export async function buildApp(
      * `web/dist` sibling package. Lets tests exercise the SPA-fallback static serving (present and
      * absent) without depending on whether `web` has actually been built in the checkout. */
     webDistDir?: string;
+    /** Test-only override: starts the Task 4 service-status poller with this config instead of the
+     * default "skip entirely under `NODE_ENV=test`" behavior — lets tests exercise the wiring (short
+     * `intervalMs`, a fake `fetchImpl`) deterministically. In production this is never passed; the
+     * poller always runs at `SERVICE_WATCH_INTERVAL_MS`. */
+    serviceWatch?: { intervalMs: number; fetchImpl?: typeof fetch };
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -164,6 +208,7 @@ export async function buildApp(
 
   app.decorate('cfg', cfg);
   app.decorate('db', openDb(cfg.dbPath));
+  migrateLegacyWebhookChannel(app.db);
   app.decorate('github', () => {
     const githubAppCfg = getSetting<GithubAppConfig>(app.db, 'github_app');
     return githubAppCfg ? new GitHubService(githubAppCfg) : null;
@@ -208,26 +253,17 @@ export async function buildApp(
     return cloneUrl(repo, token);
   }
 
-  // Resolves the webhook to notify for a given deploy: the project's own `notifyWebhookUrl` if
-  // set, else the global `notify_webhook_url` setting; skips silently (no webhook configured
-  // anywhere) and skips `'success'` notifications unless `notify_on_success` is set — failures are
-  // always sent regardless of that setting.
-  async function notify(p: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string }): Promise<void> {
-    if (p.status === 'success' && getSetting<boolean>(app.db, 'notify_on_success') !== true) {
-      return;
-    }
-
-    const deploymentRow = app.db.select({ projectId: deployments.projectId }).from(deployments).where(eq(deployments.id, p.deploymentId)).get();
-    const projectRow = deploymentRow
-      ? app.db.select({ notifyWebhookUrl: projects.notifyWebhookUrl }).from(projects).where(eq(projects.id, deploymentRow.projectId)).get()
-      : undefined;
-
-    const webhookUrl = projectRow?.notifyWebhookUrl ?? getSetting<string>(app.db, 'notify_webhook_url');
-    if (!webhookUrl) {
-      return;
-    }
-
-    await sendDeployNotification(fetchImpl, webhookUrl, p);
+  // Wired as `PipelineDeps.notify`: preserves v1's per-project/global webhook override (gated by
+  // `notify_on_success`) AND additionally (always — Task 4's bus events are additive) emits the
+  // matching `notifybus` event to every channel subscribed to it. See `services/deploynotify.ts`.
+  async function notify(p: {
+    project: string;
+    status: 'success' | 'failed';
+    deploymentId: number;
+    message: string;
+    rolledBack?: boolean;
+  }): Promise<void> {
+    await notifyDeployTerminal(app.db, fetchImpl, p);
   }
 
   const pipelineDeps: PipelineDeps = {
@@ -252,7 +288,17 @@ export async function buildApp(
       run:
         deps.queueRun ??
         (async (deploymentId: number, signal: AbortSignal, logger: DeployLogger) => {
-          await runDeploy(pipelineDeps, deploymentId, logger, signal);
+          const result = await runDeploy(pipelineDeps, deploymentId, logger, signal);
+          // The pipeline's own `notify` hook is deliberately never called for a cancellation
+          // (unchanged v1 behavior — see deploy/pipeline.ts), so it's the one terminal status the
+          // bus needs a separate emission for, driven off `runDeploy`'s own return value instead.
+          if (result === 'canceled') {
+            try {
+              await notifyDeployCanceled(app.db, fetchImpl, deploymentId);
+            } catch (err) {
+              app.log.error({ err }, 'notifyDeployCanceled failed');
+            }
+          }
         }),
     }),
   );
@@ -316,6 +362,7 @@ export async function buildApp(
   await app.register(cronRoutes);
   await app.register(serverRoutes);
   await app.register(webhookRoutes);
+  await app.register(notificationRoutes, { fetchImpl: deps.fetchImpl });
 
   // Serves the built web SPA (see `web/`, Task 22) when present. Guarded on existence so dev mode
   // — where `web/dist` may not exist yet, since `web` ships its own Vite dev server instead — never
@@ -349,6 +396,27 @@ export async function buildApp(
       return reply.sendFile('index.html');
     });
   }
+
+  // Service-status poller (Task 4): runs at `SERVICE_WATCH_INTERVAL_MS` in production. Under
+  // `NODE_ENV=test` (vitest's default) it's skipped entirely unless a test explicitly opts in via
+  // `deps.serviceWatch`, so the hundreds of app-level tests that never touch it don't each leave a
+  // background timer running. Stopped via an `onClose` hook so `app.close()` always leaves no open
+  // handles behind — otherwise a real interval would keep the process (and vitest) alive forever.
+  const serviceWatchEnabled = deps.serviceWatch !== undefined || process.env.NODE_ENV !== 'test';
+  app.decorate(
+    'serviceWatch',
+    serviceWatchEnabled
+      ? startServiceWatch({
+          db: app.db,
+          sysops: app.sysops,
+          intervalMs: deps.serviceWatch?.intervalMs ?? SERVICE_WATCH_INTERVAL_MS,
+          fetchImpl: deps.serviceWatch?.fetchImpl ?? fetchImpl,
+        })
+      : undefined,
+  );
+  app.addHook('onClose', () => {
+    app.serviceWatch?.stop();
+  });
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
   // every route is registered, since it can start deploys immediately via the queue's `run`.

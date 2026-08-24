@@ -44,8 +44,10 @@ export function parseDfOutput(stdout: string): { totalGb: number; usedGb: number
   throw new Error('df -k /: no line found for mount "/"');
 }
 
-/** Display name + unit for each of `SYSTEM_UNITS`, in the fixed order `getStats` reports them. */
-const SERVICE_NAMES: Record<SystemUnit, string> = {
+/** Display name + unit for each of `SYSTEM_UNITS`, in the fixed order `getStats` reports them.
+ * Exported so `services/servicewatch.ts` (Task 4's poller) can reuse the same display names in its
+ * `service_down`/`service_recovered` bus messages instead of duplicating the map. */
+export const SERVICE_NAMES: Record<SystemUnit, string> = {
   nginx: 'Nginx',
   'php8.1-fpm': 'PHP-FPM 8.1',
   'php8.2-fpm': 'PHP-FPM 8.2',

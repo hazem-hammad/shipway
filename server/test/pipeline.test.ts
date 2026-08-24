@@ -191,7 +191,7 @@ interface BaseHarness {
   gitOps: GitOps;
   shell: RecordingShell;
   secretBox: SecretBox;
-  notifications: Array<{ project: string; status: 'success' | 'failed'; deploymentId: number; message: string }>;
+  notifications: Array<{ project: string; status: 'success' | 'failed'; deploymentId: number; message: string; rolledBack?: boolean }>;
   fetchHttp: (url: string) => Promise<{ status: number }>;
   logger: DeployLogger;
   deps: PipelineDeps;
@@ -422,6 +422,8 @@ describe('runDeploy — build failure', () => {
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');
+    // a pre-activate failure never rolls anything back — `rolledBack` must be unset, not `false`
+    expect(notifications[0]?.rolledBack).toBeUndefined();
   });
 });
 
@@ -463,6 +465,9 @@ describe('runDeploy — node health-check failure', () => {
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');
+    // the health check failure rolled the release back — the caller (app.ts's notify wiring) needs
+    // this to emit `deploy_rolled_back` instead of `deploy_failed`.
+    expect(notifications[0]?.rolledBack).toBe(true);
   });
 });
 
@@ -493,6 +498,7 @@ describe('runDeploy — post_deploy failure', () => {
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');
+    expect(notifications[0]?.rolledBack).toBeUndefined();
   });
 });
 
@@ -649,6 +655,8 @@ describe('runDeploy — rollback trigger', () => {
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');
+    // caught before activate ever ran — nothing was rolled back
+    expect(notifications[0]?.rolledBack).toBeUndefined();
   });
 });
 
@@ -755,5 +763,6 @@ describe('runDeploy — workers', () => {
 
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');
+    expect(notifications[0]?.rolledBack).toBe(true);
   });
 });
