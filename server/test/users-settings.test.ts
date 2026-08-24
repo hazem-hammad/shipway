@@ -278,6 +278,23 @@ describe('settings API', () => {
     await app.close();
   });
 
+  it('PUT /api/settings 400 names the offending fields (empty server_ip)', async () => {
+    const { app, cookie } = await buildAuthedApp();
+
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/api/settings',
+      headers: { cookie },
+      payload: { base_domain: 'intcore.dev', server_ip: '', acme_email: 'someone@example.com' },
+    });
+    expect(res.statusCode).toBe(400);
+    const body = res.json() as { error: string };
+    expect(body.error).toContain('server_ip');
+    expect(body.error).not.toContain('base_domain');
+
+    await app.close();
+  });
+
   it('unauthenticated requests to /api/users and /api/settings are 401', async () => {
     const app = await buildTestApp();
     await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });

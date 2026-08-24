@@ -155,10 +155,22 @@ function ServerSettingsStep({ onDone }: { onDone: (baseDomain: string, serverIp:
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
+    const domain = baseDomain.trim();
+    const ip = serverIp.trim();
+    const email = acmeEmail.trim();
+    const missing = [
+      !domain && 'Base domain',
+      !ip && 'Server IP',
+      !email && 'ACME email',
+    ].filter((label): label is string => Boolean(label));
+    if (missing.length > 0) {
+      setError(`${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required.`);
+      return;
+    }
     setSubmitting(true);
     try {
-      await putSettings({ base_domain: baseDomain, server_ip: serverIp, acme_email: acmeEmail });
-      onDone(baseDomain, serverIp);
+      await putSettings({ base_domain: domain, server_ip: ip, acme_email: email });
+      onDone(domain, ip);
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -176,13 +188,13 @@ function ServerSettingsStep({ onDone }: { onDone: (baseDomain: string, serverIp:
             mono
             required
             autoFocus
-            placeholder="apps.example.com"
+            placeholder="e.g. apps.example.com"
             value={baseDomain}
             onChange={(event) => setBaseDomain(event.target.value)}
           />
         </Field>
         <Field label="Server IP" hint="The public IPv4 address this server is reachable at.">
-          <Input mono required placeholder="203.0.113.10" value={serverIp} onChange={(event) => setServerIp(event.target.value)} />
+          <Input mono required placeholder="e.g. 203.0.113.10" value={serverIp} onChange={(event) => setServerIp(event.target.value)} />
         </Field>
         <Field label="ACME email" hint="Used for Let's Encrypt certificate notices.">
           <Input type="email" required value={acmeEmail} onChange={(event) => setAcmeEmail(event.target.value)} />

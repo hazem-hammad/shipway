@@ -69,7 +69,8 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
   app.put('/api/settings', async (request, reply) => {
     const parsed = settingsUpdateSchema.safeParse(request.body);
     if (!parsed.success) {
-      return reply.code(400).send({ error: 'invalid request body' });
+      const fields = [...new Set(parsed.error.issues.map((issue) => issue.path.join('.') || 'body'))];
+      return reply.code(400).send({ error: `invalid settings: ${fields.join(', ')}` });
     }
 
     for (const [key, value] of Object.entries(parsed.data)) {

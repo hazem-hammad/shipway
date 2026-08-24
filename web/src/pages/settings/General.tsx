@@ -51,10 +51,19 @@ function GeneralForm({ settings }: { settings: Settings }) {
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setSaving(true);
     setError(null);
+    const missing = [
+      !baseDomain.trim() && 'Base domain',
+      !serverIp.trim() && 'Server IP',
+      !acmeEmail.trim() && 'ACME email',
+    ].filter((label): label is string => Boolean(label));
+    if (missing.length > 0) {
+      setError(`${missing.join(', ')} ${missing.length === 1 ? 'is' : 'are'} required.`);
+      return;
+    }
+    setSaving(true);
     try {
-      await putSettings({ base_domain: baseDomain, server_ip: serverIp, acme_email: acmeEmail });
+      await putSettings({ base_domain: baseDomain.trim(), server_ip: serverIp.trim(), acme_email: acmeEmail.trim() });
       await queryClient.invalidateQueries({ queryKey: ['settings'] });
       setDirty(false);
     } catch (err) {
