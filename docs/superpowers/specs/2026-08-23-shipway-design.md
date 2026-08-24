@@ -104,7 +104,7 @@ Every deploy (webhook push, manual button, or rollback) runs these steps as a jo
 10. **Prune** — keep newest 5 releases, delete older.
 11. **Notify** — webhook (Slack-compatible JSON, plus Discord/Telegram formats auto-detected by URL) on failure always, on success if enabled.
 
-**Rollback** = re-run steps 6–8 pointing at a previous release folder (picked in the UI). Instant.
+**Rollback** = re-run steps 6–8 pointing at a previous release folder (picked in the UI). Instant. Implementation ruling: rollback also re-runs step 9 (post-deploy script) and step 10 (prune) after activation — the release it targets should end up in the same state a normal deploy of it would (cache warms re-applied, release history trimmed), and skipping prune would let a rollback bypass the 5-release retention cap.
 
 **Cancel** = SIGTERM the running step's process group; release folder cleaned up.
 
