@@ -8,7 +8,7 @@
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Cloud } from 'lucide-react';
-import { ApiError, putSettings, verifyCloudflare, type Settings, type SettingsUpdate } from '../../api';
+import { ApiError, putSettings, verifyCloudflare, type CloudflareVerifyResult, type Settings, type SettingsUpdate } from '../../api';
 import { useSettings } from '../../hooks';
 import { Badge, Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
 
@@ -40,20 +40,20 @@ export default function CloudflareSection() {
 
 function CloudflareForm({ settings }: { settings: Settings }) {
   const queryClient = useQueryClient();
-  const configured = settings.cloudflare_token !== null;
 
   const [token, setToken] = useState('');
   const [zoneId, setZoneId] = useState(settings.cloudflare_zone_id ?? '');
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<'ok' | 'fail' | null>(null);
+  // Full verify result (not just a boolean) so the UI can show WHY a check failed — not
+  // configured, an invalid token, or an error — instead of one generic failure message. Cleared
+  // on every edit (see `markDirty`) so a stale "Connected" badge can never survive a field change.
+  const [testResult, setTestResult] = useState<CloudflareVerifyResult | null>(null);
 
   function markDirty() {
     setDirty(true);
-    setSaved(false);
     setTestResult(null);
     setError(null);
   }
@@ -69,7 +69,6 @@ function CloudflareForm({ settings }: { settings: Settings }) {
       await putSettings(body);
       await queryClient.invalidateQueries({ queryKey: ['settings'] });
       setDirty(false);
-      setSaved(true);
       setToken('');
     } catch (err) {
       setError(err instanceof ApiError ? err.message : 'Could not save Cloudflare settings. Try again.');
@@ -82,16 +81,18 @@ function CloudflareForm({ settings }: { settings: Settings }) {
     setTesting(true);
     setTestResult(null);
     try {
-      const result = await verifyCloudflare();
-      setTestResult(result.ok ? 'ok' : 'fail');
-    } catch {
-      setTestResult('fail');
+      setTestResult(await verifyCloudflare());
+    } catch (err) {
+      setTestResult({ ok: false, reason: 'error', message: err instanceof ApiError ? err.message : 'Could not reach the server. Try again.' });
     } finally {
       setTesting(false);
     }
   }
 
-  const canTest = (configured || saved) && !testing;
+  // Always clickable (while not already testing) — the route itself is honest about an
+  // unconfigured/blank state now, so there's no need to gate the button on `configured`/`saved`
+  // the way the previous (dishonest) version did.
+  const canTest = !testing;
 
   return (
     <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[640px] flex-col gap-6" noValidate>
@@ -131,10 +132,19 @@ function CloudflareForm({ settings }: { settings: Settings }) {
         <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!canTest}>
           Test connection
         </Button>
-        {testResult === 'ok' && <Badge tone="ok">Connected</Badge>}
-        {testResult === 'fail' && (
+        {/* Three honest states, driven entirely by the last verify result's `reason` — never
+            inferred from credentials merely being present (that was the bug: dev mode used to
+            report "Connected" unconditionally). Cleared to unknown on any field edit above. */}
+        {testResult?.reason === 'ok' && <Badge tone="ok">Connected</Badge>}
+        {testResult?.reason === 'not_configured' && <Badge tone="neutral">Not configured</Badge>}
+        {testResult?.reason === 'invalid_token' && (
           <span role="alert" className="text-sm text-danger">
-            Could not verify the token.
+            Cloudflare rejected this token. Check it hasn&rsquo;t expired or been revoked.
+          </span>
+        )}
+        {testResult?.reason === 'error' && (
+          <span role="alert" className="text-sm text-danger">
+            {testResult.message ?? 'Could not reach Cloudflare. Try again.'}
           </span>
         )}
       </div>

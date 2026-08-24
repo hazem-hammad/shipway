@@ -96,8 +96,18 @@ export interface SettingsUpdate {
   notify_on_success?: boolean;
 }
 
+/**
+ * `GET /api/cloudflare/verify`'s response shape (plan Task 1 / spec §3 "Cloudflare verify"). `ok`
+ * is `true` only after a real, successful Cloudflare API round-trip — never inferred from
+ * credentials merely being present. `reason` always says why: `'not_configured'` when no usable
+ * token/zone id is stored, `'invalid_token'` when Cloudflare rejected the token,
+ * `'error'` for anything else (with a sanitized `message`, never the token itself), and `'ok'` on
+ * success.
+ */
 export interface CloudflareVerifyResult {
   ok: boolean;
+  reason: 'ok' | 'not_configured' | 'invalid_token' | 'error';
+  message?: string;
 }
 
 export interface GithubManifest {

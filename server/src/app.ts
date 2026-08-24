@@ -32,7 +32,7 @@ import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { workerRoutes } from './routes/workers.js';
 import { recordAudit, runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle } from './services/audit.js';
-import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
+import { FakeDnsClient, isBlankCredential, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
 import { makeGitOps } from './services/git.js';
@@ -57,8 +57,11 @@ declare module 'fastify' {
     /**
      * Lazily builds a `DnsClient` from the current `cloudflare_token`/`cloudflare_zone_id`
      * settings, or `null` when unconfigured. In dev mode, always returns a shared in-process
-     * `FakeDnsClient` so provisioning works offline. Called fresh per use so routes always see the
-     * latest stored credentials.
+     * `FakeDnsClient` (never `null`) so record provisioning works offline regardless of whether
+     * real credentials are configured — but its `setCredentials()` is refreshed from the current
+     * settings on every call, so its `verifyToken()` stays honest (plan Task 1 / spec §3
+     * "Cloudflare verify") rather than always reporting success. Called fresh per use so routes
+     * always see the latest stored credentials.
      */
     dns: () => DnsClient | null;
     /** Schedules and tracks deploy/rollback jobs; wired to `runDeploy` in `buildApp`. */
@@ -260,14 +263,22 @@ export async function buildApp(
     'dns',
     deps.dns ??
       ((): DnsClient | null => {
-        if (cfg.devMode) {
-          sharedDevDnsClient ??= new FakeDnsClient();
-          return sharedDevDnsClient;
-        }
         const token = getSetting<string>(app.db, 'cloudflare_token');
         const zoneId = getSetting<string>(app.db, 'cloudflare_zone_id');
-        if (!token || !zoneId) return null;
-        return makeCloudflareClient(token, zoneId);
+        const hasCredentials = !isBlankCredential(token) && !isBlankCredential(zoneId);
+
+        if (cfg.devMode) {
+          // Record provisioning (create/find/delete) stays fully in-memory/offline unconditionally
+          // (FakeDnsClient's own doc comment) — only its verifyToken() reflects real configured
+          // state, refreshed here on every call so "Test connection" in dev mode is never a lie
+          // (see routes/cloudflare.ts and the root-cause note in the v3 design spec §2).
+          sharedDevDnsClient ??= new FakeDnsClient();
+          sharedDevDnsClient.setCredentials(hasCredentials ? { token: token!.trim(), zoneId: zoneId!.trim() } : null);
+          return sharedDevDnsClient;
+        }
+
+        if (!hasCredentials) return null;
+        return makeCloudflareClient(token!.trim(), zoneId!.trim());
       }),
   );
 
@@ -304,9 +315,24 @@ export async function buildApp(
     secretBox: app.secretBox,
     getCloneUrl,
     runShell: makeRunShell(),
-    fetchHttp: async (url) => ({ status: (await fetchImpl(url)).status }),
+    fetchHttp: async (url, signal) => ({ status: (await fetchImpl(url, { signal })).status }),
     notify,
-    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    sleep: (ms, signal) =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      }),
   };
 
   app.decorate(

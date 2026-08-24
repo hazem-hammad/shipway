@@ -2,7 +2,7 @@ import { type FormEvent, type ReactNode, useState } from 'react';
 import { useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import { Check, Cloud, GitBranch, Server, UserPlus } from 'lucide-react';
-import { ApiError, fetchGithubManifest, putSettings, setupAdmin, verifyCloudflare, type Me } from '../api';
+import { ApiError, fetchGithubManifest, putSettings, setupAdmin, verifyCloudflare, type CloudflareVerifyResult, type Me } from '../api';
 import { submitManifestForm } from '../lib/github';
 import { Button, Card, CardHeader, Field, ICON_STROKE, Input, StatusDot } from '../components/ui';
 
@@ -281,7 +281,9 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [testResult, setTestResult] = useState<'ok' | 'fail' | null>(null);
+  // Full verify result (not just a boolean) so a failure can say WHY — not configured, an invalid
+  // token, or an error — rather than one generic "could not verify" message.
+  const [testResult, setTestResult] = useState<CloudflareVerifyResult | null>(null);
 
   async function handleSave(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -302,10 +304,9 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
     setTesting(true);
     setTestResult(null);
     try {
-      const result = await verifyCloudflare();
-      setTestResult(result.ok ? 'ok' : 'fail');
-    } catch {
-      setTestResult('fail');
+      setTestResult(await verifyCloudflare());
+    } catch (err) {
+      setTestResult({ ok: false, reason: 'error', message: errorMessage(err) });
     } finally {
       setTesting(false);
     }
@@ -328,6 +329,7 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
             onChange={(event) => {
               setToken(event.target.value);
               setSaved(false);
+              setTestResult(null);
             }}
           />
         </Field>
@@ -339,6 +341,7 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
             onChange={(event) => {
               setZoneId(event.target.value);
               setSaved(false);
+              setTestResult(null);
             }}
           />
         </Field>
@@ -354,8 +357,12 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
           <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!saved}>
             Test connection
           </Button>
-          {testResult === 'ok' && <span className="text-sm text-ok">Connected.</span>}
-          {testResult === 'fail' && <span className="text-sm text-danger">Could not verify the token.</span>}
+          {testResult?.reason === 'ok' && <span className="text-sm text-ok">Connected.</span>}
+          {testResult?.reason === 'not_configured' && <span className="text-sm text-soft">Not configured. Save a token and zone ID first.</span>}
+          {testResult?.reason === 'invalid_token' && (
+            <span className="text-sm text-danger">Cloudflare rejected this token. Check it hasn&rsquo;t expired or been revoked.</span>
+          )}
+          {testResult?.reason === 'error' && <span className="text-sm text-danger">{testResult.message ?? 'Could not reach Cloudflare. Try again.'}</span>}
         </div>
       </form>
       {saved && (
