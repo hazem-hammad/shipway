@@ -1,13 +1,31 @@
 /**
- * Environment tab: the project's raw `.env` text (editable) plus a read-only preview of the
- * managed block Shipway appends on every deploy from the SMTP tab's config (backed by
- * `GET /api/projects/:id/env/preview`).
+ * Environment tab: the project's `.env` text, editable as either a Table (default, one row per
+ * `KEY=value` pair) or Raw (today's textarea), plus a read-only preview of the managed block Shipway
+ * appends on every deploy from the SMTP tab's config (backed by `GET /api/projects/:id/env/preview`).
+ *
+ * Table <-> Raw conversion goes through `parseEnv`/`serializeEnv` (server/src/deploy/envparse.ts,
+ * imported here via a relative path per Ruling 1 in
+ * .superpowers/sdd/2026-08-25-shipway-v3/progress.md), so switching modes never drops a comment,
+ * blank line, or line the parser isn't confident about reformatting.
  */
-import { type ChangeEvent, useState } from 'react';
-import { KeyRound } from 'lucide-react';
+import { type ChangeEvent, useMemo, useRef, useState } from 'react';
+import { Eye, EyeOff, KeyRound, Plus, Trash2 } from 'lucide-react';
 import { ApiError, putProjectEnv } from '../../api';
 import { useProjectEnv, useProjectEnvPreview } from '../../hooks';
-import { Button, Card, CardHeader, ICON_STROKE, Skeleton, Textarea } from '../../components/ui';
+import { Button, Card, CardHeader, ICON_STROKE, Input, Skeleton, Tabs, Textarea } from '../../components/ui';
+import { findDuplicateKeys, parseEnv, serializeEnv, type EnvExtra, type EnvRow } from '../../../../server/src/deploy/envparse.js';
+
+/** Keys that look like secrets get masked by default with a per-row reveal toggle. */
+const SECRET_KEY_RE = /(SECRET|TOKEN|KEY|PASSWORD|PASS|DSN|CREDENTIAL)/i;
+
+type Mode = 'table' | 'raw';
+
+/** A table row plus view-only state (stable id for React keys/reveal-state, reveal toggle). Stripped
+ *  back down to `EnvRow` before it ever reaches `serializeEnv`. */
+interface EditableRow extends EnvRow {
+  id: number;
+  revealed: boolean;
+}
 
 export default function EnvEditorTab({ projectId }: { projectId: number }) {
   const envQuery = useProjectEnv(projectId);
@@ -28,14 +46,56 @@ export default function EnvEditorTab({ projectId }: { projectId: number }) {
 
 function EnvEditorForm({ projectId, initialContent }: { projectId: number; initialContent: string }) {
   const previewQuery = useProjectEnvPreview(projectId);
+  const idRef = useRef(0);
+  const nextId = () => idRef.current++;
 
-  const [content, setContent] = useState(initialContent);
+  const [mode, setMode] = useState<Mode>('table');
+  const [rows, setRows] = useState<EditableRow[]>(() =>
+    parseEnv(initialContent).rows.map((row) => ({ ...row, id: nextId(), revealed: false })),
+  );
+  const [extras, setExtras] = useState<EnvExtra[]>(() => parseEnv(initialContent).extras);
+  const [rawText, setRawText] = useState(initialContent);
+
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  function handleChange(event: ChangeEvent<HTMLTextAreaElement>) {
-    setContent(event.target.value);
+  const duplicateKeys = useMemo(() => findDuplicateKeys(rows), [rows]);
+
+  function switchMode(next: Mode) {
+    if (next === mode) return;
+    if (next === 'raw') {
+      setRawText(serializeEnv(rows, extras));
+    } else {
+      const parsed = parseEnv(rawText);
+      setRows(parsed.rows.map((row) => ({ ...row, id: nextId(), revealed: false })));
+      setExtras(parsed.extras);
+    }
+    setMode(next);
+  }
+
+  function updateRow(id: number, patch: Partial<Pick<EditableRow, 'key' | 'value'>>) {
+    setRows((prev) => prev.map((row) => (row.id === id ? { ...row, ...patch } : row)));
+    setDirty(true);
+    setError(null);
+  }
+
+  function addRow() {
+    setRows((prev) => [...prev, { id: nextId(), key: '', value: '', revealed: false }]);
+    setDirty(true);
+  }
+
+  function deleteRow(id: number) {
+    setRows((prev) => prev.filter((row) => row.id !== id));
+    setDirty(true);
+  }
+
+  function toggleReveal(id: number) {
+    setRows((prev) => prev.map((row) => (row.id === id ? { ...row, revealed: !row.revealed } : row)));
+  }
+
+  function handleRawChange(event: ChangeEvent<HTMLTextAreaElement>) {
+    setRawText(event.target.value);
     setDirty(true);
     setError(null);
   }
@@ -44,6 +104,7 @@ function EnvEditorForm({ projectId, initialContent }: { projectId: number; initi
     setSaving(true);
     setError(null);
     try {
+      const content = mode === 'raw' ? rawText : serializeEnv(rows, extras);
       await putProjectEnv(projectId, content);
       setDirty(false);
     } catch (err) {
@@ -57,15 +118,60 @@ function EnvEditorForm({ projectId, initialContent }: { projectId: number; initi
     <Card>
       <CardHeader icon={<KeyRound size={20} strokeWidth={ICON_STROKE} />} title="Environment variables" description="Injected into every deploy as .env." />
 
-      <div className="mt-5 flex flex-col gap-3">
-        <Textarea
-          mono
-          spellCheck={false}
-          value={content}
-          onChange={handleChange}
-          aria-label="Environment file"
-          className="min-h-[320px] w-full"
+      <div className="mt-5 flex flex-col gap-4">
+        <Tabs
+          tabs={[
+            { id: 'table', label: 'Table' },
+            { id: 'raw', label: 'Raw' },
+          ]}
+          value={mode}
+          onChange={(id) => switchMode(id === 'raw' ? 'raw' : 'table')}
         />
+
+        {mode === 'table' ? (
+          <div className="flex flex-col gap-3">
+            {rows.length === 0 ? (
+              <p className="text-sm text-soft">No environment variables yet.</p>
+            ) : (
+              <div className="flex flex-col gap-2">
+                {rows.map((row) => (
+                  <EnvRowFields
+                    key={row.id}
+                    row={row}
+                    isDuplicate={row.key !== '' && duplicateKeys.has(row.key)}
+                    onKeyChange={(key) => updateRow(row.id, { key })}
+                    onValueChange={(value) => updateRow(row.id, { value })}
+                    onDelete={() => deleteRow(row.id)}
+                    onToggleReveal={() => toggleReveal(row.id)}
+                  />
+                ))}
+              </div>
+            )}
+
+            <div>
+              <Button variant="outline" size="sm" onClick={addRow}>
+                <Plus size={16} strokeWidth={ICON_STROKE} aria-hidden />
+                Add variable
+              </Button>
+            </div>
+
+            {extras.length > 0 && (
+              <p className="text-[13px] text-soft">
+                {extras.length} {extras.length === 1 ? 'line' : 'lines'} kept as written (comments and blanks).
+              </p>
+            )}
+          </div>
+        ) : (
+          <Textarea
+            mono
+            spellCheck={false}
+            value={rawText}
+            onChange={handleRawChange}
+            aria-label="Environment file"
+            className="min-h-[320px] w-full"
+          />
+        )}
+
         <div className="flex flex-wrap items-center gap-3">
           <Button loading={saving} disabled={!dirty} onClick={() => void handleSave()}>
             Save
@@ -97,5 +203,68 @@ function EnvEditorForm({ projectId, initialContent }: { projectId: number; initi
         </div>
       </div>
     </Card>
+  );
+}
+
+const ICON_BUTTON_CLASSES =
+  'grid h-9 w-9 shrink-0 place-items-center rounded-lg text-icon transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus';
+
+function EnvRowFields({
+  row,
+  isDuplicate,
+  onKeyChange,
+  onValueChange,
+  onDelete,
+  onToggleReveal,
+}: {
+  row: EditableRow;
+  isDuplicate: boolean;
+  onKeyChange: (key: string) => void;
+  onValueChange: (value: string) => void;
+  onDelete: () => void;
+  onToggleReveal: () => void;
+}) {
+  const isSecret = row.key !== '' && SECRET_KEY_RE.test(row.key);
+  const masked = isSecret && !row.revealed;
+
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <div className="min-w-0 basis-2/5">
+          <Input mono value={row.key} onChange={(event) => onKeyChange(event.target.value)} placeholder="KEY" aria-label="Variable name" />
+        </div>
+        <span aria-hidden className="text-soft">
+          =
+        </span>
+        <div className="min-w-0 flex-1">
+          <Input
+            mono
+            type={masked ? 'password' : 'text'}
+            value={row.value}
+            onChange={(event) => onValueChange(event.target.value)}
+            placeholder="value"
+            aria-label="Variable value"
+          />
+        </div>
+        {isSecret && (
+          <button
+            type="button"
+            onClick={onToggleReveal}
+            aria-label={row.revealed ? 'Hide value' : 'Reveal value'}
+            className={`${ICON_BUTTON_CLASSES} hover:text-ink`}
+          >
+            {row.revealed ? <EyeOff size={16} strokeWidth={ICON_STROKE} aria-hidden /> : <Eye size={16} strokeWidth={ICON_STROKE} aria-hidden />}
+          </button>
+        )}
+        <button type="button" onClick={onDelete} aria-label="Delete variable" className={`${ICON_BUTTON_CLASSES} hover:text-danger`}>
+          <Trash2 size={16} strokeWidth={ICON_STROKE} aria-hidden />
+        </button>
+      </div>
+      {isDuplicate && (
+        <p role="alert" className="text-[13px] text-danger">
+          Duplicate key "{row.key}". The last one wins.
+        </p>
+      )}
+    </div>
   );
 }
