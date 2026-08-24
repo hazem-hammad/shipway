@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
 import { buildEnvFile, buildManagedVars, type SmtpConfig } from '../deploy/envfile.js';
+import { requireRole } from '../lib/authz.js';
+import { getActor, recordAudit } from '../services/audit.js';
 import { ProvisionError, deprovisionProject, provisionProject, refreshProjectConfig, type ProvisionDeps } from '../services/provisioner.js';
 import { allocatePort } from '../system/ports.js';
 import { SLUG_RE, isValidPublicDir } from '../system/templates.js';
@@ -79,6 +81,18 @@ const IMMUTABLE_PATCH_FIELDS = ['slug', 'repo', 'type'] as const;
 
 /** Fields whose change requires re-rendering/reinstalling the vhost and (node/nextjs) app unit. */
 const REFRESH_TRIGGER_FIELDS = ['phpVersion', 'publicDir', 'startCmd', 'nodeVersion'] as const;
+
+/** `PATCH /api/projects/:id` handles both general settings and the pre/post-deploy scripts (there's
+ * no separate scripts sub-route) — this picks the more specific `project.scripts.update` audit
+ * action when every changed field is one of the two script fields, and the general
+ * `project.update` otherwise. */
+const SCRIPT_ONLY_PATCH_FIELDS = new Set(['preDeployScript', 'postDeployScript']);
+function projectPatchAuditAction(changedFields: string[]): string {
+  if (changedFields.length > 0 && changedFields.every((field) => SCRIPT_ONLY_PATCH_FIELDS.has(field))) {
+    return 'project.scripts.update';
+  }
+  return 'project.update';
+}
 
 const deleteProjectBodySchema = z.object({ confirmName: z.string() });
 
@@ -252,6 +266,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(502).send({ error: 'provisioning failed', step, detail: toErrorMessage(err) });
     }
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.create', targetType: 'project', targetName: created.slug, meta: { type: created.type } });
+
     return reply.code(201).send(toPublicProject(created));
   });
 
@@ -318,10 +335,18 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    if (Object.keys(parsed.data).length > 0) {
+      const actor = getActor(app.db, request.session.get('userId'));
+      const action = projectPatchAuditAction(Object.keys(parsed.data));
+      recordAudit(app.db, { ...actor, action, targetType: 'project', targetName: updated.slug });
+    }
+
     return toPublicProject(updated);
   });
 
   app.delete('/api/projects/:id', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const paramsParsed = projectIdParamsSchema.safeParse(request.params);
     if (!paramsParsed.success) {
       return reply.code(404).send({ error: 'project not found' });
@@ -343,6 +368,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     }
 
     await deprovisionProject(deps(), id);
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.delete', targetType: 'project', targetName: project.slug });
 
     return reply.code(204).send();
   });
@@ -378,13 +406,16 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'invalid request body' });
     }
 
-    const existing = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, id)).get();
+    const existing = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'project not found' });
     }
 
     const envEncrypted = app.secretBox.encrypt(parsed.data.content);
     app.db.update(projects).set({ envEncrypted }).where(eq(projects.id, id)).run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.env.update', targetType: 'project', targetName: existing.slug });
 
     return reply.code(204).send();
   });
@@ -429,7 +460,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'config is required when mode is "custom"' });
     }
 
-    const existing = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, id)).get();
+    const existing = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'project not found' });
     }
@@ -437,6 +468,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const smtpConfigEncrypted = mode === 'custom' && config ? app.secretBox.encrypt(JSON.stringify(config)) : null;
 
     app.db.update(projects).set({ smtpMode: mode, smtpConfigEncrypted }).where(eq(projects.id, id)).run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.smtp.update', targetType: 'project', targetName: existing.slug, meta: { mode } });
 
     return reply.code(204).send();
   });

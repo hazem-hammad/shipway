@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import * as fs from 'node:fs';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
+import { getActor, recordAudit } from '../services/audit.js';
 
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
 const deploymentIdParamsSchema = z.object({ id: z.coerce.number().int() });
@@ -32,12 +33,16 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    const project = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
+    const project = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
     if (!project) {
       return reply.code(404).send({ error: 'project not found' });
     }
 
     const deploymentId = app.queue.enqueue({ projectId: project.id, trigger: 'manual' });
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'deploy.trigger', targetType: 'project', targetName: project.slug, meta: { trigger: 'manual', deploymentId } });
+
     return reply.code(202).send({ deploymentId });
   });
 
@@ -47,7 +52,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    const project = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
+    const project = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
     if (!project) {
       return reply.code(404).send({ error: 'project not found' });
     }
@@ -71,6 +76,10 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const deploymentId = app.queue.enqueue({ projectId: project.id, trigger: 'rollback', releasePath });
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'deploy.rollback', targetType: 'project', targetName: project.slug, meta: { releasePath, deploymentId } });
+
     return reply.code(202).send({ deploymentId });
   });
 
@@ -113,12 +122,17 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'deployment not found' });
     }
 
-    const row = app.db.select({ id: deployments.id }).from(deployments).where(eq(deployments.id, paramsParsed.data.id)).get();
+    const row = app.db.select({ id: deployments.id, projectId: deployments.projectId }).from(deployments).where(eq(deployments.id, paramsParsed.data.id)).get();
     if (!row) {
       return reply.code(404).send({ error: 'deployment not found' });
     }
 
     app.queue.cancel(row.id);
+
+    const project = app.db.select({ slug: projects.slug }).from(projects).where(eq(projects.id, row.projectId)).get();
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'deploy.cancel', targetType: 'deployment', targetName: project?.slug ?? String(row.id) });
+
     return reply.code(202).send({});
   });
 

@@ -2,7 +2,9 @@ import { eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { users } from '../db/schema.js';
+import { requireRole } from '../lib/authz.js';
 import { hashPassword } from '../lib/passwords.js';
+import { getActor, recordAudit } from '../services/audit.js';
 
 const createUserSchema = z.object({
   name: z.string().min(1),
@@ -31,6 +33,8 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post('/api/users', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const parsed = createUserSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid request body' });
@@ -51,10 +55,15 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'failed to create user' });
     }
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'user.create', targetType: 'user', targetName: created.email });
+
     return reply.code(201).send(toPublicUser(created));
   });
 
   app.delete('/api/users/:id', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const parsedParams = userIdParamsSchema.safeParse(request.params);
     if (!parsedParams.success) {
       return reply.code(404).send({ error: 'user not found' });
@@ -66,12 +75,16 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(403).send({ error: 'cannot delete your own account' });
     }
 
-    const existing = app.db.select({ id: users.id }).from(users).where(eq(users.id, id)).get();
+    const existing = app.db.select({ id: users.id, email: users.email }).from(users).where(eq(users.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'user not found' });
     }
 
     app.db.delete(users).where(eq(users.id, id)).run();
+
+    const actor = getActor(app.db, sessionUserId);
+    recordAudit(app.db, { ...actor, action: 'user.delete', targetType: 'user', targetName: existing.email });
+
     return reply.code(204).send();
   });
 }

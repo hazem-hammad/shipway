@@ -2,6 +2,7 @@ import { and, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { projects, workers } from '../db/schema.js';
+import { getActor, recordAudit } from '../services/audit.js';
 import { applyWorker, removeWorker, workerInstances, type WorkerDeps } from '../services/workers.js';
 import { unitNames } from '../system/templates.js';
 
@@ -133,6 +134,9 @@ export async function workerRoutes(app: FastifyInstance): Promise<void> {
 
     await applyWorker(deps(), project, created);
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'worker.create', targetType: 'worker', targetName: created.name, meta: { project: project.slug } });
+
     return reply.code(201).send(created);
   });
 
@@ -164,6 +168,9 @@ export async function workerRoutes(app: FastifyInstance): Promise<void> {
 
     await applyWorker(deps(), project, updated, existing.processes);
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'worker.update', targetType: 'worker', targetName: updated.name, meta: { project: project.slug } });
+
     return updated;
   });
 
@@ -181,6 +188,9 @@ export async function workerRoutes(app: FastifyInstance): Promise<void> {
 
     await removeWorker(deps(), project, worker);
     app.db.delete(workers).where(eq(workers.id, worker.id)).run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'worker.delete', targetType: 'worker', targetName: worker.name, meta: { project: project.slug } });
 
     return reply.code(204).send();
   });
@@ -200,6 +210,15 @@ export async function workerRoutes(app: FastifyInstance): Promise<void> {
     for (const unit of workerInstances(project.slug, worker.name, worker.processes)) {
       await app.sysops.unitAction(paramsParsed.data.action, unit);
     }
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, {
+      ...actor,
+      action: 'worker.action',
+      targetType: 'worker',
+      targetName: worker.name,
+      meta: { project: project.slug, action: paramsParsed.data.action },
+    });
 
     return reply.code(202).send({ ok: true });
   });

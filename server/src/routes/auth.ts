@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { users } from '../db/schema.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { recordAudit } from '../services/audit.js';
 
 const setupAdminSchema = z.object({
   name: z.string().min(1),
@@ -101,7 +102,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       if (existing) {
         return null;
       }
-      tx.insert(users).values({ name, email, passwordHash }).run();
+      // The very first user is always created as 'owner' directly (spec §2) — there's no earlier
+      // user for `db/index.ts`'s boot-time promotion to act on, since that only runs at db-open
+      // time, before this handler exists to insert anyone.
+      tx.insert(users).values({ name, email, passwordHash, role: 'owner' }).run();
       return tx.select().from(users).where(eq(users.email, email)).get() ?? null;
     });
 
@@ -132,6 +136,13 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     if (!user || !valid) {
       recordFailure(ip);
+      recordAudit(app.db, {
+        actorId: user?.id ?? null,
+        actorName: email,
+        action: 'auth.login_failed',
+        targetType: 'auth',
+        targetName: email,
+      });
       return reply.code(401).send({ error: 'invalid email or password' });
     }
 

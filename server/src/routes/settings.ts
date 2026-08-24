@@ -4,6 +4,8 @@ import { z } from 'zod';
 import { settings } from '../db/schema.js';
 import { getSetting, setSetting } from '../db/settings.js';
 import type { ShipwayDb } from '../db/index.js';
+import { requireRole } from '../lib/authz.js';
+import { getActor, recordAudit } from '../services/audit.js';
 
 /** Prefix used to mask secrets in `GET`/`PUT` responses (see `maskToken`). */
 const MASK_PREFIX = '•••';
@@ -67,12 +69,15 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.put('/api/settings', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const parsed = settingsUpdateSchema.safeParse(request.body);
     if (!parsed.success) {
       const fields = [...new Set(parsed.error.issues.map((issue) => issue.path.join('.') || 'body'))];
       return reply.code(400).send({ error: `invalid settings: ${fields.join(', ')}` });
     }
 
+    const changedKeys: string[] = [];
     for (const [key, value] of Object.entries(parsed.data)) {
       // A masked value (e.g. a frontend echoing back the "•••1234" it got from GET) means "leave
       // this secret alone" rather than "set the secret to this literal masked string".
@@ -80,6 +85,14 @@ export async function settingsRoutes(app: FastifyInstance): Promise<void> {
         continue;
       }
       setSetting(app.db, key, value);
+      changedKeys.push(key);
+    }
+
+    if (changedKeys.length > 0) {
+      // meta carries the changed KEYS only — never the values, several of which are secrets
+      // (cloudflare_token, etc.).
+      const actor = getActor(app.db, request.session.get('userId'));
+      recordAudit(app.db, { ...actor, action: 'settings.update', targetType: 'settings', targetName: 'settings', meta: { keys: changedKeys } });
     }
 
     return buildSettingsResponse(app.db);

@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { blob, integer, sqliteTable, text } from 'drizzle-orm/sqlite-core';
+import { blob, index, integer, sqliteTable, text, uniqueIndex } from 'drizzle-orm/sqlite-core';
 
 /**
  * Timestamp convention: all "*At" columns are stored as SQLite INTEGER epoch
@@ -13,6 +13,20 @@ export const users = sqliteTable('users', {
   name: text('name').notNull(),
   email: text('email').notNull().unique(),
   passwordHash: text('password_hash').notNull(),
+  /** Enforced server-side (see `lib/authz.ts`); order is member < admin < owner. The first user
+   * ever created (via `POST /api/setup/admin`, or the earliest-id user on a db migrated from v1
+   * with no owner yet — see `db/index.ts`'s boot promotion) is always 'owner'. */
+  role: text('role', { enum: ['owner', 'admin', 'member'] })
+    .notNull()
+    .default('member'),
+  /** 'invited' users have a pending invite (see Task 3's `/api/users/invite`) and cannot log in
+   * until they activate via `inviteToken`. */
+  status: text('status', { enum: ['active', 'invited'] })
+    .notNull()
+    .default('active'),
+  /** Single-use invite token (32 hex chars); `NULL` for already-active users. */
+  inviteToken: text('invite_token').unique(),
+  inviteExpiresAt: integer('invite_expires_at', { mode: 'number' }),
   createdAt: integer('created_at', { mode: 'number' })
     .notNull()
     .$defaultFn(() => Date.now()),
@@ -57,6 +71,9 @@ export const projects = sqliteTable('projects', {
     .default('mailpit'),
   smtpConfigEncrypted: blob('smtp_config_encrypted', { mode: 'buffer' }),
   notifyWebhookUrl: text('notify_webhook_url'),
+  /** Git-URL source alternative to a GitHub App `repo` (Task 8): any https git URL, used verbatim
+   * by the pipeline's `getCloneUrl` when set. `NULL` for GitHub-App-sourced projects. */
+  repoUrl: text('repo_url'),
   createdAt: integer('created_at', { mode: 'number' })
     .notNull()
     .$defaultFn(() => Date.now()),
@@ -110,3 +127,51 @@ export const cronJobs = sqliteTable('cron_jobs', {
   schedule: text('schedule').notNull(),
   command: text('command').notNull(),
 });
+
+/** Named notification delivery targets (webhook URL; Slack-compatible/Discord/Telegram
+ * auto-detected by `services/notify.ts`'s formatter — see Task 4). */
+export const notificationChannels = sqliteTable('notification_channels', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull().unique(),
+  url: text('url').notNull(),
+  createdAt: integer('created_at', { mode: 'number' })
+    .notNull()
+    .$defaultFn(() => Date.now()),
+});
+
+/** Per-event opt-in for a channel (Task 4's notification matrix); a given (event, channelId) pair
+ * is subscribed at most once. */
+export const notificationSubscriptions = sqliteTable(
+  'notification_subscriptions',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    event: text('event').notNull(),
+    channelId: integer('channel_id')
+      .notNull()
+      .references(() => notificationChannels.id, { onDelete: 'cascade' }),
+  },
+  (table) => [uniqueIndex('notification_subscriptions_event_channel_id_unique').on(table.event, table.channelId)],
+);
+
+/**
+ * Every mutating API action records one row here (see `services/audit.ts`'s `recordAudit`).
+ * `actorId` is set null (not cascade-deleted) if the acting user is later removed, so the audit
+ * trail survives user deletion; `actorName` is captured at write time so the row stays meaningful
+ * even then. `meta` is an opaque JSON-encoded string (e.g. changed setting keys — never values).
+ */
+export const auditEvents = sqliteTable(
+  'audit_events',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    actorId: integer('actor_id').references(() => users.id, { onDelete: 'set null' }),
+    actorName: text('actor_name').notNull(),
+    action: text('action').notNull(),
+    targetType: text('target_type').notNull(),
+    targetName: text('target_name').notNull(),
+    meta: text('meta'),
+    createdAt: integer('created_at', { mode: 'number' })
+      .notNull()
+      .$defaultFn(() => Date.now()),
+  },
+  (table) => [index('audit_events_created_at_idx').on(table.createdAt), index('audit_events_action_idx').on(table.action)],
+);

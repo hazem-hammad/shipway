@@ -21,6 +21,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { projects } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
+import { recordAudit } from '../services/audit.js';
 import { verifyWebhookSignature, type GithubAppConfig } from '../services/github.js';
 
 const GITHUB_APP_SETTING_KEY = 'github_app';
@@ -102,14 +103,25 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(200).send({ ignored: true });
     }
 
-    const deployed = matchingProjects.map((project) =>
-      app.queue.enqueue({
+    const deployed = matchingProjects.map((project) => {
+      const deploymentId = app.queue.enqueue({
         projectId: project.id,
         trigger: 'push',
         commitSha: payload.after,
         commitMessage: payload.head_commit?.message,
-      }),
-    );
+      });
+
+      recordAudit(app.db, {
+        actorId: null,
+        actorName: 'github',
+        action: 'deploy.trigger',
+        targetType: 'project',
+        targetName: project.slug,
+        meta: { trigger: 'push', commitSha: payload.after, deploymentId },
+      });
+
+      return deploymentId;
+    });
 
     return reply.code(200).send({ deployed });
   });

@@ -4,6 +4,8 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { databases, projects } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
+import { requireRole } from '../lib/authz.js';
+import { getActor, recordAudit } from '../services/audit.js';
 import { connectionEnv, IDENTIFIER_RE } from '../services/dbprovision.js';
 
 const idParamsSchema = z.object({ id: z.coerce.number().int() });
@@ -138,6 +140,9 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'failed to create database' });
     }
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'database.create', targetType: 'database', targetName: name, meta: { engine } });
+
     // The ONE time the plaintext password is ever returned — every other read (GET
     // /api/databases, /:id/credentials) either omits it or requires a separate decrypt.
     return reply.code(201).send({ id: created.id, engine, name, username, password });
@@ -163,6 +168,8 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.delete('/api/databases/:id', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const paramsParsed = idParamsSchema.safeParse(request.params);
     if (!paramsParsed.success) {
       return reply.code(404).send({ error: 'database not found' });
@@ -190,6 +197,9 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
     }
 
     app.db.delete(databases).where(eq(databases.id, id)).run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'database.drop', targetType: 'database', targetName: row.name, meta: { engine: row.engine } });
 
     return reply.code(204).send();
   });
@@ -228,6 +238,9 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       .set({ envEncrypted: app.secretBox.encrypt(nextEnv) })
       .where(eq(projects.id, project.id))
       .run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'database.inject', targetType: 'database', targetName: dbRow.name, meta: { projectId: project.id } });
 
     return reply.code(204).send();
   });
