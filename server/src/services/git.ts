@@ -27,6 +27,7 @@ import { execa } from 'execa';
 import { existsSync } from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { AbortedError } from '../lib/aborted-error.js';
 
 export interface GitOps {
   /**
@@ -64,13 +65,16 @@ function sanitizeError(err: unknown, url: string): Error {
 }
 
 /**
- * A deliberately generic error for a git command aborted via `cancelSignal`: execa's own error for
- * a canceled process (often the bare `AbortSignal.reason`, e.g. a DOMException) is not a clear
- * "this was canceled" message on its own, so callers that see `signal.aborted` after a git command
- * throws replace whatever execa raised with this instead.
+ * A deliberately generic, typed error for a git command aborted via `cancelSignal`: execa's own
+ * error for a canceled process (often the bare `AbortSignal.reason`, e.g. a DOMException) is not a
+ * clear "this was canceled" message on its own, so callers that see `signal.aborted` after a git
+ * command throws replace whatever execa raised with this instead. Using the shared `AbortedError`
+ * (rather than a plain `Error`) lets a caller that wants to classify by cause rather than by the
+ * ambient `signal.aborted` flag (see `deploy/pipeline.ts`'s `runPostActivate`) do so with
+ * `instanceof AbortedError`.
  */
-function canceledError(): Error {
-  return new Error('git operation canceled');
+function canceledError(): AbortedError {
+  return new AbortedError('git operation canceled');
 }
 
 /** SIGKILL escalation delay if the process group doesn't exit promptly after `cancelSignal`'s

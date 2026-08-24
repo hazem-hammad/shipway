@@ -1,10 +1,15 @@
 import { execa } from 'execa';
+import { AbortedError } from '../lib/aborted-error.js';
 import { assertSystemUnit, assertUnitName, assertUnitPattern } from './types.js';
 import type { SysOps, UnitAction, UnitStatus } from './types.js';
 
 const PHP_VERSION_RE = /^8\.[0-9]+$/;
 const MIN_JOURNAL_LINES = 1;
 const MAX_JOURNAL_LINES = 1000;
+
+/** SIGKILL escalation delay if a `signal`-aborted restart's process group doesn't exit promptly
+ * after the SIGTERM `cancelSignal` sends — mirrors `deploy/runshell.ts`/`services/git.ts`. */
+const CANCEL_FORCE_KILL_DELAY_MS = 5000;
 
 /**
  * RealSysOps performs privileged system mutations by shelling out via
@@ -35,20 +40,41 @@ export class RealSysOps implements SysOps {
     await this.run('sudo', ['systemctl', 'reload', 'nginx']);
   }
 
-  async reloadPhpFpm(version: string): Promise<void> {
+  async reloadPhpFpm(version: string, signal?: AbortSignal): Promise<void> {
     if (!PHP_VERSION_RE.test(version)) {
       throw new Error(`Invalid PHP version: ${version}`);
     }
-    await this.run('sudo', ['systemctl', 'reload', `php${version}-fpm`]);
+    await this.runCancelable(['systemctl', 'reload', `php${version}-fpm`], signal, `php${version}-fpm reload`);
   }
 
   async daemonReload(): Promise<void> {
     await this.run('sudo', ['systemctl', 'daemon-reload']);
   }
 
-  async unitAction(action: UnitAction, unit: string): Promise<void> {
+  async unitAction(action: UnitAction, unit: string, signal?: AbortSignal): Promise<void> {
     assertUnitName(unit);
-    await this.run('sudo', ['systemctl', action, unit]);
+    await this.runCancelable(['systemctl', action, unit], signal, `systemctl ${action} ${unit}`);
+  }
+
+  /**
+   * Shared by `unitAction`/`reloadPhpFpm`: `sudo <args>` with no extra options when `signal` is
+   * omitted (preserving the exact command shape every other caller — routes, workers, cron — has
+   * always gotten, none of which have a signal to pass), or with `cancelSignal`/`killDescendants`/
+   * `forceKillAfterDelay` wired up when the deploy pipeline's post-activate restart passes one (see
+   * `deploy/pipeline.ts`'s `restartRuntime`/`restartWorkers`). A failure while `signal` is aborted
+   * is rethrown as `AbortedError` (attributing it to *this* abort specifically, not a coincidental
+   * one) so callers can classify by error type; otherwise the raw error propagates unchanged.
+   */
+  private async runCancelable(args: string[], signal: AbortSignal | undefined, label: string): Promise<void> {
+    if (!signal) {
+      await this.run('sudo', args);
+      return;
+    }
+    try {
+      await this.run('sudo', args, { cancelSignal: signal, killDescendants: true, forceKillAfterDelay: CANCEL_FORCE_KILL_DELAY_MS });
+    } catch (err) {
+      throw signal.aborted ? new AbortedError(`${label} canceled`) : err;
+    }
   }
 
   async unitStatus(unit: string): Promise<UnitStatus> {

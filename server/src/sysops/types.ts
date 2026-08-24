@@ -19,12 +19,18 @@ export interface SysOps {
   nginxTest(): Promise<{ ok: boolean; output: string }>;
   /** Reloads nginx. */
   reloadNginx(): Promise<void>;
-  /** Reloads php-fpm for `version` (e.g. `'8.3'` -> `php8.3-fpm`). */
-  reloadPhpFpm(version: string): Promise<void>;
+  /**
+   * Reloads php-fpm for `version` (e.g. `'8.3'` -> `php8.3-fpm`). `signal`, when given (the deploy
+   * pipeline's post-activate restart passes its cancel signal; most other callers have none to
+   * pass and omit it, unaffected), aborts the underlying command — see `RealSysOps`'s doc comment
+   * for how a failure gets attributed to that abort specifically, vs. a genuine reload failure.
+   */
+  reloadPhpFpm(version: string, signal?: AbortSignal): Promise<void>;
   /** Runs `systemctl daemon-reload`. */
   daemonReload(): Promise<void>;
-  /** Runs `systemctl <action> <unit>` for a Shipway-managed unit. */
-  unitAction(action: UnitAction, unit: string): Promise<void>;
+  /** Runs `systemctl <action> <unit>` for a Shipway-managed unit. See `reloadPhpFpm`'s doc comment
+   * for `signal`. */
+  unitAction(action: UnitAction, unit: string, signal?: AbortSignal): Promise<void>;
   /** Reads the current status of a Shipway-managed unit. Never throws. */
   unitStatus(unit: string): Promise<UnitStatus>;
   /**

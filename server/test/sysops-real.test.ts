@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { execa } from 'execa';
+import { AbortedError } from '../src/lib/aborted-error.js';
 import { RealSysOps } from '../src/sysops/real.js';
 
 interface StubCall {
@@ -124,6 +125,92 @@ describe('RealSysOps command assembly', () => {
 
     await expect(sysops.unitAction('restart', 'not-a-unit')).rejects.toThrow();
     expect(calls).toEqual([]);
+  });
+
+  it('unitAction, given a signal, passes it through as cancelSignal (plus killDescendants + forceKillAfterDelay)', async () => {
+    const { run, calls } = makeStubRun();
+    const sysops = new RealSysOps(run);
+    const controller = new AbortController();
+
+    await sysops.unitAction('restart', 'shipway-app-foo', controller.signal);
+
+    expect(calls).toEqual([
+      {
+        file: 'sudo',
+        args: ['systemctl', 'restart', 'shipway-app-foo'],
+        options: { cancelSignal: controller.signal, killDescendants: true, forceKillAfterDelay: 5000 },
+      },
+    ]);
+  });
+
+  it('unitAction, given a signal that fires mid-command, rejects promptly with a clear AbortedError (not the raw execa/DOMException message) — a genuinely-interrupted restart, not just a stage-boundary check', async () => {
+    // A stub `run` that never settles on its own — only the `cancelSignal` it was given (execa's
+    // real behavior on abort) rejects it, simulating a hung/wedged `systemctl restart`. The raw
+    // rejection is deliberately generic/confusing to prove `unitAction` replaces it.
+    const run = vi.fn(
+      (_file: string, _args: readonly string[] = [], options?: { cancelSignal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          options?.cancelSignal?.addEventListener(
+            'abort',
+            () => {
+              reject(new Error('This operation was aborted'));
+            },
+            { once: true },
+          );
+        }),
+    ) as unknown as typeof execa;
+    const sysops = new RealSysOps(run);
+    const controller = new AbortController();
+
+    const promise = sysops.unitAction('restart', 'shipway-app-foo', controller.signal);
+    setTimeout(() => {
+      controller.abort();
+    }, 20);
+
+    const start = Date.now();
+    await expect(promise).rejects.toThrow(AbortedError);
+    expect(Date.now() - start).toBeLessThan(1000);
+  });
+
+  it('unitAction, given a signal, still rejects with the RAW error when the command fails for an unrelated reason (signal never aborts)', async () => {
+    const run = vi.fn(async () => {
+      throw new Error('systemctl restart shipway-app-foo: unit failed to start (Result: exit-code)');
+    }) as unknown as typeof execa;
+    const sysops = new RealSysOps(run);
+    const controller = new AbortController();
+
+    await expect(sysops.unitAction('restart', 'shipway-app-foo', controller.signal)).rejects.toThrow(
+      /unit failed to start/,
+    );
+    await expect(sysops.unitAction('restart', 'shipway-app-foo', controller.signal)).rejects.not.toBeInstanceOf(
+      AbortedError,
+    );
+  });
+
+  it('reloadPhpFpm, given a signal that fires mid-command, rejects promptly with a clear AbortedError', async () => {
+    const run = vi.fn(
+      (_file: string, _args: readonly string[] = [], options?: { cancelSignal?: AbortSignal }) =>
+        new Promise((_resolve, reject) => {
+          options?.cancelSignal?.addEventListener(
+            'abort',
+            () => {
+              reject(new Error('This operation was aborted'));
+            },
+            { once: true },
+          );
+        }),
+    ) as unknown as typeof execa;
+    const sysops = new RealSysOps(run);
+    const controller = new AbortController();
+
+    const promise = sysops.reloadPhpFpm('8.3', controller.signal);
+    setTimeout(() => {
+      controller.abort();
+    }, 20);
+
+    const start = Date.now();
+    await expect(promise).rejects.toThrow(AbortedError);
+    expect(Date.now() - start).toBeLessThan(1000);
   });
 
   it('unitStatus runs systemctl is-active <unit> without sudo and maps stdout', async () => {

@@ -253,6 +253,37 @@ class FailingUnitActionSysOps extends DevSysOps {
   }
 }
 
+/**
+ * Simulates a *genuine* restart failure (a broken unit in the new release — nothing to do with
+ * cancellation) that happens to coincide with a user clicking Cancel at that exact moment: the
+ * first `restart` call both aborts `controller` (as if the click landed right then) AND throws an
+ * unrelated error. Every subsequent `restart` call (i.e. the rollback's own restart, back to the
+ * previous — presumably working — release) succeeds normally, so a caller can tell whether the
+ * rollback attempt actually ran to completion.
+ */
+class AbortOnFirstRestartSysOps extends DevSysOps {
+  private restartCalls = 0;
+
+  constructor(
+    root: string,
+    private readonly controller: AbortController,
+  ) {
+    super(root);
+  }
+
+  override async unitAction(action: UnitAction, unit: string, signal?: AbortSignal): Promise<void> {
+    if (action === 'restart') {
+      this.restartCalls += 1;
+      if (this.restartCalls === 1) {
+        this.calls.push(`unitAction ${action} ${unit} (FAILS, coincidental abort)`);
+        this.controller.abort();
+        throw new Error(`systemctl ${action} ${unit}: unit failed to start (Result: exit-code)`);
+      }
+    }
+    return super.unitAction(action, unit, signal);
+  }
+}
+
 function currentPath(cfg: Config, slug: string): string {
   return path.join(cfg.appsDir, slug, 'current');
 }
@@ -739,6 +770,75 @@ describe('runDeploy — cancel-requested log line', () => {
 
     expect(lines.some((l) => l.includes('==> cancel requested'))).toBe(true);
     expect(lines.some((l) => l.includes('stopping after the current step'))).toBe(true);
+  });
+});
+
+describe('runDeploy — post-activate cancel classification is by cause, not coincidence', () => {
+  it('a genuine restart failure that coincides with a cancel click is reported failed (not canceled), notifies deploy_failed, and still rolls back', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const controller = new AbortController();
+
+    const { cfg, db, notifications, logger, deps } = makeHarness({
+      sysopsFactory: (cfg) => new AbortOnFirstRestartSysOps(sysopsRoot(cfg), controller),
+    });
+
+    const projectId = insertProject(db, { slug: 'coincidental-cancel', type: 'node', nodeVersion: '22', port: 3098 });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+
+    const prevReleaseDir = path.join(cfg.appsDir, 'coincidental-cancel', 'releases', 'prev-release');
+    fs.mkdirSync(prevReleaseDir, { recursive: true });
+    fs.mkdirSync(path.dirname(currentPath(cfg, 'coincidental-cancel')), { recursive: true });
+    fs.symlinkSync(prevReleaseDir, currentPath(cfg, 'coincidental-cancel'));
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    // The restart's own failure is unrelated to the cancel — must be `failed`, never `canceled`,
+    // even though `signal.aborted` is `true` by the time the outer catch runs.
+    expect(result).toBe('failed');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('failed');
+
+    // Rolled back to the previous release — the rollback's own restart call (the SECOND `restart`,
+    // which the stub lets succeed) actually ran, proving cancellation didn't short-circuit it.
+    expect(readCurrentTarget(cfg, 'coincidental-cancel')).toBe(prevReleaseDir);
+
+    // The real (non-cancellation) failure path: notified as `failed` with `rolledBack: true`, not
+    // silently swallowed the way every other cancellation path swallows notify entirely.
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.status).toBe('failed');
+    expect(notifications[0]?.rolledBack).toBe(true);
+    expect(notifications[0]?.message).toContain('unit failed to start');
+  });
+
+  it('an abort that genuinely interrupts the restart (no independent failure) is still reported canceled', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, notifications, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'genuine-restart-cancel', type: 'static' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    // static projects skip restartRuntime entirely, so drive the abort at the 'restart' stage
+    // boundary itself (checkAborted) — still exercises the same `err instanceof AbortedError`
+    // classification path in runPostActivate's catch, just via the stage-boundary check rather
+    // than a genuinely-interrupted sysops call.
+    const controller = new AbortController();
+    logger.on('line', (l: string) => {
+      if (l.includes('==> restart')) {
+        controller.abort();
+      }
+    });
+
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    expect(result).toBe('canceled');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
   });
 });
 

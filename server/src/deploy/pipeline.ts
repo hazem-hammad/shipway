@@ -22,6 +22,7 @@ import type { Config } from '../config.js';
 import type { ShipwayDb } from '../db/index.js';
 import { deployments, projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
+import { AbortedError } from '../lib/aborted-error.js';
 import type { SecretBox } from '../lib/secretbox.js';
 import type { GitOps } from '../services/git.js';
 import { nodeBinDir, phpBinDir } from '../services/provisioner.js';
@@ -82,14 +83,6 @@ class StageError extends Error {
   }
 }
 
-/** Thrown internally when `signal.aborted` is observed at a stage boundary. */
-class AbortedError extends Error {
-  constructor() {
-    super('deploy canceled');
-    this.name = 'AbortedError';
-  }
-}
-
 /** Thrown internally when the health check exhausts its retries. */
 class HealthCheckFailedError extends Error {
   constructor() {
@@ -104,7 +97,7 @@ function errMessage(err: unknown): string {
 
 function checkAborted(signal: AbortSignal): void {
   if (signal.aborted) {
-    throw new AbortedError();
+    throw new AbortedError('deploy canceled');
   }
 }
 
@@ -332,18 +325,27 @@ function activateRelease(projectDir: string, releaseDir: string): string | null 
   return previous;
 }
 
-async function restartRuntime(deps: PipelineDeps, project: ProjectRow): Promise<void> {
+/**
+ * `signal` is optional and deliberately NOT passed by the rollback path in
+ * `handlePostActivateFailure`: that call must run to completion and restore the previous release
+ * even when `signal` is already aborted (that's the whole point of a rollback during a cancel) — a
+ * `cancelSignal` that's already fired would immediately kill it. The forward activate→restart path
+ * does pass it, so a genuinely-hung restart is still interruptible, and (per `sysops/real.ts`'s
+ * `unitAction`/`reloadPhpFpm`) a failure caused by that abort throws `AbortedError` specifically,
+ * distinguishable from an unrelated restart failure that merely coincides with a cancel.
+ */
+async function restartRuntime(deps: PipelineDeps, project: ProjectRow, signal?: AbortSignal): Promise<void> {
   switch (project.type) {
     case 'php': {
       if (!project.phpVersion) {
         throw new Error(`project "${project.slug}" has no phpVersion configured`);
       }
-      await deps.sysops.reloadPhpFpm(project.phpVersion);
+      await deps.sysops.reloadPhpFpm(project.phpVersion, signal);
       return;
     }
     case 'node':
     case 'nextjs':
-      await deps.sysops.unitAction('restart', unitNames.app(project.slug));
+      await deps.sysops.unitAction('restart', unitNames.app(project.slug), signal);
       return;
     case 'static':
       return;
@@ -354,11 +356,12 @@ function getProjectWorkers(db: ShipwayDb, projectId: number): WorkerRow[] {
   return db.select().from(workers).where(eq(workers.projectId, projectId)).all();
 }
 
-/** Restarts every instance of every worker in `rows`. */
-async function restartWorkers(deps: PipelineDeps, project: ProjectRow, rows: WorkerRow[]): Promise<void> {
+/** Restarts every instance of every worker in `rows`. See `restartRuntime`'s doc comment for why
+ * `signal` is optional and omitted by the rollback path. */
+async function restartWorkers(deps: PipelineDeps, project: ProjectRow, rows: WorkerRow[], signal?: AbortSignal): Promise<void> {
   for (const worker of rows) {
     for (const unit of workerInstances(project.slug, worker.name, worker.processes)) {
-      await deps.sysops.unitAction('restart', unit);
+      await deps.sysops.unitAction('restart', unit, signal);
     }
   }
 }
@@ -426,6 +429,12 @@ function defaultWaitForPort(port: number, timeoutMs: number, signal?: AbortSigna
  * Unset, node-like: waits up to 15s for the port to accept connections. Unset, php/static: skipped
  * (always healthy). `signal` short-circuits all of the above the moment it aborts — the fetch, the
  * between-retry sleep, and the port poll all bail immediately rather than running out their clock.
+ *
+ * When a bail was actually caused by `signal` firing, this throws `AbortedError` directly (checked
+ * immediately after the specific abortable await that was interrupted) rather than returning
+ * `false` — a plain `false` return is reserved for a genuine health failure (all retries exhausted,
+ * or the port never opened, with `signal` never aborted), so the caller can classify by error type
+ * instead of re-checking the ambient flag later, once other unrelated stages may have run too.
  */
 async function runHealthCheck(deps: PipelineDeps, project: ProjectRow, signal: AbortSignal): Promise<boolean> {
   if (project.healthCheckPath) {
@@ -435,7 +444,7 @@ async function runHealthCheck(deps: PipelineDeps, project: ProjectRow, signal: A
 
     for (let attempt = 1; attempt <= HEALTH_CHECK_TRIES; attempt++) {
       if (signal.aborted) {
-        return false;
+        throw new AbortedError('health check canceled');
       }
       try {
         const res = await deps.fetchHttp(url, signal);
@@ -446,7 +455,7 @@ async function runHealthCheck(deps: PipelineDeps, project: ProjectRow, signal: A
         // network error (or abort) on this attempt — fall through and retry/bail
       }
       if (signal.aborted) {
-        return false;
+        throw new AbortedError('health check canceled');
       }
       if (attempt < HEALTH_CHECK_TRIES) {
         await deps.sleep(HEALTH_CHECK_INTERVAL_MS, signal);
@@ -460,7 +469,14 @@ async function runHealthCheck(deps: PipelineDeps, project: ProjectRow, signal: A
       return false;
     }
     const waitForPort = deps.waitForPort ?? defaultWaitForPort;
-    return waitForPort(project.port, WAIT_FOR_PORT_TIMEOUT_MS, signal);
+    const healthy = await waitForPort(project.port, WAIT_FOR_PORT_TIMEOUT_MS, signal);
+    if (!healthy && signal.aborted) {
+      // `waitForPort` only resolves `false` early like this by reacting to `signal` itself (see
+      // `defaultWaitForPort`) — checked right here, immediately after the specific call that was
+      // given the signal, so this is never a coincidental/unrelated abort.
+      throw new AbortedError('health check canceled');
+    }
+    return healthy;
   }
 
   return true; // php/static without a health check path: nothing to check
@@ -597,10 +613,14 @@ async function handlePreActivateFailure(
  * Any failure from `activate` onward through the health check (thrown error, or the health check
  * itself failing): attempts to roll the `current` symlink back to `previousReleasePath` (if any)
  * and restart the runtime — code may already be live, so this rollback attempt happens regardless
- * of *why* the stage stopped. The reported status, though, reflects the cause: `canceled` when
- * `signal` was aborted (the user asked to stop — nothing here "failed"; if `activate` hadn't run
- * yet, `previousReleasePath` is still `null` so the rollback block below is simply a no-op), else
- * `failed` (a real error, notified same as any other failure — never notified for a cancellation).
+ * of *why* the stage stopped, and deliberately WITHOUT `signal` (an already-aborted `cancelSignal`
+ * would immediately kill this restart too — the rollback must complete even during a cancel). The
+ * reported status reflects `canceled`'s caller-supplied value, which by the time this is called has
+ * already been determined by error TYPE (`err instanceof AbortedError`, not the ambient
+ * `signal.aborted` flag — see `runPostActivate`'s catch) so a genuine restart/health failure that
+ * merely coincides with a cancel click is never mislabeled as a calm cancellation. `canceled: true`
+ * skips notify entirely (same as every other cancellation path); `false` notifies same as any other
+ * failure, with `rolledBack` reflecting whether the rollback below actually succeeded.
  */
 async function handlePostActivateFailure(
   deps: PipelineDeps,
@@ -620,7 +640,7 @@ async function handlePostActivateFailure(
     try {
       logger.section('rollback');
       activateRelease(projectDir, previousReleasePath);
-      await restartRuntime(deps, project);
+      await restartRuntime(deps, project); // no `signal` — see doc comment above
       logger.line('rolled back to previous release');
       rolledBack = true;
     } catch (rollbackErr) {
@@ -664,13 +684,13 @@ async function runPostActivate(
 
     logger.section('restart');
     checkAborted(signal);
-    await restartRuntime(deps, project);
+    await restartRuntime(deps, project, signal);
 
     const workerRows = getProjectWorkers(deps.db, project.id);
     if (workerRows.length > 0) {
       logger.section('workers');
       checkAborted(signal);
-      await restartWorkers(deps, project, workerRows);
+      await restartWorkers(deps, project, workerRows, signal);
     }
 
     logger.section('health');
@@ -680,11 +700,15 @@ async function runPostActivate(
       throw new HealthCheckFailedError();
     }
   } catch (err) {
-    // Any abort seen anywhere in this try (a stage boundary, or the health check bailing out of
-    // its own retries/sleep) is reported `canceled`, not `failed` — see `handlePostActivateFailure`
-    // for why the rollback attempt still runs regardless (previousReleasePath is `null`, a no-op,
-    // if `activate` never got the chance to run).
-    return await handlePostActivateFailure(deps, logger, project, projectDir, deploymentId, previousReleasePath, err, signal.aborted);
+    // Classify by the error's CAUSE, not by whether `signal` merely happens to be aborted at catch
+    // time: `checkAborted`'s stage-boundary throws, and an abort-attributed `restartRuntime`/
+    // `restartWorkers`/health-check failure (see their doc comments), are `AbortedError` — reported
+    // `canceled`. Anything else (a genuine restart/health failure, independent of cancellation, that
+    // simply happens to coincide with a cancel click) stays `failed` even though `signal.aborted` is
+    // also `true` in that case — a real post-activate infrastructure failure must never be silently
+    // relabeled as a calm cancellation. See `handlePostActivateFailure` for why the rollback attempt
+    // still runs regardless (previousReleasePath is `null`, a no-op, if `activate` never ran).
+    return await handlePostActivateFailure(deps, logger, project, projectDir, deploymentId, previousReleasePath, err, err instanceof AbortedError);
   }
 
   let result: 'success' | 'failed' = 'success';

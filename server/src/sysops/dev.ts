@@ -39,7 +39,13 @@ export class DevSysOps implements SysOps {
     this.calls.push('reloadNginx');
   }
 
-  async reloadPhpFpm(version: string): Promise<void> {
+  // `signal` (interface compliance with `SysOps`) is accepted but not acted on here: every
+  // operation below is a synchronous, instant no-op with nothing to actually interrupt. Tests that
+  // need a genuinely-abortable or genuinely-failing restart use a small subclass that overrides
+  // `unitAction` (see e.g. `pipeline.test.ts`'s fixtures), not this base class.
+
+  async reloadPhpFpm(version: string, signal?: AbortSignal): Promise<void> {
+    void signal;
     this.calls.push(`reloadPhpFpm ${version}`);
   }
 
@@ -47,7 +53,8 @@ export class DevSysOps implements SysOps {
     this.calls.push('daemonReload');
   }
 
-  async unitAction(action: UnitAction, unit: string): Promise<void> {
+  async unitAction(action: UnitAction, unit: string, signal?: AbortSignal): Promise<void> {
+    void signal;
     assertUnitName(unit);
     this.calls.push(`unitAction ${action} ${unit}`);
   }
