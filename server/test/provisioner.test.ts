@@ -18,6 +18,7 @@ import {
   phpBinDir,
   provisionProject,
   refreshProjectConfig,
+  resolveDnsOutcome,
   type ProvisionDeps,
 } from '../src/services/provisioner.js';
 
@@ -122,6 +123,23 @@ class RecordingDnsClient implements DnsClient {
 
   get records(): Map<string, string> {
     return this.inner.records;
+  }
+}
+
+/** A `DnsClient` whose `findARecord` always throws — used to exercise `resolveDnsOutcome`'s
+ * error-capture branch and `provisionProject`'s unchanged throw-on-DNS-failure behavior. */
+class FailingDnsClient implements DnsClient {
+  async verifyToken(): Promise<boolean> {
+    return false;
+  }
+  async findARecord(): Promise<string | null> {
+    throw new Error('Cloudflare findARecord failed: 503 Service Unavailable');
+  }
+  async createARecord(): Promise<string> {
+    throw new Error('should not be called');
+  }
+  async deleteARecord(): Promise<void> {
+    // unused
   }
 }
 
@@ -314,7 +332,109 @@ describe('provisionProject — no dns configured', () => {
     const sysops = new DevSysOps(sysopsRoot(cfg));
     const id = insertProject(db, { slug: 'docs', type: 'static', publicDir: '' });
 
-    await expect(provisionProject({ db, cfg, sysops, dns: null }, id)).resolves.toBeUndefined();
+    await expect(provisionProject({ db, cfg, sysops, dns: null }, id)).resolves.toEqual({
+      attempted: false,
+      created: false,
+      existed: false,
+    });
+  });
+});
+
+describe('resolveDnsOutcome', () => {
+  it('reports attempted:false when dns is null (step skipped entirely)', async () => {
+    const outcome = await resolveDnsOutcome(null, 'skip.apps.example.com', '203.0.113.10');
+    expect(outcome).toEqual({ attempted: false, created: false, existed: false });
+  });
+
+  it('reports created:true when no A record exists yet', async () => {
+    const dns = new RecordingDnsClient();
+    const outcome = await resolveDnsOutcome(dns, 'fresh.apps.example.com', '203.0.113.10');
+    expect(outcome).toEqual({ attempted: true, created: true, existed: false });
+    expect(dns.records.get('fresh.apps.example.com')).toBe('203.0.113.10');
+  });
+
+  it('reports existed:true (and skips createARecord) when an A record already exists', async () => {
+    const dns = new RecordingDnsClient();
+    await dns.createARecord('taken.apps.example.com', '203.0.113.10');
+    dns.calls.length = 0;
+
+    const outcome = await resolveDnsOutcome(dns, 'taken.apps.example.com', '203.0.113.10');
+
+    expect(outcome).toEqual({ attempted: true, created: false, existed: true });
+    expect(dns.calls).toEqual(['findARecord taken.apps.example.com']);
+  });
+
+  it('captures a thrown DNS client error into `error` instead of throwing', async () => {
+    const outcome = await resolveDnsOutcome(new FailingDnsClient(), 'broken.apps.example.com', '203.0.113.10');
+    expect(outcome).toEqual({
+      attempted: true,
+      created: false,
+      existed: false,
+      error: 'Cloudflare findARecord failed: 503 Service Unavailable',
+    });
+  });
+});
+
+describe('provisionProject — DNS outcome return value', () => {
+  it('resolves with the DNS outcome (created) on success', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'docs', type: 'static', publicDir: '' });
+
+    const outcome = await provisionProject({ db, cfg, sysops, dns }, id);
+
+    expect(outcome).toEqual({ attempted: true, created: true, existed: false });
+  });
+
+  it('resolves with the DNS outcome (existed) when the record was already there', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    await dns.createARecord('docs.apps.example.com', '203.0.113.10');
+    const id = insertProject(db, { slug: 'docs', type: 'static', publicDir: '' });
+
+    const outcome = await provisionProject({ db, cfg, sysops, dns }, id);
+
+    expect(outcome).toEqual({ attempted: true, created: false, existed: true });
+  });
+
+  it('resolves with attempted:false when deps.dns is null', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const id = insertProject(db, { slug: 'docs', type: 'static', publicDir: '' });
+
+    const outcome = await provisionProject({ db, cfg, sysops, dns: null }, id);
+
+    expect(outcome).toEqual({ attempted: false, created: false, existed: false });
+  });
+
+  it('still throws a ProvisionError (step "dns") on a DNS failure — unchanged failure semantics, error is not swallowed into a 201-shaped return', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new FailingDnsClient();
+    const id = insertProject(db, { slug: 'broken', type: 'static', publicDir: '' });
+
+    let caught: unknown;
+    try {
+      await provisionProject({ db, cfg, sysops, dns }, id);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ProvisionError);
+    expect((caught as ProvisionError).step).toBe('dns');
+    expect((caught as ProvisionError).message).toContain('503 Service Unavailable');
+    // Nothing past the DNS step ran.
+    expect(sysops.calls).toEqual([]);
   });
 });
 

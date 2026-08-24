@@ -26,7 +26,9 @@ import {
   fetchUsers,
   fetchWorkers,
   isPendingDeploymentStatus,
+  verifyCloudflare,
   type AuditConfig,
+  type CloudflareVerifyResult,
   type CronJob,
   type DatabaseListItem,
   type Deployment,
@@ -138,6 +140,16 @@ export function useGlobalDeployments(): UseQueryResult<GlobalDeployment[]> {
 
 export function useGithubStatus(): UseQueryResult<GithubStatus> {
   return useQuery({ queryKey: ['github-status'], queryFn: fetchGithubStatus });
+}
+
+/**
+ * Live Cloudflare connection status (`GET /api/cloudflare/verify`) — used by New Project's Domain
+ * card (plan Task 5) to show whether the DNS record it describes will actually be created, and by
+ * Settings > Cloudflare's own "Test connection" flow. No `refetchInterval`: a stale answer isn't
+ * dangerous (the create route still enforces reality), and re-checking is cheap via `refetch()`.
+ */
+export function useCloudflareVerify(): UseQueryResult<CloudflareVerifyResult> {
+  return useQuery({ queryKey: ['cloudflare-verify'], queryFn: verifyCloudflare });
 }
 
 /** Repos accessible to the installed GitHub App. Only meaningful once the app is installed. */

@@ -30,18 +30,22 @@ import {
   createProject,
   deployProject,
   putProjectEnv,
+  type CloudflareVerifyResult,
   type CreateProjectBody,
+  type DnsOutcome,
   type GithubRepo,
   type ProjectType,
 } from '../api';
-import { useGithubBranches, useGithubRepos, useGithubStatus, useSettings } from '../hooks';
+import { useCloudflareVerify, useGithubBranches, useGithubRepos, useGithubStatus, useSettings } from '../hooks';
 import { NextjsIcon, NodeIcon, PhpIcon, StaticIcon, type BrandIconProps } from '../components/BrandIcons';
 import {
   Badge,
+  type BadgeTone,
   Button,
   ButtonLink,
   Card,
   CardHeader,
+  Checkbox,
   Field,
   ICON_STROKE,
   IconChip,
@@ -134,6 +138,51 @@ function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Something went wrong. Try again.';
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** How long the Domain card's DNS result row stays visible before this page navigates away —
+ * long enough to actually read a short line, short enough not to feel like a stall. */
+const DNS_RESULT_DISPLAY_MS = 900;
+
+// ---------------------------------------------------------------------------
+// Domain card readiness — the create route can only make good on the DNS record it shows when
+// BOTH the server IP is configured (needed as the record's content) AND Cloudflare is actually
+// connected (needed to create it). Either gap means "create anyway" must be explicitly checked.
+// ---------------------------------------------------------------------------
+
+interface CloudflareStatus {
+  pending: boolean;
+  ready: boolean;
+  tone: BadgeTone;
+  label: string;
+}
+
+function cloudflareStatus(data: CloudflareVerifyResult | undefined, isPending: boolean, isError: boolean): CloudflareStatus {
+  if (isPending) {
+    return { pending: true, ready: false, tone: 'neutral', label: 'Checking Cloudflare…' };
+  }
+  if (isError || !data) {
+    return { pending: false, ready: false, tone: 'danger', label: 'Cloudflare error' };
+  }
+  switch (data.reason) {
+    case 'ok':
+      return { pending: false, ready: true, tone: 'ok', label: 'Cloudflare connected' };
+    case 'not_configured':
+      return { pending: false, ready: false, tone: 'neutral', label: 'Cloudflare not configured' };
+    default:
+      return { pending: false, ready: false, tone: 'danger', label: 'Cloudflare error' };
+  }
+}
+
+function dnsResultLine(outcome: DnsOutcome): string {
+  if (outcome.error) return outcome.error;
+  if (outcome.created) return 'DNS record created.';
+  if (outcome.existed) return 'DNS record already existed.';
+  return 'No DNS record was created.';
+}
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -142,6 +191,7 @@ export default function ProjectNewPage() {
   const queryClient = useQueryClient();
   const [, navigate] = useLocation();
   const settingsQuery = useSettings();
+  const cloudflareQuery = useCloudflareVerify();
 
   const [step, setStep] = useState<'source' | 'configure'>('source');
   const [sourceTab, setSourceTab] = useState<'github' | 'url'>('github');
@@ -165,8 +215,21 @@ export default function ProjectNewPage() {
   const [formError, setFormError] = useState<string | null>(null);
   const [provisionError, setProvisionError] = useState<ProvisionError | null>(null);
 
+  // "Create anyway without a DNS record" — required only while dnsReady is false (spec §3 "New
+  // Project DNS"); cleared to false whenever the underlying gap changes so a stale ack from a
+  // previous, different reason can never silently carry over.
+  const [createAnyway, setCreateAnyway] = useState(false);
+  // Set right after a successful create, briefly, so the Domain card can show what actually
+  // happened to DNS before this page navigates to the deployment log (see handleDeploy).
+  const [dnsResult, setDnsResult] = useState<DnsOutcome | null>(null);
+
   const isNodeLike = type === 'node' || type === 'nextjs';
   const baseDomain = settingsQuery.data?.base_domain ?? 'your-domain';
+  const serverIp = settingsQuery.data?.server_ip ?? null;
+  const settingsSettled = !settingsQuery.isPending;
+  const serverIpMissing = settingsSettled && serverIp === null;
+  const cfStatus = cloudflareStatus(cloudflareQuery.data, cloudflareQuery.isPending, cloudflareQuery.isError);
+  const dnsReady = settingsSettled && !serverIpMissing && cfStatus.ready;
 
   function handleTypeChange(next: ProjectType) {
     setType(next);
@@ -206,7 +269,13 @@ export default function ProjectNewPage() {
 
   const branch = source?.branch ?? '';
   const canSubmit =
-    source !== null && name.trim() !== '' && slug !== '' && SLUG_RE.test(slug) && branch.trim() !== '' && !submitting;
+    source !== null &&
+    name.trim() !== '' &&
+    slug !== '' &&
+    SLUG_RE.test(slug) &&
+    branch.trim() !== '' &&
+    !submitting &&
+    (dnsReady || createAnyway);
 
   function setBranch(next: string) {
     if (!source) return;
@@ -220,6 +289,7 @@ export default function ProjectNewPage() {
     setFormError(null);
     setProvisionError(null);
     setSlugApiError(null);
+    setDnsResult(null);
     setSubmitting(true);
 
     const body: CreateProjectBody = {
@@ -239,6 +309,15 @@ export default function ProjectNewPage() {
       const project = await createProject(body);
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
       await queryClient.invalidateQueries({ queryKey: ['overview'] });
+
+      // Surface the DNS outcome in the Domain card for a short beat before navigating away — the
+      // simpler of the two approaches the plan allows (the alternative, passing the outcome
+      // through to the deployment log page, has nowhere to land: wouter's `navigate` carries no
+      // location state, and coupling the deployment log — a surface other work on this project
+      // owns — to a one-time "how did project creation's DNS step go" payload would outlive its
+      // usefulness the moment the user leaves this page anyway).
+      setDnsResult(project.dns);
+      await sleep(DNS_RESULT_DISPLAY_MS);
 
       // Env is set post-create (PUT), before the first deploy, only when something was pasted.
       if (envContent.trim() !== '') {
@@ -293,6 +372,14 @@ export default function ProjectNewPage() {
               onBranchChange={setBranch}
               slug={slug}
               baseDomain={baseDomain}
+              serverIp={serverIp}
+              serverIpMissing={serverIpMissing}
+              settingsSettled={settingsSettled}
+              cloudflare={cfStatus}
+              dnsReady={dnsReady}
+              createAnyway={createAnyway}
+              onCreateAnywayChange={setCreateAnyway}
+              dnsResult={dnsResult}
               type={type}
               buildCmd={buildCmd}
               submitting={submitting}
@@ -764,6 +851,14 @@ function ConfigureRail({
   onBranchChange,
   slug,
   baseDomain,
+  serverIp,
+  serverIpMissing,
+  settingsSettled,
+  cloudflare,
+  dnsReady,
+  createAnyway,
+  onCreateAnywayChange,
+  dnsResult,
   type,
   buildCmd,
   submitting,
@@ -775,6 +870,14 @@ function ConfigureRail({
   onBranchChange: (branch: string) => void;
   slug: string;
   baseDomain: string;
+  serverIp: string | null;
+  serverIpMissing: boolean;
+  settingsSettled: boolean;
+  cloudflare: CloudflareStatus;
+  dnsReady: boolean;
+  createAnyway: boolean;
+  onCreateAnywayChange: (checked: boolean) => void;
+  dnsResult: DnsOutcome | null;
   type: ProjectType;
   buildCmd: string;
   submitting: boolean;
@@ -799,10 +902,17 @@ function ConfigureRail({
         </div>
       </Card>
 
-      <Card>
-        <CardHeader icon={<Globe size={20} strokeWidth={ICON_STROKE} />} title="Domain" />
-        <p className="mt-3 rounded-xl bg-surface-2 px-3.5 py-2.5 font-mono text-sm text-ink">{domain}</p>
-      </Card>
+      <DomainCard
+        domain={domain}
+        serverIp={serverIp}
+        serverIpMissing={serverIpMissing}
+        settingsSettled={settingsSettled}
+        cloudflare={cloudflare}
+        dnsReady={dnsReady}
+        createAnyway={createAnyway}
+        onCreateAnywayChange={onCreateAnywayChange}
+        dnsResult={dnsResult}
+      />
 
       <Card>
         <CardHeader icon={<Rocket size={20} strokeWidth={ICON_STROKE} />} title="Deploy summary" />
@@ -829,6 +939,94 @@ function ConfigureRail({
         Deploy
       </Button>
     </>
+  );
+}
+
+/**
+ * Right rail's Domain card (plan Task 5 / spec §3 "New Project DNS"): shows the exact `A` record
+ * this project would get, live Cloudflare connection status, and — while it can't actually be
+ * created (missing server IP, or Cloudflare not connected) — a calm explanation plus the "create
+ * anyway" acknowledgment that gates Deploy. After a successful create, `dnsResult` replaces the
+ * live-status section with what actually happened, briefly, before the page navigates away.
+ */
+function DomainCard({
+  domain,
+  serverIp,
+  serverIpMissing,
+  settingsSettled,
+  cloudflare,
+  dnsReady,
+  createAnyway,
+  onCreateAnywayChange,
+  dnsResult,
+}: {
+  domain: string;
+  serverIp: string | null;
+  serverIpMissing: boolean;
+  settingsSettled: boolean;
+  cloudflare: CloudflareStatus;
+  dnsReady: boolean;
+  createAnyway: boolean;
+  onCreateAnywayChange: (checked: boolean) => void;
+  dnsResult: DnsOutcome | null;
+}) {
+  return (
+    <Card>
+      <CardHeader icon={<Globe size={20} strokeWidth={ICON_STROKE} />} title="Domain" />
+
+      <div className="mt-3 flex flex-col gap-3">
+        {!settingsSettled ? (
+          <Skeleton className="h-10 w-full" />
+        ) : serverIpMissing ? (
+          <p className="text-sm text-soft">
+            Set the server IP in{' '}
+            <Link href="/settings/general" className="font-medium text-link hover:underline">
+              Settings &gt; General
+            </Link>{' '}
+            before Shipway can create a DNS record for this project.
+          </p>
+        ) : (
+          <p className="rounded-xl bg-surface-2 px-3.5 py-2.5 font-mono text-sm text-ink">
+            A &nbsp;&nbsp; {domain} &nbsp;&nbsp; &rarr; &nbsp;&nbsp; {serverIp}
+          </p>
+        )}
+
+        {dnsResult ? (
+          <div className={`rounded-xl px-4 py-3 text-sm ${dnsResult.error ? 'bg-danger/10 text-danger' : 'bg-ok-tint text-ok-tint-fg'}`}>
+            {dnsResultLine(dnsResult)}
+          </div>
+        ) : (
+          <>
+            <div>
+              <Badge tone={cloudflare.tone}>{cloudflare.label}</Badge>
+            </div>
+
+            {settingsSettled && !cloudflare.pending && !dnsReady && (
+              <div className="rounded-xl border border-line bg-surface-2 px-4 py-3">
+                <p className="text-sm text-soft">
+                  {serverIpMissing ? (
+                    'No DNS record will be created until the server IP is set.'
+                  ) : (
+                    <>
+                      Cloudflare isn&rsquo;t connected, so no DNS record will be created for this project.{' '}
+                      <Link href="/settings/cloudflare" className="font-medium text-link hover:underline">
+                        Connect Cloudflare &rarr;
+                      </Link>
+                    </>
+                  )}
+                </p>
+                <Checkbox
+                  className="mt-3"
+                  checked={createAnyway}
+                  onChange={onCreateAnywayChange}
+                  label="Create anyway without a DNS record"
+                />
+              </div>
+            )}
+          </>
+        )}
+      </div>
+    </Card>
   );
 }
 

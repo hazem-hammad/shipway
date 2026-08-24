@@ -262,6 +262,54 @@ describe('POST /api/projects', () => {
     await app.close();
   });
 
+  describe('dns outcome (plan Task 5 / spec §3 "New Project DNS")', () => {
+    it('the 201 body includes dns:{attempted:true, created:true, existed:false} for a fresh record', async () => {
+      const { app, cookie } = await buildProjectsTestApp();
+
+      const res = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: NODE_PAYLOAD });
+
+      expect(res.statusCode).toBe(201);
+      expect(res.json().dns).toEqual({ attempted: true, created: true, existed: false });
+
+      await app.close();
+    });
+
+    it('reports existed:true when an A record for the slug is already there', async () => {
+      const { app, cookie, dns } = await buildProjectsTestApp();
+      await dns.createARecord('app.apps.example.com', '203.0.113.10');
+
+      const res = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: NODE_PAYLOAD });
+
+      expect(res.statusCode).toBe(201);
+      expect(res.json().dns).toEqual({ attempted: true, created: false, existed: true });
+
+      await app.close();
+    });
+
+    it('reports attempted:false when no DNS client is configured (app.dns() returns null)', async () => {
+      const dataDir = tmpDataDir();
+      const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir });
+      const sysops = new DevSysOps(path.join(dataDir, 'system'));
+      const app = await buildApp(cfg, { sysops, dns: () => null });
+
+      const create = await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
+      const cookie = sessionCookie(create);
+      await app.inject({
+        method: 'PUT',
+        url: '/api/settings',
+        headers: { cookie },
+        payload: { base_domain: 'apps.example.com', server_ip: '203.0.113.10' },
+      });
+
+      const res = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: NODE_PAYLOAD });
+
+      expect(res.statusCode).toBe(201);
+      expect(res.json().dns).toEqual({ attempted: false, created: false, existed: false });
+
+      await app.close();
+    });
+  });
+
   it('returns 502 with step info and deletes the row when base_domain/server_ip are unset', async () => {
     const { app, cookie } = await buildProjectsTestApp({ configureDomain: false });
 

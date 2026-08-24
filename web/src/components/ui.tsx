@@ -273,11 +273,12 @@ export function Checkbox({ checked, onChange, label, disabled, className = '' }:
 // Badge — pill, 12.5px/500 (DESIGN.md Badges/chips).
 // ---------------------------------------------------------------------------
 
-export type BadgeTone = 'neutral' | 'ok';
+export type BadgeTone = 'neutral' | 'ok' | 'danger';
 
 const BADGE_TONES: Record<BadgeTone, string> = {
   neutral: 'bg-surface-2 text-soft',
   ok: 'bg-ok-tint text-ok-tint-fg',
+  danger: 'bg-danger/10 text-danger',
 };
 
 export function Badge({ tone = 'neutral', className = '', children }: { tone?: BadgeTone; className?: string; children: ReactNode }) {

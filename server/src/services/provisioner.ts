@@ -25,6 +25,23 @@ export interface ProvisionDeps {
   dns: DnsClient | null;
 }
 
+/**
+ * What happened during a project's DNS step (plan Task 5 / spec §3 "New Project DNS") — reported
+ * back to callers instead of only a throw/silent-success. `attempted` is `false` only when
+ * `deps.dns` is `null` (no DNS client configured at all, e.g. dev mode with no credentials); when
+ * it's `true`, exactly one of `created`/`existed` is `true` (a matching `A` record either already
+ * existed, find-first, or was just created). `error` is set only by {@link resolveDnsOutcome} for
+ * a caller that wants the failure captured rather than thrown — `provisionProject` itself does NOT
+ * return an outcome with `error` set: it still throws a `ProvisionError` on a DNS failure exactly
+ * as before (see its doc comment), preserving today's provisioning failure semantics unchanged.
+ */
+export interface DnsOutcome {
+  attempted: boolean;
+  created: boolean;
+  existed: boolean;
+  error?: string;
+}
+
 export type ProjectRow = typeof projects.$inferSelect;
 
 /**
@@ -182,6 +199,32 @@ async function writeVhost(
   await deps.sysops.reloadNginx();
 }
 
+/**
+ * Runs the find-then-create DNS step for `domain` and reports what happened rather than only
+ * throwing: `{attempted: false}` when `dns` is `null` (step skipped entirely); otherwise finds the
+ * existing `A` record first (the real Cloudflare client isn't idempotent on repeat
+ * `createARecord`) and either reports `existed` or creates one and reports `created`. A thrown
+ * error from the DNS client is CAUGHT here and captured into `error` rather than re-thrown — this
+ * is what makes every branch (including failure) directly testable as data. `provisionProject`
+ * calls this and then layers its own throw for the 'dns' step on top when `error` is set, so its
+ * external failure behavior is unchanged from before this outcome reporting existed.
+ */
+export async function resolveDnsOutcome(dns: DnsClient | null, domain: string, serverIp: string): Promise<DnsOutcome> {
+  if (!dns) {
+    return { attempted: false, created: false, existed: false };
+  }
+  try {
+    const existing = await dns.findARecord(domain);
+    if (existing) {
+      return { attempted: true, created: false, existed: true };
+    }
+    await dns.createARecord(domain, serverIp);
+    return { attempted: true, created: true, existed: false };
+  } catch (err) {
+    return { attempted: true, created: false, existed: false, error: errMessage(err) };
+  }
+}
+
 /** Renders and installs the `shipway-app-<slug>.service` unit, then `daemon-reload`s. */
 async function writeAppUnit(deps: ProvisionDeps, project: ProjectRow): Promise<void> {
   if (project.port === null) {
@@ -212,24 +255,22 @@ async function writeAppUnit(deps: ProvisionDeps, project: ProjectRow): Promise<v
  * 5. node/nextjs only: render + install the app unit, `daemon-reload`, then `enable` it.
  *
  * Any step failing throws a `ProvisionError` identifying which step failed; callers are responsible
- * for cleanup (the `POST /api/projects` route deletes the just-inserted row on failure).
+ * for cleanup (the `POST /api/projects` route deletes the just-inserted row on failure). On
+ * success, resolves to the {@link DnsOutcome} from step 2 — the caller's own record of what
+ * happened to DNS (skipped / created / already existed) — so a route can report it without
+ * changing anything about when provisioning itself fails (a DNS failure still throws here, exactly
+ * as before; only the success outcome is new).
  */
-export async function provisionProject(deps: ProvisionDeps, projectId: number): Promise<void> {
+export async function provisionProject(deps: ProvisionDeps, projectId: number): Promise<DnsOutcome> {
   const project = getProjectOrThrow(deps.db, projectId);
   assertSlug(project.slug);
 
   const { baseDomain, serverIp } = requireDomainSettings(deps.db);
   const domain = `${project.slug}.${baseDomain}`;
 
-  if (deps.dns) {
-    try {
-      const existing = await deps.dns.findARecord(domain);
-      if (!existing) {
-        await deps.dns.createARecord(domain, serverIp);
-      }
-    } catch (err) {
-      throw new ProvisionError('dns', `DNS record creation failed for ${domain}: ${errMessage(err)}`);
-    }
+  const dnsOutcome = await resolveDnsOutcome(deps.dns, domain, serverIp);
+  if (dnsOutcome.error) {
+    throw new ProvisionError('dns', `DNS record creation failed for ${domain}: ${dnsOutcome.error}`);
   }
 
   try {
@@ -248,6 +289,8 @@ export async function provisionProject(deps: ProvisionDeps, projectId: number): 
     await writeAppUnit(deps, project);
     await deps.sysops.unitAction('enable', unitNames.app(project.slug));
   }
+
+  return dnsOutcome;
 }
 
 /**

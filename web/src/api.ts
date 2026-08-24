@@ -292,12 +292,30 @@ export interface CreateProjectBody {
   autoDeploy?: boolean;
 }
 
+/**
+ * What happened during a project's DNS step (`server/src/services/provisioner.ts`'s
+ * `resolveDnsOutcome`, plan Task 5 / spec §3 "New Project DNS"): `attempted` is `false` only when
+ * no DNS client was configured at all (the step was skipped entirely); otherwise exactly one of
+ * `created`/`existed` is `true`. A DNS failure never reaches this shape — it fails project creation
+ * outright (502) instead, so `dns` is only ever present on a successful 201.
+ */
+export interface DnsOutcome {
+  attempted: boolean;
+  created: boolean;
+  existed: boolean;
+  error?: string;
+}
+
+export interface CreateProjectResponse extends Project {
+  dns: DnsOutcome;
+}
+
 export function fetchProjects(): Promise<ProjectListItem[]> {
   return apiFetch<ProjectListItem[]>('/api/projects');
 }
 
-export function createProject(body: CreateProjectBody): Promise<Project> {
-  return apiFetch<Project>('/api/projects', { method: 'POST', body });
+export function createProject(body: CreateProjectBody): Promise<CreateProjectResponse> {
+  return apiFetch<CreateProjectResponse>('/api/projects', { method: 'POST', body });
 }
 
 export function fetchProject(id: number): Promise<Project> {
