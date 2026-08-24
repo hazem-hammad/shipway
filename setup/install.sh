@@ -1,0 +1,664 @@
+#!/usr/bin/env bash
+#
+# setup/install.sh — provisions a fresh Ubuntu 24.04 server as a Shipway
+# host: nginx, PHP 8.1-8.4, MySQL, PostgreSQL, Redis, Node 18/20/22,
+# Mailpit, certbot, the `deployer` user + its narrow sudo helper, then
+# builds and starts Shipway itself and points DNS/nginx at it.
+#
+# Idempotent: safe to re-run after a partial failure or to pick up a fix.
+# Packages/binaries already installed are skipped; generated secrets are
+# cached in /root/.shipway-install-secrets so re-running never rotates a
+# credential a project or the running server may already depend on.
+#
+# Must be run as root (`sudo ./setup/install.sh`) from inside a Shipway
+# checkout, or with SHIPWAY_REPO_URL set. See docs/server-setup.md for the
+# full walkthrough. Non-interactive installs can set SHIPWAY_BASE_DOMAIN,
+# SHIPWAY_SERVER_IP, SHIPWAY_CF_API_TOKEN, SHIPWAY_ACME_EMAIL instead of
+# answering the prompts.
+#
+# --- Deliberate deviations from a literal reading of the spec/task brief,
+#     made for correctness on a real Ubuntu 24.04 box, documented here so
+#     a reviewer isn't left guessing why the code doesn't match verbatim:
+#
+#   - Extra apt packages beyond the brief's literal list: `rsync` (to copy
+#     a local checkout into /opt/shipway), `jq` (to parse the GitHub/
+#     Cloudflare JSON APIs reliably instead of fragile grep/sed), and
+#     `software-properties-common` (provides `add-apt-repository`, which
+#     the ondrej/php PPA step needs and which is not guaranteed present on
+#     a minimal Ubuntu server image).
+#   - MySQL admin user is granted at BOTH 'shipway_admin'@'localhost' (as
+#     literally specified) and 'shipway_admin'@'127.0.0.1'. MySQL's
+#     special-cased "localhost means the Unix socket" behavior lives in
+#     client libraries (the `mysql` CLI), not the server's account
+#     matching — a TCP connection to 127.0.0.1 (which is what mysql2, and
+#     therefore `mysql_admin_url`, always uses — see
+#     server/src/services/dbprovision.ts's `connectionEnv`) is not
+#     guaranteed to match a `@localhost`-only grant on every install
+#     (it depends on reverse-DNS/`skip-name-resolve`). Granting both hosts
+#     with the same password makes the account work regardless.
+#   - setup/sudoers.d-shipway pins nginx's real path (`/usr/sbin/nginx`,
+#     not `/usr/bin/nginx` — see the comments in that file for why).
+#
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+readonly SCRIPT_DIR REPO_ROOT
+readonly SECRETS_FILE=/root/.shipway-install-secrets
+readonly DEPLOYER_HOME=/var/deploy
+readonly SHIPWAY_DIR=/opt/shipway
+readonly NODE_VERSIONS=(18 20 22)
+readonly PHP_VERSIONS=(8.1 8.2 8.3 8.4)
+readonly PHP_EXTENSIONS=(fpm cli mysql pgsql sqlite3 redis mbstring xml curl zip gd bcmath intl)
+
+log() {
+  echo "install.sh: $*"
+}
+
+die() {
+  echo "install.sh: $*" >&2
+  exit 1
+}
+
+# ---------------------------------------------------------------------------
+# 0. Preconditions
+# ---------------------------------------------------------------------------
+
+check_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    die "must be run as root (e.g. sudo ./setup/install.sh)"
+  fi
+}
+
+check_ubuntu() {
+  local id="" version_id=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    id="${ID:-}"
+    version_id="${VERSION_ID:-}"
+  fi
+  if [[ "$id" != "ubuntu" || "$version_id" != "24.04" ]]; then
+    log "WARNING: this script targets Ubuntu 24.04; detected '${id:-unknown} ${version_id:-unknown}'. Continuing anyway."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Small helpers used throughout
+# ---------------------------------------------------------------------------
+
+# 24 random bytes as 48 lowercase hex chars. Avoids piping through `head`
+# (which SIGPIPEs the upstream reader and, under `pipefail`, would abort the
+# whole script) by reading an exact byte count from /dev/urandom instead.
+random_secret() {
+  od -An -tx1 -N24 /dev/urandom | tr -d ' \n'
+}
+
+# Returns the value for $1 from $SECRETS_FILE, generating and persisting a
+# new random one on first use. Re-running install.sh must never rotate a
+# credential a project's env or the running server may already hold.
+get_or_create_secret() {
+  local name="$1"
+  local existing
+  existing="$(grep -m1 "^${name}=" "$SECRETS_FILE" 2>/dev/null | cut -d= -f2- || true)"
+  if [[ -n "$existing" ]]; then
+    printf '%s' "$existing"
+    return
+  fi
+  local value
+  value="$(random_secret)"
+  echo "${name}=${value}" >> "$SECRETS_FILE"
+  printf '%s' "$value"
+}
+
+# ---------------------------------------------------------------------------
+# 1. apt packages: nginx/git/curl/acl/unzip + the ondrej/php PPA + PHP
+#    8.1-8.4 + composer
+# ---------------------------------------------------------------------------
+
+install_base_packages() {
+  log "apt-get update"
+  apt-get update -y
+
+  log "installing base packages"
+  apt-get install -y \
+    nginx git curl acl unzip \
+    software-properties-common rsync jq ca-certificates
+}
+
+install_php() {
+  log "adding ppa:ondrej/php"
+  add-apt-repository -y ppa:ondrej/php
+  apt-get update -y
+
+  local php_packages=()
+  local v ext
+  for v in "${PHP_VERSIONS[@]}"; do
+    for ext in "${PHP_EXTENSIONS[@]}"; do
+      php_packages+=("php${v}-${ext}")
+    done
+  done
+
+  log "installing PHP ${PHP_VERSIONS[*]} (${PHP_EXTENSIONS[*]})"
+  apt-get install -y "${php_packages[@]}"
+}
+
+install_composer() {
+  if [[ -x /usr/local/bin/composer ]]; then
+    log "composer already installed, skipping"
+    return
+  fi
+
+  log "installing composer"
+  local tmp_dir installer expected_sig actual_sig
+  tmp_dir="$(mktemp -d)"
+  installer="${tmp_dir}/composer-setup.php"
+
+  curl -fsSL -o "$installer" https://getcomposer.org/installer
+  expected_sig="$(curl -fsSL https://composer.github.io/installer.sig)"
+  actual_sig="$(php -r "echo hash_file('sha384', '${installer}');")"
+  if [[ "$actual_sig" != "$expected_sig" ]]; then
+    rm -rf "$tmp_dir"
+    die "composer installer signature mismatch (expected ${expected_sig}, got ${actual_sig})"
+  fi
+
+  php "$installer" --quiet --install-dir=/usr/local/bin --filename=composer
+  rm -rf "$tmp_dir"
+}
+
+# ---------------------------------------------------------------------------
+# 2. MySQL, PostgreSQL, Redis
+# ---------------------------------------------------------------------------
+
+install_databases() {
+  log "installing mysql-server, postgresql, redis-server"
+  apt-get install -y mysql-server postgresql redis-server
+}
+
+configure_redis() {
+  local conf=/etc/redis/redis.conf
+  local marker="# shipway-managed requirepass"
+
+  if grep -qF "$marker" "$conf"; then
+    log "redis requirepass already configured, skipping"
+    # Recover the password actually in effect (redis.conf is the source of
+    # truth) into the secrets cache if it's missing there — e.g. the secrets
+    # file was lost/reset on an already-provisioned box. Without this,
+    # write_bootstrap_file's later `get_or_create_secret REDIS_PASSWORD`
+    # would mint a new value that doesn't match what redis-server is
+    # actually running with.
+    if ! grep -q "^REDIS_PASSWORD=" "$SECRETS_FILE" 2>/dev/null; then
+      local existing_password
+      existing_password="$(grep -A1 -F "$marker" "$conf" | grep '^requirepass ' | head -n1 | cut -d' ' -f2-)"
+      if [[ -n "$existing_password" ]]; then
+        echo "REDIS_PASSWORD=${existing_password}" >> "$SECRETS_FILE"
+      fi
+    fi
+    return
+  fi
+
+  log "setting redis requirepass"
+  local password
+  password="$(get_or_create_secret REDIS_PASSWORD)"
+  {
+    echo ""
+    echo "$marker"
+    echo "requirepass ${password}"
+  } >> "$conf"
+  systemctl restart redis-server
+}
+
+# ---------------------------------------------------------------------------
+# 3. Node 18/20/22 -> /opt/node/<major>
+# ---------------------------------------------------------------------------
+
+install_node() {
+  local major="$1"
+  local target_dir="/opt/node/${major}"
+
+  if [[ -x "${target_dir}/bin/node" ]]; then
+    log "/opt/node/${major} already installed, skipping"
+    return
+  fi
+
+  log "installing Node ${major} to ${target_dir}"
+  local dist_url="https://nodejs.org/dist/latest-v${major}.x"
+  local shasums filename expected_sha
+  shasums="$(curl -fsSL "${dist_url}/SHASUMS256.txt")"
+  filename="$(printf '%s\n' "$shasums" | awk '{print $2}' | grep -E "^node-v${major}\.[0-9]+\.[0-9]+-linux-x64\.tar\.xz\$" | head -n1)"
+  if [[ -z "$filename" ]]; then
+    die "could not find a linux-x64 tarball for Node ${major} in ${dist_url}/SHASUMS256.txt"
+  fi
+  expected_sha="$(printf '%s\n' "$shasums" | grep -F " ${filename}" | awk '{print $1}')"
+
+  local tmp_dir actual_sha
+  tmp_dir="$(mktemp -d)"
+  curl -fsSL -o "${tmp_dir}/${filename}" "${dist_url}/${filename}"
+  actual_sha="$(sha256sum "${tmp_dir}/${filename}" | awk '{print $1}')"
+  if [[ "$actual_sha" != "$expected_sha" ]]; then
+    rm -rf "$tmp_dir"
+    die "sha256 mismatch for ${filename}: expected ${expected_sha}, got ${actual_sha}"
+  fi
+
+  mkdir -p "$target_dir"
+  tar -xJf "${tmp_dir}/${filename}" -C "$target_dir" --strip-components=1
+  rm -rf "$tmp_dir"
+}
+
+install_all_node_versions() {
+  local v
+  for v in "${NODE_VERSIONS[@]}"; do
+    install_node "$v"
+  done
+}
+
+# ---------------------------------------------------------------------------
+# 4. Mailpit
+# ---------------------------------------------------------------------------
+
+install_mailpit_binary() {
+  if [[ -x /usr/local/bin/mailpit ]]; then
+    log "mailpit already installed, skipping"
+    return
+  fi
+
+  log "installing mailpit"
+  local asset_url
+  asset_url="$(curl -fsSL https://api.github.com/repos/axllent/mailpit/releases/latest \
+    | jq -r '.assets[] | select(.name | test("linux.*amd64.*tar\\.gz$"; "i")) | .browser_download_url' \
+    | head -n1)"
+  if [[ -z "$asset_url" ]]; then
+    die "could not find a linux/amd64 mailpit release asset"
+  fi
+
+  local tmp_dir binary
+  tmp_dir="$(mktemp -d)"
+  curl -fsSL -o "${tmp_dir}/mailpit.tar.gz" "$asset_url"
+  tar -xzf "${tmp_dir}/mailpit.tar.gz" -C "$tmp_dir"
+  binary="$(find "$tmp_dir" -type f -name mailpit | head -n1)"
+  if [[ -z "$binary" ]]; then
+    rm -rf "$tmp_dir"
+    die "mailpit binary not found in downloaded archive"
+  fi
+
+  install -m 0755 -o root -g root "$binary" /usr/local/bin/mailpit
+  rm -rf "$tmp_dir"
+}
+
+install_mailpit_unit() {
+  log "installing mailpit.service"
+  cat > /etc/systemd/system/mailpit.service <<'EOF'
+[Unit]
+Description=Mailpit SMTP + web UI (shared catch-all mailbox for Shipway projects)
+After=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+ExecStart=/usr/local/bin/mailpit --listen 127.0.0.1:8025 --smtp 127.0.0.1:1025
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 0644 /etc/systemd/system/mailpit.service
+  systemctl daemon-reload
+  systemctl enable --now mailpit
+}
+
+# ---------------------------------------------------------------------------
+# 5. certbot
+# ---------------------------------------------------------------------------
+
+install_certbot() {
+  log "installing certbot + cloudflare dns plugin"
+  apt-get install -y certbot python3-certbot-dns-cloudflare
+}
+
+# ---------------------------------------------------------------------------
+# 6. deployer user, dirs, sysops helper + sudoers
+# ---------------------------------------------------------------------------
+
+create_deployer_user() {
+  if id -u deployer >/dev/null 2>&1; then
+    log "deployer user already exists, skipping"
+  else
+    log "creating deployer system user"
+    useradd --system --create-home --home-dir "$DEPLOYER_HOME" --shell /bin/bash deployer
+  fi
+
+  install -d -m 0750 -o deployer -g deployer /var/deploy/apps
+  install -d -m 0750 -o deployer -g deployer /var/deploy/logs
+  install -d -m 0750 -o deployer -g deployer /var/lib/shipway
+
+  # deployer needs to read the systemd journal (no sudo) for `journalctl -u`
+  # log tailing (see server/src/sysops/real.ts's journalTail).
+  usermod -aG systemd-journal deployer
+}
+
+install_sysops_helper() {
+  log "installing /usr/local/bin/shipway-sysops"
+  install -m 0755 -o root -g root "${SCRIPT_DIR}/shipway-sysops" /usr/local/bin/shipway-sysops
+
+  log "validating and installing sudoers.d-shipway"
+  local tmp
+  tmp="$(mktemp)"
+  cp "${SCRIPT_DIR}/sudoers.d-shipway" "$tmp"
+  if ! visudo -c -f "$tmp"; then
+    rm -f "$tmp"
+    die "sudoers.d-shipway failed visudo validation, aborting before installing it"
+  fi
+  install -m 0440 -o root -g root "$tmp" /etc/sudoers.d/shipway-sysops
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# 7. Prompts (env-var overridable, for non-interactive installs)
+# ---------------------------------------------------------------------------
+
+BASE_DOMAIN=""
+SERVER_IP=""
+CF_API_TOKEN=""
+ACME_EMAIL=""
+
+read_prompts() {
+  BASE_DOMAIN="${SHIPWAY_BASE_DOMAIN:-}"
+  if [[ -z "$BASE_DOMAIN" ]]; then
+    read -r -p "Base domain (e.g. intcore.dev): " BASE_DOMAIN
+  fi
+
+  SERVER_IP="${SHIPWAY_SERVER_IP:-}"
+  if [[ -z "$SERVER_IP" ]]; then
+    read -r -p "Server public IP: " SERVER_IP
+  fi
+
+  CF_API_TOKEN="${SHIPWAY_CF_API_TOKEN:-}"
+  if [[ -z "$CF_API_TOKEN" ]]; then
+    read -r -s -p "Cloudflare API token (Zone.DNS edit): " CF_API_TOKEN
+    echo
+  fi
+
+  ACME_EMAIL="${SHIPWAY_ACME_EMAIL:-}"
+  if [[ -z "$ACME_EMAIL" ]]; then
+    read -r -p "ACME/Let's Encrypt contact email: " ACME_EMAIL
+  fi
+
+  if [[ -z "$BASE_DOMAIN" || -z "$SERVER_IP" || -z "$CF_API_TOKEN" || -z "$ACME_EMAIL" ]]; then
+    die "BASE_DOMAIN, SERVER_IP, CF_API_TOKEN and ACME_EMAIL are all required"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 8. Wildcard cert via certbot + Cloudflare DNS-01
+# ---------------------------------------------------------------------------
+
+issue_certificate() {
+  install -d -m 0700 /root/.secrets
+  local cf_ini=/root/.secrets/certbot-cloudflare.ini
+  cat > "$cf_ini" <<EOF
+dns_cloudflare_api_token = ${CF_API_TOKEN}
+EOF
+  chmod 0600 "$cf_ini"
+
+  local cert_dir="/etc/letsencrypt/live/${BASE_DOMAIN}"
+  if [[ -d "$cert_dir" ]]; then
+    log "certificate for ${BASE_DOMAIN} already exists, skipping certbot"
+  else
+    log "requesting wildcard certificate for *.${BASE_DOMAIN} / ${BASE_DOMAIN}"
+    certbot certonly \
+      --dns-cloudflare \
+      --dns-cloudflare-credentials "$cf_ini" \
+      --dns-cloudflare-propagation-seconds 30 \
+      -d "*.${BASE_DOMAIN}" \
+      -d "${BASE_DOMAIN}" \
+      --cert-name "${BASE_DOMAIN}" \
+      --agree-tos \
+      -m "$ACME_EMAIL" \
+      -n
+  fi
+
+  install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
+  cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+systemctl reload nginx
+EOF
+  chmod 0755 /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+}
+
+# ---------------------------------------------------------------------------
+# 9. MySQL / Postgres admin accounts for Shipway
+# ---------------------------------------------------------------------------
+
+MYSQL_ADMIN_PASSWORD=""
+POSTGRES_ADMIN_PASSWORD=""
+
+provision_mysql_admin() {
+  MYSQL_ADMIN_PASSWORD="$(get_or_create_secret MYSQL_ADMIN_PASSWORD)"
+  log "provisioning MySQL shipway_admin user"
+  # Granted at both hosts — see the file header comment for why. The
+  # trailing ALTER USERs are not redundant with CREATE USER IF NOT EXISTS:
+  # if the account already existed, CREATE's IDENTIFIED BY clause is a
+  # no-op, so without the ALTER the account's real password could drift
+  # from whatever get_or_create_secret just returned (e.g. if
+  # /root/.shipway-install-secrets was ever lost and regenerated) — leaving
+  # bootstrap.json reporting a password that doesn't actually work.
+  mysql -u root <<SQL
+CREATE USER IF NOT EXISTS 'shipway_admin'@'localhost' IDENTIFIED BY '${MYSQL_ADMIN_PASSWORD}';
+CREATE USER IF NOT EXISTS 'shipway_admin'@'127.0.0.1' IDENTIFIED BY '${MYSQL_ADMIN_PASSWORD}';
+ALTER USER 'shipway_admin'@'localhost' IDENTIFIED BY '${MYSQL_ADMIN_PASSWORD}';
+ALTER USER 'shipway_admin'@'127.0.0.1' IDENTIFIED BY '${MYSQL_ADMIN_PASSWORD}';
+GRANT ALL ON *.* TO 'shipway_admin'@'localhost' WITH GRANT OPTION;
+GRANT ALL ON *.* TO 'shipway_admin'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+}
+
+provision_postgres_admin() {
+  POSTGRES_ADMIN_PASSWORD="$(get_or_create_secret POSTGRES_ADMIN_PASSWORD)"
+  log "provisioning Postgres shipway_admin role"
+  local exists
+  exists="$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='shipway_admin'")"
+  if [[ "$exists" == "1" ]]; then
+    # Same reasoning as the MySQL ALTER USERs above: always (re)assert the
+    # password so it can never drift from what bootstrap.json reports.
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -c \
+      "ALTER ROLE shipway_admin WITH PASSWORD '${POSTGRES_ADMIN_PASSWORD}'"
+  else
+    sudo -u postgres psql -v ON_ERROR_STOP=1 -c \
+      "CREATE ROLE shipway_admin LOGIN CREATEDB CREATEROLE PASSWORD '${POSTGRES_ADMIN_PASSWORD}'"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# 10. bootstrap.json — imported once by the server on first boot (see
+#     server/src/lib/bootstrap.ts) and then deleted.
+# ---------------------------------------------------------------------------
+
+write_bootstrap_file() {
+  log "writing /var/lib/shipway/bootstrap.json"
+  local redis_password
+  redis_password="$(get_or_create_secret REDIS_PASSWORD)"
+
+  local mysql_admin_url="mysql://shipway_admin:${MYSQL_ADMIN_PASSWORD}@127.0.0.1:3306"
+  local postgres_admin_url="postgres://shipway_admin:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:5432/postgres"
+  local mailpit_web_url="https://mail.${BASE_DOMAIN}"
+
+  install -d -m 0750 -o deployer -g deployer /var/lib/shipway
+  jq -n \
+    --arg mysql_admin_url "$mysql_admin_url" \
+    --arg postgres_admin_url "$postgres_admin_url" \
+    --arg redis_host "127.0.0.1" \
+    --argjson redis_port 6379 \
+    --arg redis_password "$redis_password" \
+    --arg mailpit_smtp_host "127.0.0.1" \
+    --argjson mailpit_smtp_port 1025 \
+    --arg mailpit_web_url "$mailpit_web_url" \
+    --arg base_domain "$BASE_DOMAIN" \
+    --arg server_ip "$SERVER_IP" \
+    --arg acme_email "$ACME_EMAIL" \
+    '{
+      mysql_admin_url: $mysql_admin_url,
+      postgres_admin_url: $postgres_admin_url,
+      redis_info: { host: $redis_host, port: $redis_port, password: $redis_password },
+      mailpit_info: { smtpHost: $mailpit_smtp_host, smtpPort: $mailpit_smtp_port, webUrl: $mailpit_web_url },
+      base_domain: $base_domain,
+      server_ip: $server_ip,
+      acme_email: $acme_email
+    }' > /var/lib/shipway/bootstrap.json
+
+  chown deployer:deployer /var/lib/shipway/bootstrap.json
+  chmod 0600 /var/lib/shipway/bootstrap.json
+}
+
+# ---------------------------------------------------------------------------
+# 11. Fetch/build Shipway itself, install its unit
+# ---------------------------------------------------------------------------
+
+sync_shipway_source() {
+  if [[ -f "${REPO_ROOT}/package.json" && -d "${REPO_ROOT}/server" && -d "${REPO_ROOT}/setup" ]]; then
+    log "installing from local checkout at ${REPO_ROOT}"
+    mkdir -p "$SHIPWAY_DIR"
+    rsync -a --delete \
+      --exclude '.git' \
+      --exclude 'node_modules' \
+      --exclude '*/node_modules' \
+      --exclude 'server/dist' \
+      --exclude 'server/data' \
+      --exclude 'web/dist' \
+      "${REPO_ROOT}/" "${SHIPWAY_DIR}/"
+  elif [[ -n "${SHIPWAY_REPO_URL:-}" ]]; then
+    log "cloning ${SHIPWAY_REPO_URL} into ${SHIPWAY_DIR}"
+    if [[ -d "${SHIPWAY_DIR}/.git" ]]; then
+      git -C "$SHIPWAY_DIR" fetch --all
+      git -C "$SHIPWAY_DIR" reset --hard '@{upstream}'
+    else
+      rm -rf "$SHIPWAY_DIR"
+      git clone "$SHIPWAY_REPO_URL" "$SHIPWAY_DIR"
+    fi
+  else
+    die "not running from a Shipway checkout and SHIPWAY_REPO_URL is not set"
+  fi
+
+  chown -R deployer:deployer "$SHIPWAY_DIR"
+}
+
+build_shipway() {
+  log "npm ci && npm run build (as deployer)"
+  sudo -u deployer bash -lc "export PATH=/opt/node/22/bin:\$PATH && cd ${SHIPWAY_DIR} && npm ci && npm run build"
+}
+
+install_shipway_unit() {
+  log "installing shipway.service"
+  install -m 0644 -o root -g root "${SCRIPT_DIR}/shipway.service" /etc/systemd/system/shipway.service
+  systemctl daemon-reload
+  systemctl enable shipway
+  systemctl restart shipway
+}
+
+# ---------------------------------------------------------------------------
+# 12. nginx vhosts for the dashboard + mailpit
+# ---------------------------------------------------------------------------
+
+render_vhost() {
+  local template="$1" dest_name="$2"
+  # The template's placeholder is the literal text `${BASE_DOMAIN}`; the
+  # `\$` below escapes it so bash doesn't expand it before sed ever sees it.
+  sed "s|\${BASE_DOMAIN}|${BASE_DOMAIN}|g" "$template" > "/etc/nginx/sites-available/${dest_name}"
+  ln -sf "/etc/nginx/sites-available/${dest_name}" "/etc/nginx/sites-enabled/${dest_name}"
+}
+
+install_vhosts() {
+  log "rendering dashboard + mailpit nginx vhosts"
+  render_vhost "${SCRIPT_DIR}/templates/nginx-dashboard.conf" "shipway-dashboard.conf"
+  render_vhost "${SCRIPT_DIR}/templates/nginx-mailpit.conf" "shipway-mailpit.conf"
+
+  nginx -t
+  systemctl reload nginx
+}
+
+# ---------------------------------------------------------------------------
+# 13. Cloudflare DNS records for deploy.<domain> and mail.<domain>
+# ---------------------------------------------------------------------------
+
+cf_api() {
+  curl -fsSL -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" "$@"
+}
+
+create_a_record_if_missing() {
+  local zone_id="$1" name="$2"
+  local existing
+  existing="$(cf_api "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${name}" | jq -r '.result[0].id // empty')"
+  if [[ -n "$existing" ]]; then
+    log "DNS A record for ${name} already exists, skipping"
+    return
+  fi
+
+  log "creating DNS A record for ${name} -> ${SERVER_IP}"
+  cf_api -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+    --data "$(jq -n --arg name "$name" --arg content "$SERVER_IP" '{type: "A", name: $name, content: $content, ttl: 300, proxied: false}')" \
+    > /dev/null
+}
+
+configure_dns() {
+  local zone_id
+  zone_id="$(cf_api "https://api.cloudflare.com/client/v4/zones?name=${BASE_DOMAIN}" | jq -r '.result[0].id // empty')"
+  if [[ -z "$zone_id" ]]; then
+    die "could not find a Cloudflare zone named ${BASE_DOMAIN} (check the API token's zone access)"
+  fi
+
+  create_a_record_if_missing "$zone_id" "deploy.${BASE_DOMAIN}"
+  create_a_record_if_missing "$zone_id" "mail.${BASE_DOMAIN}"
+}
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+main() {
+  check_root
+  check_ubuntu
+  export DEBIAN_FRONTEND=noninteractive
+
+  touch "$SECRETS_FILE"
+  chmod 0600 "$SECRETS_FILE"
+
+  install_base_packages
+  install_php
+  install_composer
+
+  install_databases
+  configure_redis
+
+  install_all_node_versions
+
+  install_mailpit_binary
+  install_mailpit_unit
+
+  install_certbot
+
+  create_deployer_user
+  install_sysops_helper
+
+  read_prompts
+  issue_certificate
+
+  provision_mysql_admin
+  provision_postgres_admin
+  write_bootstrap_file
+
+  sync_shipway_source
+  build_shipway
+  install_shipway_unit
+
+  install_vhosts
+  configure_dns
+
+  log "done. Shipway is live at https://deploy.${BASE_DOMAIN} — open it to run the first-run setup wizard."
+}
+
+main "$@"

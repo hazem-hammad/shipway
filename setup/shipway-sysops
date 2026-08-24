@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+#
+# shipway-sysops — the narrow, whitelisted root helper. Installed by
+# setup/install.sh at /usr/local/bin/shipway-sysops, owned root:root, mode
+# 0755. It is invoked as `sudo shipway-sysops <verb> <dest>` by the
+# `deployer` user (see sudoers.d-shipway), which is the trust boundary
+# Shipway's own process (running as `deployer`) crosses to touch root-owned
+# nginx/systemd config.
+#
+# This is the ONLY sudoers entry that takes an argument shipway itself
+# chooses (a file path) — every other sudoers entry below is a fixed,
+# argument-free (or glob-anchored) command. So this script is the one place
+# that argument validation actually matters: everything between `deployer`
+# and writing/removing an arbitrary root-owned file is the whitelist below.
+#
+# Verbs:
+#   install-file <dest>   Reads content from stdin, writes it to <dest>
+#                          atomically (mktemp alongside <dest> + mv, so the
+#                          rename is on the same filesystem), mode 0644.
+#   remove-file <dest>    Removes <dest> (rm -f — a missing file is not an
+#                          error).
+#
+# <dest> must match one of:
+#   /etc/nginx/sites-available/shipway-<slug>.conf
+#   /etc/nginx/sites-enabled/shipway-<slug>.conf
+#   /etc/systemd/system/shipway-<unit>.service
+#
+# Anything else — an unknown verb, the wrong argument count, or a <dest>
+# outside the whitelist — prints an error to stderr and exits 2. Nothing is
+# ever written or removed outside those two directories/patterns.
+
+set -euo pipefail
+
+readonly NGINX_DEST_RE='^/etc/nginx/sites-(available|enabled)/shipway-[a-z0-9-]+\.conf$'
+readonly SYSTEMD_DEST_RE='^/etc/systemd/system/shipway-[a-z0-9@.-]+\.service$'
+
+usage() {
+  echo "usage: shipway-sysops install-file <dest>   (content read from stdin)" >&2
+  echo "       shipway-sysops remove-file <dest>" >&2
+}
+
+# Exits 2 (with a message on stderr) unless $1 matches the nginx-vhost or
+# systemd-unit whitelist above.
+assert_whitelisted() {
+  local dest="$1"
+  if [[ "$dest" =~ $NGINX_DEST_RE ]] || [[ "$dest" =~ $SYSTEMD_DEST_RE ]]; then
+    return 0
+  fi
+  echo "shipway-sysops: refusing to touch path outside the whitelist: $dest" >&2
+  exit 2
+}
+
+install_file() {
+  local dest="$1"
+  assert_whitelisted "$dest"
+
+  local dir
+  dir="$(dirname -- "$dest")"
+  if [[ ! -d "$dir" ]]; then
+    echo "shipway-sysops: directory does not exist: $dir" >&2
+    exit 2
+  fi
+
+  # mktemp in the SAME directory as dest, so the final `mv` below is a rename
+  # on one filesystem (atomic), never a cross-filesystem copy.
+  local tmp
+  tmp="$(mktemp "${dest}.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+
+  cat > "$tmp"
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$dest"
+
+  trap - EXIT
+}
+
+remove_file() {
+  local dest="$1"
+  assert_whitelisted "$dest"
+  rm -f "$dest"
+}
+
+if [[ $# -ne 2 ]]; then
+  usage
+  exit 2
+fi
+
+verb="$1"
+dest="$2"
+
+case "$verb" in
+  install-file)
+    install_file "$dest"
+    ;;
+  remove-file)
+    remove_file "$dest"
+    ;;
+  *)
+    echo "shipway-sysops: unknown verb: $verb" >&2
+    usage
+    exit 2
+    ;;
+esac
