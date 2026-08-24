@@ -130,11 +130,16 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const { email, password } = parsed.data;
     const user = app.db.select().from(users).where(eq(users.email, email)).get();
-    // Always run a real argon2id verify, even for an unknown email, against DUMMY_PASSWORD_HASH —
-    // see its doc comment. This keeps "unknown email" and "wrong password" 401s equally expensive.
-    const valid = await verifyPassword(user ? user.passwordHash : DUMMY_PASSWORD_HASH, password);
+    // Always run a real argon2id verify against DUMMY_PASSWORD_HASH — see its doc comment — for
+    // both an unknown email AND a `status: 'invited'` user (Task 3: invited users can't log in
+    // until they activate via `/api/invite/:token`; their `passwordHash` is an unusable sentinel
+    // anyway, but we still route around it explicitly here rather than relying on that). This keeps
+    // "unknown email", "not yet activated", and "wrong password" 401s equally expensive — an
+    // attacker can't distinguish any of the three from response timing.
+    const canAttemptLogin = user !== undefined && user.status === 'active';
+    const valid = await verifyPassword(canAttemptLogin ? user.passwordHash : DUMMY_PASSWORD_HASH, password);
 
-    if (!user || !valid) {
+    if (!canAttemptLogin || !valid) {
       recordFailure(ip);
       recordAudit(app.db, {
         actorId: user?.id ?? null,

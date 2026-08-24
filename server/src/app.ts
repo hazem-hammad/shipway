@@ -91,9 +91,11 @@ const DEFAULT_WEB_DIST_DIR = path.resolve(__dirname, '../../web/dist');
  * Path prefixes under `/api/` that do NOT require an authenticated session. Everything else under
  * `/api/` is guarded by the global `onRequest` hook below. `/api/health` itself is checked
  * separately as an exact match (see `isPublicApiPath`), not a prefix, so a future route like
- * `/api/healthcheck` doesn't accidentally slip through unauthenticated too.
+ * `/api/healthcheck` doesn't accidentally slip through unauthenticated too. `/api/invite/` is
+ * public (Task 3): the invitee has no session yet — `GET` previews the pending invite and `POST`
+ * activates it — both routes validate the token itself as their credential (see `routes/users.ts`).
  */
-const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/setup/', '/api/webhooks/'];
+const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/setup/', '/api/webhooks/', '/api/invite/'];
 
 function isPublicApiPath(path: string): boolean {
   if (path === '/api/health') return true;
