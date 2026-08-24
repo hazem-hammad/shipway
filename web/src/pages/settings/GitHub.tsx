@@ -1,13 +1,18 @@
 /**
  * Settings > GitHub: create/configure the GitHub App and check its install status
  * (server/src/routes/github.ts). The manifest auto-submit flow is identical to the setup wizard's
- * step 4 — both now share `submitManifestForm` from lib/github.ts (task-25 controller ruling) so
- * they can't drift. `?created=1` lands here from the manifest callback's redirect
- * (`/settings/github?created=1`, see github.ts).
+ * step 4 — both share `submitManifestForm` from lib/github.ts so they can't drift. `?created=1`
+ * lands here from the manifest callback's redirect (`/settings/github?created=1`, see github.ts).
+ *
+ * Restyled to the reference anatomy (DESIGN.md Cards / Buttons): a connected-app row with an
+ * "Used for deploys" badge once installed, a plain install link + secondary "Detect installation"
+ * while configured-but-not-installed, and "Create GitHub App" + a manual-fallback `<details>` while
+ * unconfigured.
  */
 import { type FormEvent, useState } from 'react';
 import { useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
+import { ExternalLink, GitBranch } from 'lucide-react';
 import {
   ApiError,
   fetchGithubManifest,
@@ -18,35 +23,57 @@ import {
 } from '../../api';
 import { submitManifestForm } from '../../lib/github';
 import { useGithubStatus } from '../../hooks';
-import { BerthLight, Button, Field, Input, Skeleton, Textarea } from '../../components/ui';
+import { Badge, Button, buttonClasses, Card, CardHeader, Field, ICON_STROKE, IconChip, Input, Skeleton, Textarea } from '../../components/ui';
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
+}
+
+const DESCRIPTION: Record<'not-configured' | 'not-installed' | 'installed', string> = {
+  'not-configured': 'Shipway deploys from GitHub through a GitHub App scoped to the repositories you choose.',
+  'not-installed': 'The app is created. Install it on an account or organization to start deploying from it.',
+  installed: 'Shipway deploys from any repository this app is installed on.',
+};
+
+function stateFor(status: GithubStatus | undefined): 'not-configured' | 'not-installed' | 'installed' | null {
+  if (!status) return null;
+  if (!status.configured) return 'not-configured';
+  if (!status.installed) return 'not-installed';
+  return 'installed';
 }
 
 export default function GithubSection() {
   const statusQuery = useGithubStatus();
   const search = useSearch();
   const created = new URLSearchParams(search).get('created') === '1';
+  const state = stateFor(statusQuery.data);
 
   return (
-    <div className="flex flex-col gap-4">
-      {created && (
-        <p role="status" className="text-sm text-go">
-          GitHub App created.
-        </p>
-      )}
+    <Card>
+      <CardHeader
+        icon={<GitBranch size={20} strokeWidth={ICON_STROKE} />}
+        title="GitHub"
+        description={state ? DESCRIPTION[state] : 'Shipway deploys from GitHub through a GitHub App.'}
+      />
 
-      {statusQuery.isPending ? (
-        <Skeleton className="h-32 w-full max-w-[640px]" />
-      ) : statusQuery.isError || !statusQuery.data ? (
-        <p role="alert" className="text-sm text-stop">
-          Could not load GitHub App status.
-        </p>
-      ) : (
-        <GithubStatusView status={statusQuery.data} />
-      )}
-    </div>
+      <div className="mt-5">
+        {created && (
+          <p role="status" className="mb-4 text-sm text-ok">
+            GitHub App created.
+          </p>
+        )}
+
+        {statusQuery.isPending ? (
+          <Skeleton className="h-16 w-full max-w-[640px]" />
+        ) : statusQuery.isError || !statusQuery.data ? (
+          <p role="alert" className="text-sm text-danger">
+            Could not load GitHub App status.
+          </p>
+        ) : (
+          <GithubStatusView status={statusQuery.data} />
+        )}
+      </div>
+    </Card>
   );
 }
 
@@ -62,9 +89,26 @@ function GithubStatusView({ status }: { status: GithubStatus }) {
 
 function Installed({ appSlug }: { appSlug: string | null }) {
   return (
-    <div className="flex items-center gap-3 rounded-lg border border-line bg-panel/40 px-4 py-3">
-      <BerthLight status="go" />
-      <span className="text-sm font-medium text-ink">Connected as {appSlug ?? 'unknown app'}</span>
+    <div className="flex max-w-[640px] flex-col gap-4">
+      <div className="flex items-center gap-3.5 rounded-xl bg-surface-2 px-4 py-3.5">
+        <IconChip>
+          <GitBranch size={20} strokeWidth={ICON_STROKE} />
+        </IconChip>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-base font-semibold text-ink">@{appSlug ?? 'unknown app'}</div>
+          <div className="text-sm text-soft">Shipway GitHub App</div>
+        </div>
+        <Badge tone="ok" className="shrink-0">
+          Used for deploys
+        </Badge>
+      </div>
+
+      {appSlug && (
+        <a href={`https://github.com/apps/${appSlug}`} target="_blank" rel="noreferrer noopener" className={buttonClasses('secondary', 'md', 'w-fit')}>
+          Manage on GitHub
+          <ExternalLink size={16} strokeWidth={ICON_STROKE} aria-hidden />
+        </a>
+      )}
     </div>
   );
 }
@@ -89,19 +133,19 @@ function NotInstalled({ appSlug }: { appSlug: string | null }) {
 
   return (
     <div className="flex max-w-[640px] flex-col gap-3">
-      <p className="text-sm text-ink-soft">The GitHub App is created but not installed on any account or organization yet.</p>
       {appSlug && (
         <a
           href={`https://github.com/apps/${appSlug}/installations/new`}
           target="_blank"
           rel="noreferrer noopener"
-          className="w-fit text-sm font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          className="inline-flex w-fit items-center gap-1.5 text-sm font-medium text-link hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
           Install the app on GitHub
+          <ExternalLink size={13} strokeWidth={ICON_STROKE} aria-hidden />
         </a>
       )}
       {error && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}
@@ -133,12 +177,8 @@ function NotConfigured() {
 
   return (
     <div className="flex max-w-[640px] flex-col gap-4">
-      <p className="text-sm text-ink-soft">
-        Shipway deploys from GitHub through a GitHub App scoped to the repositories you choose. Creating one takes you to
-        GitHub and back.
-      </p>
       {error && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}
@@ -148,8 +188,8 @@ function NotConfigured() {
         </Button>
       </div>
 
-      <details className="rounded-lg border border-line bg-panel/40 px-4 py-3">
-        <summary className="cursor-pointer rounded text-sm font-medium text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent">
+      <details className="rounded-xl bg-surface-2 px-4 py-3.5">
+        <summary className="cursor-pointer rounded text-sm font-medium text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus">
           Configure manually
         </summary>
         <ManualAppForm />
@@ -196,7 +236,7 @@ function ManualAppForm() {
         <Input mono required type="password" value={webhookSecret} onChange={(event) => setWebhookSecret(event.target.value)} />
       </Field>
       {error && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}
@@ -204,7 +244,7 @@ function ManualAppForm() {
         <Button type="submit" loading={submitting}>
           Save
         </Button>
-        {saved && <span className="text-sm text-go">Saved.</span>}
+        {saved && <span className="text-sm text-ok">Saved.</span>}
       </div>
     </form>
   );

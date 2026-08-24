@@ -52,8 +52,8 @@ export default function CronTab({ projectId }: { projectId: number }) {
         <p role="alert" className="text-sm text-danger">
           Could not load cron jobs.
         </p>
-      ) : cronQuery.data.length === 0 && !adding ? (
-        <EmptyState message="No cron jobs. Add one to run a command on a schedule." />
+      ) : cronQuery.data.length === 0 ? (
+        adding ? null : <EmptyState message="No cron jobs. Add one to run a command on a schedule." />
       ) : (
         <Card>
           <div className="flex flex-col divide-y divide-line">

@@ -10,7 +10,6 @@ import ProjectNewPage from './pages/ProjectNew';
 import ProjectLayout from './pages/project/ProjectLayout';
 import DatabasesPage from './pages/Databases';
 import DeploymentsPage from './pages/Deployments';
-import ServerPage from './pages/Server';
 import SettingsPage from './pages/Settings';
 
 export default function App() {
@@ -61,7 +60,6 @@ function AuthenticatedGate() {
         <Route path="/projects/:id" nest component={ProjectLayout} />
         <Route path="/databases" component={DatabasesPage} />
         <Route path="/deployments" component={DeploymentsPage} />
-        <Route path="/server" component={ServerPage} />
         <Route path="/settings/:section?" component={SettingsPage} />
         <Route>
           <Redirect to="/projects" />

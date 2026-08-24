@@ -7,25 +7,35 @@
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Cloud } from 'lucide-react';
 import { ApiError, putSettings, verifyCloudflare, type Settings, type SettingsUpdate } from '../../api';
 import { useSettings } from '../../hooks';
-import { Button, Field, Input, Skeleton } from '../../components/ui';
+import { Badge, Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
 
 export default function CloudflareSection() {
   const settingsQuery = useSettings();
 
-  if (settingsQuery.isPending) {
-    return <Skeleton className="h-48 w-full max-w-[640px]" />;
-  }
-  if (settingsQuery.isError || !settingsQuery.data) {
-    return (
-      <p role="alert" className="text-sm text-stop">
-        Could not load settings.
-      </p>
-    );
-  }
+  return (
+    <Card>
+      <CardHeader
+        icon={<Cloud size={20} strokeWidth={ICON_STROKE} />}
+        title="Cloudflare"
+        description="Lets Shipway create DNS records for project subdomains."
+      />
 
-  return <CloudflareForm settings={settingsQuery.data} />;
+      <div className="mt-5">
+        {settingsQuery.isPending ? (
+          <Skeleton className="h-48 w-full max-w-[640px]" />
+        ) : settingsQuery.isError || !settingsQuery.data ? (
+          <p role="alert" className="text-sm text-danger">
+            Could not load settings.
+          </p>
+        ) : (
+          <CloudflareForm settings={settingsQuery.data} />
+        )}
+      </div>
+    </Card>
+  );
 }
 
 function CloudflareForm({ settings }: { settings: Settings }) {
@@ -109,7 +119,7 @@ function CloudflareForm({ settings }: { settings: Settings }) {
       </Field>
 
       {error && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}
@@ -121,8 +131,12 @@ function CloudflareForm({ settings }: { settings: Settings }) {
         <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!canTest}>
           Test connection
         </Button>
-        {testResult === 'ok' && <span className="text-sm text-go">Connected.</span>}
-        {testResult === 'fail' && <span className="text-sm text-stop">Could not verify the token.</span>}
+        {testResult === 'ok' && <Badge tone="ok">Connected</Badge>}
+        {testResult === 'fail' && (
+          <span role="alert" className="text-sm text-danger">
+            Could not verify the token.
+          </span>
+        )}
       </div>
     </form>
   );
