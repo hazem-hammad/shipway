@@ -16,9 +16,9 @@ export function DurationText({ deployment }: DurationTextProps) {
     return <LiveDuration startedAt={deployment.startedAt} />;
   }
   if (deployment.startedAt !== null && deployment.finishedAt !== null) {
-    return <span className="font-mono text-xs text-ink-soft">{formatDuration(deployment.finishedAt - deployment.startedAt)}</span>;
+    return <span className="font-mono text-xs text-soft">{formatDuration(deployment.finishedAt - deployment.startedAt)}</span>;
   }
-  return <span className="text-xs text-ink-soft">not started</span>;
+  return <span className="text-xs text-soft">not started</span>;
 }
 
 function LiveDuration({ startedAt }: { startedAt: number }) {
@@ -29,5 +29,5 @@ function LiveDuration({ startedAt }: { startedAt: number }) {
     return () => clearInterval(id);
   }, []);
 
-  return <span className="font-mono text-xs text-ink-soft">{formatDuration(now - startedAt)}</span>;
+  return <span className="font-mono text-xs text-soft">{formatDuration(now - startedAt)}</span>;
 }

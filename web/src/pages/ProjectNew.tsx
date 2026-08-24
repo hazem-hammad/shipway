@@ -702,7 +702,7 @@ function EnvVarsCard({ value, onChange }: { value: string; onChange: (v: string)
   const lineCount = value === '' ? 0 : value.split('\n').filter((line) => line.trim() !== '').length;
   return (
     <Card>
-      <CardHeader icon={<Braces size={20} strokeWidth={ICON_STROKE} />} title="Environment variables" description="Paste your .env — set after the project is created, before the first deploy." />
+      <CardHeader icon={<Braces size={20} strokeWidth={ICON_STROKE} />} title="Environment variables" description="Paste your .env. Set after the project is created, before the first deploy." />
       <div className="mt-4 flex flex-col gap-1.5">
         <Textarea mono rows={6} placeholder={'APP_KEY=\nDB_HOST=127.0.0.1'} value={value} onChange={(event) => onChange(event.target.value)} />
         <div className="flex items-center justify-between text-[13px] text-soft">
@@ -809,7 +809,7 @@ function ConfigureRail({
         <div className="mt-3 flex flex-col gap-0.5">
           <SummaryRow label="Domain" value={domain} mono />
           <SummaryRow label="Framework" value={TYPE_LABEL[type]} />
-          <SummaryRow label="Build command" value={buildCmd || '—'} mono />
+          <SummaryRow label="Build command" value={buildCmd || 'none'} mono />
         </div>
       </Card>
 

@@ -3,17 +3,16 @@
  * `syncCrontab`). A delete that 502s (crontab sync failed) still removes the DB row server-side —
  * see cron.ts's DELETE handler — so the row disappears from the list either way; the sync failure
  * is then surfaced as a page-level notice rather than a row-level one, since the row itself is gone
- * by the time the error resolves (task-25 controller ruling).
+ * by the time the error resolves.
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Plus } from 'lucide-react';
 import { ApiError, createCronJob, deleteCronJob, patchCronJob, type CronJob } from '../../api';
 import { useCronJobs, useProject } from '../../hooks';
-import { Button, Chip, EmptyState, Field, Input, PageHeader, Skeleton } from '../../components/ui';
+import { Button, Card, Chip, EmptyState, Field, Input, Skeleton } from '../../components/ui';
 
 const SCHEDULE_HINT = 'e.g. * * * * * (every minute), */5 * * * * (every 5 min), 0 0 * * * (daily at midnight)';
-
-const TABLE_COLUMN_COUNT = 3;
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
@@ -28,74 +27,55 @@ export default function CronTab({ projectId }: { projectId: number }) {
 
   return (
     <div>
-      <PageHeader
-        title="Cron"
-        actions={
-          !adding && (
-            <Button onClick={() => setAdding(true)} className="px-2.5 py-1.5 text-xs">
-              Add cron job
-            </Button>
-          )
-        }
-      />
+      {adding ? (
+        <AddCronForm projectId={projectId} onDone={() => setAdding(false)} onCancel={() => setAdding(false)} />
+      ) : (
+        <div className="mb-5 flex justify-end">
+          <Button onClick={() => setAdding(true)}>
+            <Plus size={16} strokeWidth={2} aria-hidden />
+            Add cron job
+          </Button>
+        </div>
+      )}
 
       {deleteNotice && (
-        <p role="alert" className="mb-4 text-sm text-stop">
+        <p role="alert" className="mb-4 text-sm text-danger">
           {deleteNotice}
         </p>
       )}
 
-      {adding && (
-        <AddCronForm
-          projectId={projectId}
-          onDone={() => setAdding(false)}
-          onCancel={() => setAdding(false)}
-        />
-      )}
-
       {cronQuery.isPending ? (
-        <TableSkeleton />
+        <Card>
+          <CronSkeletonRows />
+        </Card>
       ) : cronQuery.isError ? (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           Could not load cron jobs.
         </p>
       ) : cronQuery.data.length === 0 && !adding ? (
         <EmptyState message="No cron jobs. Add one to run a command on a schedule." />
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-line">
-          <table className="w-full min-w-[560px] border-collapse text-left text-sm">
-            <thead className="bg-panel text-xs font-medium text-ink-soft">
-              <tr>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Schedule
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Command
-                </th>
-                <th scope="col" className="px-4 py-2.5"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {cronQuery.data.map((cron) => (
-                <CronRow
-                  key={cron.id}
-                  projectId={projectId}
-                  cron={cron}
-                  editing={editingId === cron.id}
-                  onToggleEdit={() => setEditingId((current) => (current === cron.id ? null : cron.id))}
-                  onDeleted={(message) => {
-                    setEditingId(null);
-                    setDeleteNotice(message);
-                  }}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Card>
+          <div className="flex flex-col divide-y divide-line">
+            {cronQuery.data.map((cron) => (
+              <CronRow
+                key={cron.id}
+                projectId={projectId}
+                cron={cron}
+                editing={editingId === cron.id}
+                onToggleEdit={() => setEditingId((current) => (current === cron.id ? null : cron.id))}
+                onDeleted={(message) => {
+                  setEditingId(null);
+                  setDeleteNotice(message);
+                }}
+              />
+            ))}
+          </div>
+        </Card>
       )}
 
       {projectQuery.data?.type === 'php' && (
-        <p className="mt-4 text-xs text-ink-soft">This project&rsquo;s PHP commands run with its configured PHP version automatically.</p>
+        <p className="mt-4 text-sm text-soft">This project&rsquo;s PHP commands run with its configured PHP version automatically.</p>
       )}
     </div>
   );
@@ -134,41 +114,31 @@ function AddCronForm({ projectId, onDone, onCancel }: { projectId: number; onDon
   }
 
   return (
-    <form
-      onSubmit={(event) => void handleSubmit(event)}
-      className="mb-4 flex flex-col gap-4 rounded-lg border border-line bg-panel/40 p-4"
-      noValidate
-    >
-      <div className="flex flex-wrap items-start gap-4">
-        <Field label="Schedule" hint={SCHEDULE_HINT} error={scheduleError ?? undefined}>
-          <Input
-            mono
-            required
-            autoFocus
-            placeholder="* * * * *"
-            value={schedule}
-            onChange={(event) => setSchedule(event.target.value)}
-            className="w-56"
-          />
-        </Field>
-        <Field label="Command" error={commandError ?? undefined}>
-          <Input mono required value={command} onChange={(event) => setCommand(event.target.value)} className="w-80" />
-        </Field>
-      </div>
-      {formError && (
-        <p role="alert" className="text-sm text-stop">
-          {formError}
-        </p>
-      )}
-      <div className="flex items-center gap-2">
-        <Button type="submit" loading={submitting} className="px-2.5 py-1 text-xs">
-          Add cron job
-        </Button>
-        <Button type="button" variant="secondary" onClick={onCancel} disabled={submitting} className="px-2.5 py-1 text-xs">
-          Cancel
-        </Button>
-      </div>
-    </form>
+    <Card className="mb-5">
+      <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-4" noValidate>
+        <div className="flex flex-wrap items-start gap-4">
+          <Field label="Schedule" hint={SCHEDULE_HINT} error={scheduleError ?? undefined}>
+            <Input mono required autoFocus placeholder="* * * * *" value={schedule} onChange={(event) => setSchedule(event.target.value)} className="w-56" />
+          </Field>
+          <Field label="Command" error={commandError ?? undefined}>
+            <Input mono required value={command} onChange={(event) => setCommand(event.target.value)} className="w-80" />
+          </Field>
+        </div>
+        {formError && (
+          <p role="alert" className="text-sm text-danger">
+            {formError}
+          </p>
+        )}
+        <div className="flex items-center gap-2">
+          <Button type="submit" loading={submitting}>
+            Add cron job
+          </Button>
+          <Button type="button" variant="outline" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
+        </div>
+      </form>
+    </Card>
   );
 }
 
@@ -206,62 +176,44 @@ function CronRow({
   }
 
   return (
-    <>
-      <tr className="h-11">
-        <td className="px-4 py-3">
-          <Chip>{cron.schedule}</Chip>
-        </td>
-        <td className="max-w-[360px] truncate px-4 py-3 font-mono text-xs text-ink-soft" title={cron.command}>
+    <div className="flex flex-col">
+      <div className="flex flex-wrap items-center gap-4 px-2 py-3">
+        <Chip>{cron.schedule}</Chip>
+        <span className="min-w-0 flex-1 truncate font-mono text-sm text-soft" title={cron.command}>
           {cron.command}
-        </td>
-        <td className="px-4 py-3 text-right">
-          <div className="flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={onToggleEdit}
-              className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              {editing ? 'Cancel' : 'Edit'}
-            </button>
-            <button
-              type="button"
-              onClick={() => setConfirmingDelete((open) => !open)}
-              className="rounded text-xs font-medium text-stop underline decoration-line underline-offset-2 hover:text-stop/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              Delete
-            </button>
-          </div>
-        </td>
-      </tr>
+        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="outline" size="sm" onClick={onToggleEdit}>
+            {editing ? 'Cancel' : 'Edit'}
+          </Button>
+          <Button variant="danger" size="sm" onClick={() => setConfirmingDelete((open) => !open)}>
+            Delete
+          </Button>
+        </div>
+      </div>
 
       {editing && (
-        <tr>
-          <td colSpan={TABLE_COLUMN_COUNT} className="border-t border-line bg-panel/60 px-4 py-3">
-            <EditCronForm projectId={projectId} cron={cron} onDone={onToggleEdit} onCancel={onToggleEdit} />
-          </td>
-        </tr>
+        <div className="mx-2 mb-3 rounded-xl bg-surface-2 px-4 py-3">
+          <EditCronForm projectId={projectId} cron={cron} onDone={onToggleEdit} onCancel={onToggleEdit} />
+        </div>
       )}
 
       {confirmingDelete && (
-        <tr>
-          <td colSpan={TABLE_COLUMN_COUNT} className="border-t border-line bg-stop/5 px-4 py-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-sm text-ink">
-                Delete cron job <Chip>{cron.schedule}</Chip>?
-              </p>
-              <div className="flex items-center gap-2">
-                <Button variant="secondary" className="px-2.5 py-1 text-xs" onClick={() => setConfirmingDelete(false)} disabled={deleting}>
-                  Cancel
-                </Button>
-                <Button variant="destructive" className="px-2.5 py-1 text-xs" loading={deleting} onClick={() => void handleDelete()}>
-                  Confirm
-                </Button>
-              </div>
-            </div>
-          </td>
-        </tr>
+        <div className="mx-2 mb-3 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-surface-2 px-4 py-3">
+          <p className="text-sm text-ink">
+            Delete cron job <Chip>{cron.schedule}</Chip>?
+          </p>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setConfirmingDelete(false)} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button variant="danger" size="sm" loading={deleting} onClick={() => void handleDelete()}>
+              Confirm
+            </Button>
+          </div>
+        </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -318,15 +270,15 @@ function EditCronForm({
         </Field>
       </div>
       {formError && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {formError}
         </p>
       )}
       <div className="flex items-center gap-2">
-        <Button type="submit" loading={saving} className="px-2.5 py-1 text-xs">
+        <Button type="submit" size="sm" loading={saving}>
           Save
         </Button>
-        <Button type="button" variant="secondary" onClick={onCancel} disabled={saving} className="px-2.5 py-1 text-xs">
+        <Button type="button" variant="outline" size="sm" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
       </div>
@@ -334,20 +286,15 @@ function EditCronForm({
   );
 }
 
-function TableSkeleton() {
+function CronSkeletonRows() {
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
-      <div className="bg-panel px-4 py-3">
-        <Skeleton className="h-3 w-32" />
-      </div>
-      <div className="divide-y divide-line">
-        {[0, 1, 2].map((row) => (
-          <div key={row} className="flex h-11 items-center gap-6 px-4">
-            <Skeleton className="h-4 w-24" />
-            <Skeleton className="h-4 flex-1" />
-          </div>
-        ))}
-      </div>
+    <div className="flex flex-col divide-y divide-line">
+      {[0, 1, 2].map((row) => (
+        <div key={row} className="flex h-14 items-center gap-4 px-2">
+          <Skeleton className="h-6 w-24 rounded-full" />
+          <Skeleton className="h-4 flex-1" />
+        </div>
+      ))}
     </div>
   );
 }

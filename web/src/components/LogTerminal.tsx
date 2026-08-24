@@ -6,6 +6,7 @@
  * "jump to latest" affordance once the reader scrolls up. No fake CRT effects.
  */
 import { useEffect, useRef, useState } from 'react';
+import { ArrowDown } from 'lucide-react';
 
 const TIMESTAMP_RE = /^\[\d{2}:\d{2}:\d{2}\]\s*/;
 
@@ -68,8 +69,12 @@ export function LogTerminal({ text, className = '' }: LogTerminalProps) {
         <button
           type="button"
           onClick={jumpToLatest}
-          className="absolute right-4 bottom-4 rounded-full bg-accent px-3 py-1.5 text-xs font-medium text-paper shadow-lg transition-colors duration-150 ease-out hover:bg-accent/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-term"
+          // Fixed dark chip (not theme-reactive) — the terminal keeps its own surface in both
+          // themes (DESIGN.md), so this affordance is built from white-alpha overlays, not tokens
+          // that flip with light/dark.
+          className="absolute right-4 bottom-4 inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/10 px-3.5 py-2 text-xs font-medium text-term-text shadow-lg backdrop-blur-sm transition-colors duration-150 ease-out hover:bg-white/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/40"
         >
+          <ArrowDown size={13} strokeWidth={1.75} aria-hidden />
           Jump to latest
         </button>
       )}
@@ -87,7 +92,7 @@ function LogLine({ line }: { line: string }) {
   return (
     <div className="whitespace-pre-wrap break-all">
       {timestamp && <span className="text-term-text/45">{timestamp}</span>}
-      <span className={isStage ? 'font-medium text-accent' : isError ? 'text-stop' : undefined}>{rest === '' ? ' ' : rest}</span>
+      <span className={isStage ? 'font-medium text-term-stage' : isError ? 'text-term-err' : undefined}>{rest === '' ? ' ' : rest}</span>
     </div>
   );
 }
