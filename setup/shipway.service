@@ -1,0 +1,26 @@
+# Installed by setup/install.sh to /etc/systemd/system/shipway.service.
+# Runs the Shipway tool itself: the Fastify monolith (API + web SPA +
+# webhook receiver + WS logs + deploy queue), listening on 127.0.0.1:8090
+# behind the nginx vhost setup/templates/nginx-dashboard.conf renders.
+#
+# Not a Shipway-managed "shipway-*" app/worker unit (those are rendered by
+# server/src/system/templates.ts for individual projects) — this is the
+# tool's own unit, installed once by install.sh/update.sh.
+
+[Unit]
+Description=Shipway deployment dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=deployer
+Group=deployer
+WorkingDirectory=/opt/shipway/server
+ExecStart=/opt/node/22/bin/node /opt/shipway/server/dist/index.js
+Environment=SHIPWAY_PORT=8090
+Environment=NODE_ENV=production
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

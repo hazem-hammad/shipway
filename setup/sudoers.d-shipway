@@ -1,0 +1,60 @@
+# /etc/sudoers.d/shipway-sysops
+#
+# Installed by setup/install.sh (as /etc/sudoers.d/shipway-sysops, mode 0440,
+# validated with `visudo -c -f` before it's ever put in place). Grants the
+# `deployer` user — the account Shipway's own process runs as — NOPASSWD
+# access to exactly the privileged commands `server/src/sysops/real.ts`
+# (RealSysOps) shells out to. Nothing else. See spec section 11 (Security).
+#
+# Validate this file directly with: visudo -c -f setup/sudoers.d-shipway
+#
+# --- Command path notes -----------------------------------------------
+# RealSysOps calls `execa('sudo', ['nginx', '-t'])` / `execa('sudo',
+# ['systemctl', ...])` — i.e. it invokes the bare command name, not an
+# absolute path. `sudo` resolves that name to an absolute path itself,
+# searching `secure_path` (Ubuntu's default:
+# /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin), and then
+# only allows the run if THAT resolved path matches a rule below. So the
+# paths here have to match where the packages actually put the binaries,
+# not just a plausible-looking guess:
+#
+#   systemctl -> /usr/bin/systemctl on Ubuntu 24.04. (/bin is a symlink to
+#     /usr/bin under usrmerge, and systemctl is never duplicated under
+#     /usr/sbin, so secure_path's search always lands on /usr/bin first —
+#     a /bin/systemctl rule would never actually be exercised and is
+#     deliberately omitted here.)
+#   nginx -> /usr/sbin/nginx, NOT /usr/bin/nginx. Ubuntu's nginx-core
+#     package (and every nginx-* variant built from it) installs the
+#     binary at /usr/sbin/nginx only; since /usr/sbin precedes /usr/bin in
+#     secure_path, that's also what a bare `sudo nginx -t` resolves to.
+#     Rules here must say /usr/sbin/nginx or `nginxTest()`/provisioning's
+#     `nginx -t` calls would be denied.
+# ------------------------------------------------------------------------
+
+# The whitelisted root helper — install/remove nginx vhosts and systemd
+# units. Path validation happens inside the helper itself
+# (setup/shipway-sysops); sudoers just allows it to run with any arguments.
+deployer ALL=(root) NOPASSWD: /usr/local/bin/shipway-sysops *
+
+# nginx: validate config, reload after a vhost install/remove.
+deployer ALL=(root) NOPASSWD: /usr/sbin/nginx -t
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl reload nginx
+
+# php-fpm: reload clears opcache after a php deploy. One rule per version
+# Shipway supports (spec: PHP 8.1-8.4 side by side via ondrej/php).
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl reload php8.1-fpm
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl reload php8.2-fpm
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl reload php8.3-fpm
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl reload php8.4-fpm
+
+# Pick up newly installed/removed unit files.
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload
+
+# Shipway-managed units only (shipway-app-<slug>, shipway-worker-<slug>-
+# <name>@<n>) — the `shipway-*` glob is the sudoers-side half of the same
+# `shipway-` prefix RealSysOps/assertUnitName enforce in code.
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl start shipway-*
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl stop shipway-*
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl restart shipway-*
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl enable shipway-*
+deployer ALL=(root) NOPASSWD: /usr/bin/systemctl disable shipway-*
