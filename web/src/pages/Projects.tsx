@@ -1,19 +1,64 @@
 /**
- * The projects table (DESIGN.md: "Projects page is a table, not a card grid: berth light, name,
- * slug.intcore.dev link (mono), type chip, last deploy (status + relative time + sha), deploy
- * button per row"). The status word and berth light are combined via `StatusBadge` in the first
- * column; the "last deploy" column then adds the relative time and short sha without repeating the
- * word.
+ * The Projects list (route `/projects`, DESIGN.md's Tables & lists): one card of hairline-separated
+ * 56px rows — status dot, name + subdomain link, type badge, last-deploy meta, a row Deploy button,
+ * and a ghosted chevron — composed entirely from `components/ui.tsx` primitives, matching Home.tsx's
+ * (Task 6) compositional style. The row's primary navigation is a real stretched `<Link>` layered
+ * behind the row's content; the subdomain link and the Deploy button are independently interactive
+ * elements raised above it (see ProjectRow's doc comment).
  */
 import { useState } from 'react';
 import { Link, useLocation, useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
-import { ApiError, deployProject, type LastDeployment, type ProjectListItem } from '../api';
+import { ArrowRight, ExternalLink, Plus } from 'lucide-react';
+import { ApiError, deployProject, type DeploymentStatus, type LastDeployment, type ProjectListItem, type ProjectType } from '../api';
 import { useProjects, useSettings } from '../hooks';
-import { StatusBadge } from '../components/StatusBadge';
-import { ProjectUrl } from '../components/ProjectUrl';
-import { Button, Chip, EmptyState, PageHeader, Skeleton } from '../components/ui';
 import { formatRelativeTime, shortSha } from '../lib/format';
+import {
+  Badge,
+  Button,
+  ButtonLink,
+  Card,
+  Chip,
+  ICON_STROKE,
+  PageHeader,
+  Skeleton,
+  StatusDot,
+  type StatusDotStatus,
+} from '../components/ui';
+
+const PROJECT_TYPE_LABEL: Record<ProjectType, string> = {
+  php: 'PHP',
+  node: 'Node',
+  nextjs: 'Next.js',
+  static: 'Static',
+};
+
+const DOT_STATUS_BY_DEPLOY: Record<DeploymentStatus, StatusDotStatus> = {
+  queued: 'warn',
+  running: 'warn',
+  success: 'ok',
+  failed: 'danger',
+  rolled_back: 'ok',
+  canceled: 'idle',
+};
+
+const DEPLOY_STATUS_LABEL: Record<DeploymentStatus, string> = {
+  queued: 'queued',
+  running: 'running',
+  success: 'success',
+  failed: 'failed',
+  rolled_back: 'rolled back',
+  canceled: 'canceled',
+};
+
+const DEPLOY_STATUS_TEXT_CLASS: Record<DeploymentStatus, string> = {
+  queued: 'text-warn',
+  running: 'text-warn',
+  success: 'text-ok',
+  failed: 'text-danger',
+  rolled_back: 'text-ok',
+  canceled: 'text-soft',
+};
 
 export default function ProjectsPage() {
   const projectsQuery = useProjects();
@@ -31,9 +76,9 @@ export default function ProjectsPage() {
     setDeployError(null);
     setDeployingId(project.id);
     try {
-      await deployProject(project.id);
+      const { deploymentId } = await deployProject(project.id);
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
-      navigate(`/projects/${String(project.id)}`);
+      navigate(`/projects/${String(project.id)}/deployments/${String(deploymentId)}`);
     } catch (err) {
       setDeployError(err instanceof ApiError ? err.message : 'Could not queue the deploy. Try again.');
     } finally {
@@ -45,80 +90,69 @@ export default function ProjectsPage() {
     <div>
       <PageHeader
         title="Projects"
+        subtitle="Everything Shipway deploys from your repositories"
         actions={
-          <Link
-            href="/projects/new"
-            className="inline-flex items-center justify-center rounded-md bg-accent px-3 py-2 text-sm font-medium text-paper transition-colors duration-150 ease-out hover:bg-accent/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-paper"
-          >
+          <ButtonLink href="/projects/new" variant="primary">
+            <Plus size={18} strokeWidth={2} aria-hidden />
             New project
-          </Link>
+          </ButtonLink>
         }
       />
 
       {deletedSlug && (
-        <p role="status" className="mb-4 flex items-center gap-2 text-sm text-go">
+        <p role="status" className="mb-4 flex items-center gap-2 text-sm text-ok">
           Project <Chip>{deletedSlug}</Chip> deleted.
         </p>
       )}
 
       {deployError && (
-        <p role="alert" className="mb-4 text-sm text-stop">
+        <p role="alert" className="mb-4 text-sm text-danger">
           {deployError}
         </p>
       )}
 
       {projectsQuery.isPending ? (
-        <TableSkeleton />
+        <Card>
+          <ProjectsSkeletonRows />
+        </Card>
       ) : projectsQuery.isError ? (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           Could not load projects.
         </p>
       ) : projectsQuery.data.length === 0 ? (
-        <EmptyState
-          message="No projects yet. Connect GitHub and create your first project."
-          action={{ label: 'New project', href: '/projects/new' }}
-        />
+        <ProjectsEmptyState />
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-line">
-          <table className="w-full min-w-[760px] border-collapse text-left text-sm">
-            <thead className="bg-panel text-xs font-medium text-ink-soft">
-              <tr>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Status
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Name
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  URL
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Type
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Last deploy
-                </th>
-                <th scope="col" className="px-4 py-2.5"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {projectsQuery.data.map((project) => (
-                <ProjectRow
-                  key={project.id}
-                  project={project}
-                  baseDomain={baseDomain}
-                  deploying={deployingId === project.id}
-                  onDeploy={() => void handleDeploy(project)}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Card>
+          <div className="divide-y divide-line">
+            {projectsQuery.data.map((project) => (
+              <ProjectRow
+                key={project.id}
+                project={project}
+                baseDomain={baseDomain}
+                deploying={deployingId === project.id}
+                onDeploy={() => void handleDeploy(project)}
+              />
+            ))}
+          </div>
+        </Card>
       )}
     </div>
   );
 }
 
+// ---------------------------------------------------------------------------
+// Row
+// ---------------------------------------------------------------------------
+
+/**
+ * The row is a relative container with the primary navigation rendered as a real, stretched
+ * `<Link>` (absolutely positioned, filling the row, `z-0`) instead of a hand-rolled
+ * `role="link"` + `onKeyDown` div — that gives the row native keyboard behavior (Enter
+ * activates it) and lets cmd/ctrl-click open it in a new tab, which the old click-handler
+ * pattern couldn't. The subdomain link and the Deploy button are genuinely independent
+ * interactive elements, so they're lifted above the stretched link with `relative z-10`
+ * instead of the old `stopPropagation` dance.
+ */
 function ProjectRow({
   project,
   baseDomain,
@@ -130,60 +164,122 @@ function ProjectRow({
   deploying: boolean;
   onDeploy: () => void;
 }) {
+  const dotStatus: StatusDotStatus = project.lastDeployment ? DOT_STATUS_BY_DEPLOY[project.lastDeployment.status] : 'idle';
+  const href = `/projects/${String(project.id)}`;
+
   return (
-    <tr className="h-11">
-      <td className="px-4 py-3">
-        <StatusBadge status={project.lastDeployment?.status ?? null} />
-      </td>
-      <td className="px-4 py-3 font-medium text-ink">{project.name}</td>
-      <td className="px-4 py-3">
-        <ProjectUrl slug={project.slug} baseDomain={baseDomain} />
-      </td>
-      <td className="px-4 py-3">
-        <Chip>{project.type}</Chip>
-      </td>
-      <td className="px-4 py-3">
-        <LastDeployCell lastDeployment={project.lastDeployment} />
-      </td>
-      <td className="px-4 py-3 text-right">
-        <Button variant="secondary" className="px-2.5 py-1 text-xs" loading={deploying} onClick={onDeploy}>
-          Deploy
-        </Button>
-      </td>
-    </tr>
+    <div className="group relative flex h-14 items-center gap-4 rounded-xl px-2 transition-colors duration-150 ease-out hover:bg-surface-2">
+      <Link
+        href={href}
+        aria-label={`Open ${project.name}`}
+        className="absolute inset-0 z-0 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      />
+
+      <StatusDot status={dotStatus} />
+
+      <div className="min-w-0 flex-1">
+        <div className="truncate text-lg font-semibold text-ink">{project.name}</div>
+        {baseDomain ? (
+          <a
+            href={`https://${project.slug}.${baseDomain}`}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="relative z-10 mt-0.5 inline-flex w-fit items-center gap-1 font-mono text-sm text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            {project.slug}.{baseDomain}
+            <ExternalLink size={12} strokeWidth={ICON_STROKE} aria-hidden />
+          </a>
+        ) : (
+          <span className="mt-0.5 block font-mono text-sm text-soft">{project.slug}</span>
+        )}
+      </div>
+
+      <Badge className="shrink-0">{PROJECT_TYPE_LABEL[project.type]}</Badge>
+
+      <div className="hidden w-36 shrink-0 flex-col items-end gap-0.5 sm:flex">
+        <LastDeployMeta lastDeployment={project.lastDeployment} />
+      </div>
+
+      <Button
+        variant="secondary"
+        size="sm"
+        loading={deploying}
+        className="relative z-10"
+        onClick={() => onDeploy()}
+      >
+        Deploy
+      </Button>
+
+      <ArrowRight
+        size={18}
+        strokeWidth={ICON_STROKE}
+        aria-hidden
+        className="shrink-0 text-icon opacity-60 transition-opacity duration-150 ease-out group-hover:opacity-100"
+      />
+    </div>
   );
 }
 
-function LastDeployCell({ lastDeployment }: { lastDeployment: LastDeployment | null }) {
+function LastDeployMeta({ lastDeployment }: { lastDeployment: LastDeployment | null }) {
   if (!lastDeployment) {
-    return <span className="text-ink-soft">Not deployed yet</span>;
+    return <span className="text-sm text-soft">Not deployed yet</span>;
   }
 
   return (
-    <span className="flex items-center gap-2 text-ink-soft">
-      {lastDeployment.finishedAt !== null && <span>{formatRelativeTime(lastDeployment.finishedAt)}</span>}
-      {lastDeployment.commitSha && <Chip>{shortSha(lastDeployment.commitSha)}</Chip>}
-    </span>
+    <>
+      <span className={`text-sm font-medium ${DEPLOY_STATUS_TEXT_CLASS[lastDeployment.status]}`}>
+        {DEPLOY_STATUS_LABEL[lastDeployment.status]}
+      </span>
+      <span className="flex items-center gap-1.5 text-xs text-soft">
+        {lastDeployment.finishedAt !== null && <span>{formatRelativeTime(lastDeployment.finishedAt)}</span>}
+        {lastDeployment.commitSha && <Chip>{shortSha(lastDeployment.commitSha)}</Chip>}
+      </span>
+    </>
   );
 }
 
-function TableSkeleton() {
+// ---------------------------------------------------------------------------
+// Empty state — the same CTA pair as Home's "Launch your first project".
+// ---------------------------------------------------------------------------
+
+function ProjectsEmptyState() {
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
-      <div className="bg-panel px-4 py-3">
-        <Skeleton className="h-3 w-32" />
+    <div className="flex flex-col items-center gap-2 rounded-2xl border border-line bg-surface px-8 py-14 text-center">
+      <h2 className="text-2xl font-semibold text-ink">Launch your first project</h2>
+      <p className="max-w-md text-lg text-soft">
+        Connect a repository and Shipway builds it, ships it, and hands you a live URL in minutes.
+      </p>
+      <div className="mt-4 flex items-center gap-2.5">
+        <ButtonLink href="/projects/new" variant="primary">
+          Create project
+        </ButtonLink>
+        <ButtonLink href="/projects/new" variant="secondary">
+          Import from GitHub
+        </ButtonLink>
       </div>
-      <div className="divide-y divide-line">
-        {[0, 1, 2, 3, 4].map((row) => (
-          <div key={row} className="flex h-11 items-center gap-6 px-4">
-            <Skeleton className="h-4 w-20" />
-            <Skeleton className="h-4 w-28" />
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Loading skeleton.
+// ---------------------------------------------------------------------------
+
+function ProjectsSkeletonRows() {
+  return (
+    <div className="divide-y divide-line">
+      {[0, 1, 2, 3, 4].map((row) => (
+        <div key={row} className="flex h-14 items-center gap-4 px-2">
+          <Skeleton className="h-2 w-2 rounded-full" />
+          <div className="min-w-0 flex-1">
             <Skeleton className="h-4 w-40" />
-            <Skeleton className="h-4 w-16" />
-            <Skeleton className="h-4 flex-1" />
+            <Skeleton className="mt-1.5 h-3 w-28" />
           </div>
-        ))}
-      </div>
+          <Skeleton className="h-6 w-14 rounded-full" />
+          <Skeleton className="hidden h-8 w-24 sm:block" />
+          <Skeleton className="h-8 w-16 rounded-xl" />
+        </div>
+      ))}
     </div>
   );
 }

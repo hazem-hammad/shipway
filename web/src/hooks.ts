@@ -1,6 +1,7 @@
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import {
   apiFetch,
+  fetchAuditConfig,
   fetchCronJobs,
   fetchDatabases,
   fetchDeployment,
@@ -8,7 +9,11 @@ import {
   fetchGithubBranches,
   fetchGithubRepos,
   fetchGithubStatus,
+  fetchGlobalDeployments,
+  fetchInvite,
   fetchMe,
+  fetchNotifications,
+  fetchOverview,
   fetchProject,
   fetchProjectEnv,
   fetchProjectEnvPreview,
@@ -20,14 +25,20 @@ import {
   fetchUsers,
   fetchWorkers,
   isPendingDeploymentStatus,
+  type AuditConfig,
   type CronJob,
   type DatabaseListItem,
   type Deployment,
   type GithubRepo,
   type GithubStatus,
+  type GlobalDeployment,
+  type InvitePreview,
   type Me,
+  type NotificationsMatrix,
+  type Overview,
   type Project,
   type ProjectListItem,
+  type Role,
   type ServerStats,
   type ServicesInfo,
   type Settings,
@@ -35,6 +46,15 @@ import {
   type User,
   type WorkerListItem,
 } from './api';
+
+/** `member < admin < owner`, mirroring `server/src/lib/authz.ts`'s `roleAtLeast` — the web app never
+ * enforces anything (every gate is server-side, and a 403 is always handled calmly), this is purely
+ * for deciding what controls to *show*. */
+const ROLE_RANK: Record<Role, number> = { member: 0, admin: 1, owner: 2 };
+
+export function roleAtLeast(role: Role | undefined, min: Role): boolean {
+  return role !== undefined && ROLE_RANK[role] >= ROLE_RANK[min];
+}
 
 /**
  * Whether an admin account exists yet. `retry: false` — an error here (network, 5xx) should
@@ -47,6 +67,28 @@ export function useSetupStatus(): UseQueryResult<SetupStatus> {
 /** The current session's user, or an error (typically a 401) when there isn't one. */
 export function useMe(): UseQueryResult<Me> {
   return useQuery({ queryKey: ['me'], queryFn: fetchMe, retry: false });
+}
+
+/** `true` once the session user's role has loaded and is admin or owner. `false` (not `undefined`)
+ * while pending, so an admin-only control defaults to hidden/disabled rather than flashing visible. */
+export function useIsAdmin(): boolean {
+  const me = useMe();
+  return roleAtLeast(me.data?.role, 'admin');
+}
+
+export function useIsOwner(): boolean {
+  const me = useMe();
+  return roleAtLeast(me.data?.role, 'owner');
+}
+
+/** Public invite preview (`GET /api/invite/:token`) for the unauthenticated accept page. */
+export function useInvitePreview(token: string): UseQueryResult<InvitePreview> {
+  return useQuery({ queryKey: ['invite', token], queryFn: () => fetchInvite(token), retry: false });
+}
+
+/** Home dashboard summary (`GET /api/overview`); refreshed every 30s per the task-6 ruling. */
+export function useOverview(): UseQueryResult<Overview> {
+  return useQuery({ queryKey: ['overview'], queryFn: fetchOverview, refetchInterval: 30_000 });
 }
 
 /**
@@ -77,6 +119,18 @@ export function useProjects(): UseQueryResult<ProjectListItem[]> {
     queryFn: fetchProjects,
     refetchInterval: (query) =>
       query.state.data?.some((project) => isPendingDeploymentStatus(project.lastDeployment?.status)) ? 10_000 : false,
+  });
+}
+
+/**
+ * The global Deployments page's list (`GET /api/deployments`, Task 5/7). Polls every 10s while any
+ * row is queued/running, else every 30s.
+ */
+export function useGlobalDeployments(): UseQueryResult<GlobalDeployment[]> {
+  return useQuery({
+    queryKey: ['deployments-global'],
+    queryFn: () => fetchGlobalDeployments(),
+    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 10_000 : 30_000),
   });
 }
 
@@ -161,8 +215,20 @@ export function useServerStats(): UseQueryResult<ServerStats> {
   return useQuery({ queryKey: ['server-stats'], queryFn: fetchServerStats, refetchInterval: 10_000 });
 }
 
-// ---- Settings > Users ----
+// ---- Settings > Team ----
 
 export function useUsers(): UseQueryResult<User[]> {
   return useQuery({ queryKey: ['users'], queryFn: fetchUsers });
+}
+
+// ---- Settings > Notifications ----
+
+export function useNotifications(): UseQueryResult<NotificationsMatrix> {
+  return useQuery({ queryKey: ['notifications'], queryFn: fetchNotifications });
+}
+
+// ---- Audit log ----
+
+export function useAuditConfig(): UseQueryResult<AuditConfig> {
+  return useQuery({ queryKey: ['audit-config'], queryFn: fetchAuditConfig });
 }

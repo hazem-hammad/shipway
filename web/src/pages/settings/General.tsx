@@ -5,31 +5,39 @@
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Settings as SettingsIcon } from 'lucide-react';
 import { ApiError, putSettings, type Settings } from '../../api';
 import { useSettings } from '../../hooks';
-import { Button, Field, Input, Skeleton } from '../../components/ui';
+import { Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
 
 export default function GeneralSection() {
   const settingsQuery = useSettings();
 
-  if (settingsQuery.isPending) {
-    return (
-      <div className="flex max-w-[640px] flex-col gap-4">
-        <Skeleton className="h-10 w-full" />
-        <Skeleton className="h-10 w-full" />
-        <Skeleton className="h-10 w-full" />
-      </div>
-    );
-  }
-  if (settingsQuery.isError || !settingsQuery.data) {
-    return (
-      <p role="alert" className="text-sm text-stop">
-        Could not load settings.
-      </p>
-    );
-  }
+  return (
+    <Card>
+      <CardHeader
+        icon={<SettingsIcon size={20} strokeWidth={ICON_STROKE} />}
+        title="General"
+        description="Domain and network configuration for this server."
+      />
 
-  return <GeneralForm settings={settingsQuery.data} />;
+      <div className="mt-5">
+        {settingsQuery.isPending ? (
+          <div className="flex max-w-[640px] flex-col gap-4">
+            <Skeleton className="h-11 w-full" />
+            <Skeleton className="h-11 w-full" />
+            <Skeleton className="h-11 w-full" />
+          </div>
+        ) : settingsQuery.isError || !settingsQuery.data ? (
+          <p role="alert" className="text-sm text-danger">
+            Could not load settings.
+          </p>
+        ) : (
+          <GeneralForm settings={settingsQuery.data} />
+        )}
+      </div>
+    </Card>
+  );
 }
 
 function GeneralForm({ settings }: { settings: Settings }) {
@@ -86,7 +94,7 @@ function GeneralForm({ settings }: { settings: Settings }) {
       </Field>
 
       {error && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}

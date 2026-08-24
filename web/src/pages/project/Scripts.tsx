@@ -1,29 +1,30 @@
 /**
- * Scripts tab: pre-deploy and post-deploy shell scripts, one Save (task-24 controller ruling).
+ * Scripts tab: pre-deploy and post-deploy shell scripts, each its own Card, one shared Save.
  * Ordering/semantics in the helper text mirror the pipeline exactly (see pipeline.ts's
  * runBuildPhase/runPostActivate): pre-deploy runs after code export + env write but before
  * install/build; post-deploy runs after the release is live and has passed its health check, and a
  * failure there does not roll the release back.
  */
 import { type FormEvent, useState } from 'react';
+import { PlayCircle, Rocket } from 'lucide-react';
 import { ApiError, patchProject, type Project } from '../../api';
 import { useProject } from '../../hooks';
-import { Button, Field, Skeleton, Textarea } from '../../components/ui';
+import { Button, Card, CardHeader, ICON_STROKE, Skeleton, Textarea } from '../../components/ui';
 
 export default function ScriptsTab({ projectId }: { projectId: number }) {
   const projectQuery = useProject(projectId);
 
   if (projectQuery.isPending) {
     return (
-      <div className="flex max-w-[720px] flex-col gap-4">
-        <Skeleton className="h-40 w-full" />
-        <Skeleton className="h-40 w-full" />
+      <div className="flex flex-col gap-5">
+        <Skeleton className="h-64 w-full rounded-2xl" />
+        <Skeleton className="h-64 w-full rounded-2xl" />
       </div>
     );
   }
   if (projectQuery.isError || !projectQuery.data) {
     return (
-      <p role="alert" className="text-sm text-stop">
+      <p role="alert" className="text-sm text-danger">
         Could not load scripts.
       </p>
     );
@@ -38,6 +39,14 @@ function ScriptsForm({ project }: { project: Project }) {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  function change(setter: (value: string) => void) {
+    return (value: string) => {
+      setter(value);
+      setDirty(true);
+      setError(null);
+    };
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -57,52 +66,50 @@ function ScriptsForm({ project }: { project: Project }) {
   }
 
   return (
-    <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[720px] flex-col gap-6" noValidate>
-      <p className="text-sm text-ink-soft">
-        Each script runs in the release directory with the project env, via bash. A non-zero exit fails the deploy, same as
-        `set -e`, so write scripts accordingly.
-      </p>
-
-      <Field label="Pre-deploy script" hint="Runs after export and env write, before install/build.">
+    <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-5" noValidate>
+      <Card>
+        <CardHeader
+          icon={<PlayCircle size={20} strokeWidth={ICON_STROKE} />}
+          title="Pre-deploy script"
+          description="Runs after export and env write, before install/build. A non-zero exit fails the deploy."
+        />
         <Textarea
           mono
           spellCheck={false}
           rows={10}
-          className="min-h-[240px]"
+          className="mt-4 min-h-[240px]"
+          aria-label="Pre-deploy script"
           value={preDeployScript}
-          onChange={(event) => {
-            setPreDeployScript(event.target.value);
-            setDirty(true);
-            setError(null);
-          }}
+          onChange={(event) => change(setPreDeployScript)(event.target.value)}
         />
-      </Field>
+      </Card>
 
-      <Field label="Post-deploy script" hint="Runs once the release is live and healthy. A failure here does not roll back.">
+      <Card>
+        <CardHeader
+          icon={<Rocket size={20} strokeWidth={ICON_STROKE} />}
+          title="Post-deploy script"
+          description="Runs once the release is live and healthy. A failure here does not roll back."
+        />
         <Textarea
           mono
           spellCheck={false}
           rows={10}
-          className="min-h-[240px]"
+          className="mt-4 min-h-[240px]"
+          aria-label="Post-deploy script"
           value={postDeployScript}
-          onChange={(event) => {
-            setPostDeployScript(event.target.value);
-            setDirty(true);
-            setError(null);
-          }}
+          onChange={(event) => change(setPostDeployScript)(event.target.value)}
         />
-      </Field>
+      </Card>
 
-      {error && (
-        <p role="alert" className="text-sm text-stop">
-          {error}
-        </p>
-      )}
-
-      <div>
+      <div className="flex flex-wrap items-center gap-3">
         <Button type="submit" loading={saving} disabled={!dirty || saving}>
-          Save scripts
+          Save
         </Button>
+        {error && (
+          <p role="alert" className="text-sm text-danger">
+            {error}
+          </p>
+        )}
       </div>
     </form>
   );

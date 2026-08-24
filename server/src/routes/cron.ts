@@ -2,6 +2,7 @@ import { eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { cronJobs, projects } from '../db/schema.js';
+import { getActor, recordAudit } from '../services/audit.js';
 import { syncCrontab, validateCronExpr, type CronDeps } from '../services/cron.js';
 
 type ProjectRow = typeof projects.$inferSelect;
@@ -128,6 +129,9 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'failed to create cron job' });
     }
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'cron.create', targetType: 'cron', targetName: created.command, meta: { project: project.slug } });
+
     return reply.code(201).send(created);
   });
 
@@ -179,6 +183,9 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'failed to update cron job' });
     }
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'cron.update', targetType: 'cron', targetName: updated.command, meta: { project: project.slug } });
+
     return updated;
   });
 
@@ -188,10 +195,11 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'cron job not found' });
     }
 
-    const cron = app.db.select().from(cronJobs).where(eq(cronJobs.id, paramsParsed.data.id)).get();
-    if (!cron) {
+    const found = getCronWithProject(app, paramsParsed.data.id);
+    if (!found) {
       return reply.code(404).send({ error: 'cron job not found' });
     }
+    const { cron, project } = found;
 
     app.db.delete(cronJobs).where(eq(cronJobs.id, cron.id)).run();
 
@@ -203,6 +211,9 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       // 204 can't carry one.
       return reply.code(502).send({ error: 'cron job deleted, but crontab sync failed', detail: toErrorMessage(err) });
     }
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'cron.delete', targetType: 'cron', targetName: cron.command, meta: { project: project.slug } });
 
     return reply.code(204).send();
   });

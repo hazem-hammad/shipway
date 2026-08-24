@@ -1,15 +1,16 @@
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, type ReactNode, useState } from 'react';
 import { useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
+import { Check, Cloud, GitBranch, Server, UserPlus } from 'lucide-react';
 import { ApiError, fetchGithubManifest, putSettings, setupAdmin, verifyCloudflare, type Me } from '../api';
 import { submitManifestForm } from '../lib/github';
-import { BerthLight, Button, Field, Input, Panel, ProgressRail } from '../components/ui';
+import { Button, Card, CardHeader, Field, ICON_STROKE, Input, StatusDot } from '../components/ui';
 
 const STEP_LABELS = ['Admin', 'Server', 'Cloudflare', 'GitHub'];
 
 /**
  * The first-run setup flow: create the admin account, then three optional-but-recommended
- * configuration steps, shown as inline progressive panels (never modals). Only step 1 is gated by
+ * configuration steps, shown as inline progressive cards (never modals). Only step 1 is gated by
  * the server (`GET /api/setup/status`'s `needsSetup` flips false the moment an admin exists) — the
  * rest is this component's own local progression, so a page reload mid-wizard drops back to the
  * normal dashboard rather than resuming; that's an acceptable trade for keeping the server's
@@ -29,16 +30,19 @@ export default function SetupWizard() {
     // Refreshing it before navigating away is what lets the app shell's routing gate move past
     // `/setup` instead of bouncing back to it.
     void queryClient.invalidateQueries({ queryKey: ['setup-status'] }).then(() => {
-      navigate('/projects');
+      navigate('/');
     });
   }
 
   return (
     <div className="mx-auto max-w-[640px] px-4 py-12">
-      <p className="mb-1 text-center text-lg font-semibold text-ink">Shipway</p>
-      <p className="mb-8 text-center text-sm text-ink-soft">Let&rsquo;s get your server set up.</p>
+      <div className="mb-9 flex flex-col items-center gap-3">
+        <img src="/logo.png" alt="" className="h-10 w-10" />
+        <span className="text-2xl font-semibold text-ink">Shipway</span>
+        <p className="text-lg text-soft">Let&rsquo;s get your server set up.</p>
+      </div>
 
-      <ProgressRail steps={STEP_LABELS} currentIndex={step - 1} />
+      <Stepper steps={STEP_LABELS} currentIndex={step - 1} />
 
       <div className="flex flex-col gap-4">
         {step === 1 ? (
@@ -79,18 +83,70 @@ export default function SetupWizard() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Stepper — numbered dots + labels + connecting hairlines (DESIGN.md). Active dot = primary
+// fill; a completed step's dot turns ok-fill with a Check glyph instead of its number.
+// ---------------------------------------------------------------------------
+
+function Stepper({ steps, currentIndex }: { steps: string[]; currentIndex: number }) {
+  return (
+    <ol className="mb-9 flex items-start">
+      {steps.map((label, index) => {
+        const done = index < currentIndex;
+        const active = index === currentIndex;
+        return (
+          <li key={label} className="flex flex-1 items-start last:flex-none">
+            <div className="flex flex-col items-center gap-2">
+              <span
+                aria-hidden
+                className={`grid h-7 w-7 shrink-0 place-items-center rounded-full text-xs font-semibold transition-colors duration-150 ease-out ${
+                  done
+                    ? 'bg-ok text-white'
+                    : active
+                      ? 'bg-primary text-primary-fg'
+                      : 'border border-line bg-surface text-soft'
+                }`}
+              >
+                {done ? <Check size={14} strokeWidth={2.5} /> : index + 1}
+              </span>
+              <span className={`text-xs font-medium whitespace-nowrap ${active || done ? 'text-ink' : 'text-soft'}`}>{label}</span>
+            </div>
+            {index < steps.length - 1 && (
+              <span aria-hidden className={`mx-2 mt-3.5 h-px flex-1 ${done ? 'bg-ok' : 'bg-line'}`} />
+            )}
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Done row — a completed step collapses to a quiet surface-2 summary row.
+// ---------------------------------------------------------------------------
+
 function DoneRow({ label, detail, mono = false }: { label: string; detail: string; mono?: boolean }) {
   return (
-    <div className="flex items-center gap-3 rounded-lg border border-line bg-panel/40 px-4 py-3">
-      <BerthLight status="go" />
+    <div className="flex items-center gap-3 rounded-xl border border-line bg-surface-2 px-4 py-3">
+      <StatusDot status="ok" />
       <span className="text-sm font-medium text-ink">{label}</span>
-      {detail && <span className={`truncate text-sm text-ink-soft ${mono ? 'font-mono' : ''}`}>{detail}</span>}
+      {detail && <span className={`truncate text-sm text-soft ${mono ? 'font-mono' : ''}`}>{detail}</span>}
     </div>
   );
 }
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Something went wrong. Try again.';
+}
+
+/** Card-header pattern shared by every step (DESIGN.md Cards). */
+function StepCard({ icon, title, description, children }: { icon: ReactNode; title: string; description: string; children: ReactNode }) {
+  return (
+    <Card>
+      <CardHeader icon={icon} title={title} description={description} />
+      <div className="mt-5">{children}</div>
+    </Card>
+  );
 }
 
 // ---- Step 1: admin account ----
@@ -117,9 +173,11 @@ function AdminStep({ onDone }: { onDone: (me: Me) => void }) {
   }
 
   return (
-    <Panel>
-      <h2 className="mb-1 text-base font-semibold text-ink">Create the admin account</h2>
-      <p className="mb-4 text-sm text-ink-soft">This is the first user. Add teammates later from Settings.</p>
+    <StepCard
+      icon={<UserPlus size={20} strokeWidth={ICON_STROKE} />}
+      title="Create the admin account"
+      description="This is the first user. Add teammates later from Settings."
+    >
       <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-4" noValidate>
         <Field label="Name">
           <Input required autoFocus value={name} onChange={(event) => setName(event.target.value)} />
@@ -131,7 +189,7 @@ function AdminStep({ onDone }: { onDone: (me: Me) => void }) {
           <Input type="password" required minLength={8} value={password} onChange={(event) => setPassword(event.target.value)} />
         </Field>
         {error && (
-          <p role="alert" className="text-sm text-stop">
+          <p role="alert" className="text-sm text-danger">
             {error}
           </p>
         )}
@@ -139,7 +197,7 @@ function AdminStep({ onDone }: { onDone: (me: Me) => void }) {
           Create account
         </Button>
       </form>
-    </Panel>
+    </StepCard>
   );
 }
 
@@ -179,9 +237,11 @@ function ServerSettingsStep({ onDone }: { onDone: (baseDomain: string, serverIp:
   }
 
   return (
-    <Panel>
-      <h2 className="mb-1 text-base font-semibold text-ink">Server settings</h2>
-      <p className="mb-4 text-sm text-ink-soft">Where deployed apps live and who issues their TLS certificates.</p>
+    <StepCard
+      icon={<Server size={20} strokeWidth={ICON_STROKE} />}
+      title="Server settings"
+      description="Where deployed apps live and who issues their TLS certificates."
+    >
       <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-4" noValidate>
         <Field label="Base domain" hint="Projects deploy to <slug>.<this domain>.">
           <Input
@@ -200,7 +260,7 @@ function ServerSettingsStep({ onDone }: { onDone: (baseDomain: string, serverIp:
           <Input type="email" required value={acmeEmail} onChange={(event) => setAcmeEmail(event.target.value)} />
         </Field>
         {error && (
-          <p role="alert" className="text-sm text-stop">
+          <p role="alert" className="text-sm text-danger">
             {error}
           </p>
         )}
@@ -208,7 +268,7 @@ function ServerSettingsStep({ onDone }: { onDone: (baseDomain: string, serverIp:
           Save and continue
         </Button>
       </form>
-    </Panel>
+    </StepCard>
   );
 }
 
@@ -252,9 +312,11 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
   }
 
   return (
-    <Panel>
-      <h2 className="mb-1 text-base font-semibold text-ink">Cloudflare</h2>
-      <p className="mb-4 text-sm text-ink-soft">Shipway creates the DNS record for each project&rsquo;s subdomain.</p>
+    <StepCard
+      icon={<Cloud size={20} strokeWidth={ICON_STROKE} />}
+      title="Cloudflare"
+      description="Shipway creates the DNS record for each project&rsquo;s subdomain."
+    >
       <form onSubmit={(event) => void handleSave(event)} className="flex flex-col gap-4" noValidate>
         <Field label="API token" hint="A scoped token with DNS edit access to your zone.">
           <Input
@@ -281,7 +343,7 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
           />
         </Field>
         {error && (
-          <p role="alert" className="text-sm text-stop">
+          <p role="alert" className="text-sm text-danger">
             {error}
           </p>
         )}
@@ -292,8 +354,8 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
           <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!saved}>
             Test connection
           </Button>
-          {testResult === 'ok' && <span className="text-sm text-go">Connected.</span>}
-          {testResult === 'fail' && <span className="text-sm text-stop">Could not verify the token.</span>}
+          {testResult === 'ok' && <span className="text-sm text-ok">Connected.</span>}
+          {testResult === 'fail' && <span className="text-sm text-danger">Could not verify the token.</span>}
         </div>
       </form>
       {saved && (
@@ -301,7 +363,7 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
           Continue
         </Button>
       )}
-    </Panel>
+    </StepCard>
   );
 }
 
@@ -325,14 +387,13 @@ function GithubStep({ onSkip }: { onSkip: () => void }) {
   }
 
   return (
-    <Panel>
-      <h2 className="mb-1 text-base font-semibold text-ink">GitHub App</h2>
-      <p className="mb-4 text-sm text-ink-soft">
-        Shipway deploys from GitHub through a GitHub App scoped to the repositories you choose. Creating one takes you to
-        GitHub and back.
-      </p>
+    <StepCard
+      icon={<GitBranch size={20} strokeWidth={ICON_STROKE} />}
+      title="GitHub App"
+      description="Shipway deploys from GitHub through a GitHub App scoped to the repositories you choose. Creating one takes you to GitHub and back."
+    >
       {error && (
-        <p role="alert" className="mb-4 text-sm text-stop">
+        <p role="alert" className="mb-4 text-sm text-danger">
           {error}
         </p>
       )}
@@ -343,11 +404,11 @@ function GithubStep({ onSkip }: { onSkip: () => void }) {
         <button
           type="button"
           onClick={onSkip}
-          className="rounded text-sm font-medium text-ink-soft underline decoration-line underline-offset-2 transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          className="rounded text-sm font-medium text-soft underline decoration-line underline-offset-2 transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
         >
           I&rsquo;ll do this later
         </button>
       </div>
-    </Panel>
+    </StepCard>
   );
 }

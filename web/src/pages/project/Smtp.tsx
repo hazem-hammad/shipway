@@ -1,14 +1,15 @@
 /**
- * SMTP tab: mailpit (default) / custom / none, per the task-24 controller ruling. The server never
- * returns a saved custom config back to the client (`toPublicProject` strips `smtpConfigEncrypted`
- * — see server/src/routes/projects.ts), so switching into "custom" always starts from blank fields;
- * saving replaces the whole stored config.
+ * SMTP tab: mailpit (default) / custom / none, as horizontal radio-cards. The server never returns
+ * a saved custom config back to the client (`toPublicProject` strips `smtpConfigEncrypted` — see
+ * server/src/routes/projects.ts), so switching into "custom" always starts from blank fields; saving
+ * replaces the whole stored config.
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Mail } from 'lucide-react';
 import { ApiError, putProjectSmtp, type Project } from '../../api';
 import { useProject, useSettings } from '../../hooks';
-import { Button, Field, Input, Skeleton } from '../../components/ui';
+import { Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
 
 type SmtpMode = 'mailpit' | 'custom' | 'none';
 
@@ -23,11 +24,11 @@ export default function SmtpTab({ projectId }: { projectId: number }) {
   const settingsQuery = useSettings();
 
   if (projectQuery.isPending) {
-    return <Skeleton className="h-64 w-full max-w-[640px]" />;
+    return <Skeleton className="h-80 w-full rounded-2xl" />;
   }
   if (projectQuery.isError || !projectQuery.data) {
     return (
-      <p role="alert" className="text-sm text-stop">
+      <p role="alert" className="text-sm text-danger">
         Could not load SMTP settings.
       </p>
     );
@@ -89,120 +90,125 @@ function SmtpForm({ project, baseDomain }: { project: Project; baseDomain: strin
   const canSubmit = dirty && !saving && (mode !== 'custom' || (host.trim() !== '' && port.trim() !== ''));
 
   return (
-    <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[640px] flex-col gap-6" noValidate>
-      <div role="radiogroup" aria-label="SMTP mode" className="flex flex-col gap-2">
-        {SMTP_OPTIONS.map((option) => (
-          <label
-            key={option.value}
-            className={`flex items-start gap-2 rounded-md border px-3 py-2.5 transition-colors duration-150 ease-out ${
-              mode === option.value ? 'border-accent bg-accent-soft' : 'border-line bg-paper hover:bg-panel'
-            }`}
-          >
-            <input
-              type="radio"
-              name="smtp-mode"
-              value={option.value}
-              checked={mode === option.value}
-              onChange={() => {
-                setMode(option.value);
-                markDirty();
-              }}
-              className="mt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-              style={{ accentColor: 'var(--color-accent)' }}
-            />
-            <span>
-              <span className="block text-sm font-medium text-ink">{option.label}</span>
-              <span className="block text-xs text-ink-soft">{option.blurb}</span>
-            </span>
-          </label>
-        ))}
-      </div>
+    <Card>
+      <CardHeader icon={<Mail size={20} strokeWidth={ICON_STROKE} />} title="SMTP" description="How this project sends mail." />
 
-      {mode === 'mailpit' && (
-        <p className="font-mono text-xs text-ink-soft">127.0.0.1:1025{baseDomain ? `, view at mail.${baseDomain}` : ''}</p>
-      )}
-
-      {mode === 'custom' && (
-        <div className="flex flex-col gap-4">
-          <Field label="Host">
-            <Input
-              mono
-              required
-              value={host}
-              onChange={(event) => {
-                setHost(event.target.value);
-                markDirty();
-              }}
-            />
-          </Field>
-          <Field label="Port">
-            <Input
-              mono
-              required
-              type="number"
-              value={port}
-              onChange={(event) => {
-                setPort(event.target.value);
-                markDirty();
-              }}
-            />
-          </Field>
-          <Field label="Username" hint="Optional.">
-            <Input
-              mono
-              value={username}
-              onChange={(event) => {
-                setUsername(event.target.value);
-                markDirty();
-              }}
-            />
-          </Field>
-          <Field label="Password" hint="Optional.">
-            <Input
-              mono
-              type="password"
-              value={password}
-              onChange={(event) => {
-                setPassword(event.target.value);
-                markDirty();
-              }}
-            />
-          </Field>
-          <Field label="From address" hint="Optional.">
-            <Input
-              mono
-              type="email"
-              value={fromAddress}
-              onChange={(event) => {
-                setFromAddress(event.target.value);
-                markDirty();
-              }}
-            />
-          </Field>
-          <Field label="Encryption" hint="tls, ssl, or leave empty for none.">
-            <Input
-              mono
-              value={encryption}
-              onChange={(event) => {
-                setEncryption(event.target.value);
-                markDirty();
-              }}
-            />
-          </Field>
+      <form onSubmit={(event) => void handleSubmit(event)} className="mt-5 flex max-w-[640px] flex-col gap-5" noValidate>
+        <div role="radiogroup" aria-label="SMTP mode" className="flex flex-col gap-2">
+          {SMTP_OPTIONS.map((option) => (
+            <label
+              key={option.value}
+              className={`flex items-start gap-3 rounded-xl border px-4 py-3.5 transition-colors duration-150 ease-out ${
+                mode === option.value ? 'border-focus bg-surface-2' : 'border-line bg-surface hover:bg-surface-2'
+              }`}
+            >
+              <input
+                type="radio"
+                name="smtp-mode"
+                value={option.value}
+                checked={mode === option.value}
+                onChange={() => {
+                  setMode(option.value);
+                  markDirty();
+                }}
+                className="mt-1 h-4 w-4 accent-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+              />
+              <span>
+                <span className="block text-base font-semibold text-ink">{option.label}</span>
+                <span className="block text-sm text-soft">{option.blurb}</span>
+              </span>
+            </label>
+          ))}
         </div>
-      )}
 
-      {error && (
-        <p role="alert" className="text-sm text-stop">
-          {error}
-        </p>
-      )}
+        {mode === 'mailpit' && (
+          <p className="rounded-xl bg-surface-2 px-4 py-3 font-mono text-sm text-soft">
+            127.0.0.1:1025{baseDomain ? `, view at mail.${baseDomain}` : ''}
+          </p>
+        )}
 
-      <div>
-        <Button type="submit" loading={saving} disabled={!canSubmit}>
-          Save SMTP
-        </Button>
-      </div>
-    </form>
+        {mode === 'custom' && (
+          <div className="flex flex-col gap-4 rounded-xl bg-surface-2 p-4">
+            <Field label="Host">
+              <Input
+                mono
+                required
+                value={host}
+                onChange={(event) => {
+                  setHost(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="Port">
+              <Input
+                mono
+                required
+                type="number"
+                value={port}
+                onChange={(event) => {
+                  setPort(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="Username" hint="Optional.">
+              <Input
+                mono
+                value={username}
+                onChange={(event) => {
+                  setUsername(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="Password" hint="Optional.">
+              <Input
+                mono
+                type="password"
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="From address" hint="Optional.">
+              <Input
+                mono
+                type="email"
+                value={fromAddress}
+                onChange={(event) => {
+                  setFromAddress(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="Encryption" hint="tls, ssl, or leave empty for none.">
+              <Input
+                mono
+                value={encryption}
+                onChange={(event) => {
+                  setEncryption(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+          </div>
+        )}
+
+        {error && (
+          <p role="alert" className="text-sm text-danger">
+            {error}
+          </p>
+        )}
+
+        <div>
+          <Button type="submit" loading={saving} disabled={!canSubmit}>
+            Save
+          </Button>
+        </div>
+      </form>
+    </Card>
   );
 }

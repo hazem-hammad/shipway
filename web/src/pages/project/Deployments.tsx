@@ -1,119 +1,90 @@
 /**
- * Deployments tab (route "/", nested under ProjectLayout): the deploy history table plus the
- * Deploy button in the tab's own page-title row (DESIGN.md: "page title row (title + primary
- * action right-aligned)", same button as the Projects table's row action). Rollback uses an inline
- * confirm row expansion, never a modal (DESIGN.md bans modals).
+ * Deployments tab (route "/", nested under ProjectLayout): the deploy history, rows built the same
+ * way as the global Deployments page (DESIGN.md's Tables & lists) — one Card of hairline-separated
+ * rows. The Deploy button itself lives in ProjectLayout's header card now, not here. Rollback uses
+ * an inline `--surface-2` confirm-row expansion, never a modal (DESIGN.md bans modals).
  */
 import { useState } from 'react';
-import { Link, useLocation } from 'wouter';
+import { Link } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
+import { ArrowRight } from 'lucide-react';
 import {
   ApiError,
   cancelDeployment,
-  deployProject,
   isPendingDeploymentStatus,
   rollbackProject,
   type Deployment,
+  type DeploymentStatus,
 } from '../../api';
 import { useDeployments } from '../../hooks';
-import { StatusBadge } from '../../components/StatusBadge';
 import { DurationText } from '../../components/Duration';
-import { Button, Chip, EmptyState, PageHeader, Skeleton } from '../../components/ui';
+import { Button, Card, Chip, EmptyState, ICON_STROKE, Skeleton, StatusDot, type StatusDotStatus } from '../../components/ui';
 import { formatRelativeTime, shortSha } from '../../lib/format';
 
-const TABLE_COLUMN_COUNT = 7;
+const DOT_STATUS_BY_DEPLOY: Record<DeploymentStatus, StatusDotStatus> = {
+  queued: 'warn',
+  running: 'warn',
+  success: 'ok',
+  failed: 'danger',
+  rolled_back: 'ok',
+  canceled: 'idle',
+};
+
+const DEPLOY_STATUS_LABEL: Record<DeploymentStatus, string> = {
+  queued: 'queued',
+  running: 'running',
+  success: 'success',
+  failed: 'failed',
+  rolled_back: 'rolled back',
+  canceled: 'canceled',
+};
+
+const DEPLOY_STATUS_TEXT_CLASS: Record<DeploymentStatus, string> = {
+  queued: 'text-warn',
+  running: 'text-warn',
+  success: 'text-ok',
+  failed: 'text-danger',
+  rolled_back: 'text-ok',
+  canceled: 'text-soft',
+};
+
+const TRIGGER_LABEL: Record<Deployment['trigger'], string> = {
+  push: 'push',
+  manual: 'manual',
+  rollback: 'rollback',
+};
 
 export default function DeploymentsTab({ projectId }: { projectId: number }) {
   const deploymentsQuery = useDeployments(projectId);
-  const queryClient = useQueryClient();
-  const [, navigate] = useLocation();
-  const [deploying, setDeploying] = useState(false);
-  const [deployError, setDeployError] = useState<string | null>(null);
   const [confirmingId, setConfirmingId] = useState<number | null>(null);
-
-  async function handleDeploy() {
-    setDeployError(null);
-    setDeploying(true);
-    try {
-      const { deploymentId } = await deployProject(projectId);
-      await queryClient.invalidateQueries({ queryKey: ['deployments', projectId] });
-      await queryClient.invalidateQueries({ queryKey: ['projects'] });
-      navigate(`/deployments/${String(deploymentId)}`);
-    } catch (err) {
-      setDeployError(err instanceof ApiError ? err.message : 'Could not queue the deploy. Try again.');
-    } finally {
-      setDeploying(false);
-    }
-  }
 
   return (
     <div>
-      <PageHeader
-        title="Deployments"
-        actions={
-          <Button loading={deploying} onClick={() => void handleDeploy()}>
-            Deploy
-          </Button>
-        }
-      />
-
-      {deployError && (
-        <p role="alert" className="mb-4 text-sm text-stop">
-          {deployError}
-        </p>
-      )}
-
       {deploymentsQuery.isPending ? (
-        <TableSkeleton />
+        <Card>
+          <DeploymentsSkeletonRows />
+        </Card>
       ) : deploymentsQuery.isError ? (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           Could not load deployments.
         </p>
       ) : deploymentsQuery.data.length === 0 ? (
-        <EmptyState message="No deployments yet. Deploy to see it stream here." />
+        <EmptyState message="No deployments yet. Hit Deploy above to see it stream here." />
       ) : (
-        <div className="overflow-x-auto rounded-lg border border-line">
-          <table className="w-full min-w-[880px] border-collapse text-left text-sm">
-            <thead className="bg-panel text-xs font-medium text-ink-soft">
-              <tr>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Status
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Trigger
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Commit
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Message
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Duration
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Started
-                </th>
-                <th scope="col" className="px-4 py-2.5"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
-              {deploymentsQuery.data.map((deployment) => (
-                <DeploymentRow
-                  key={deployment.id}
-                  projectId={projectId}
-                  deployment={deployment}
-                  confirmingRollback={confirmingId === deployment.id}
-                  onToggleRollback={() => setConfirmingId((current) => (current === deployment.id ? null : deployment.id))}
-                  onRolledBack={(newId) => {
-                    setConfirmingId(null);
-                    navigate(`/deployments/${String(newId)}`);
-                  }}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Card>
+          <div className="flex flex-col divide-y divide-line">
+            {deploymentsQuery.data.map((deployment) => (
+              <DeploymentRow
+                key={deployment.id}
+                projectId={projectId}
+                deployment={deployment}
+                confirmingRollback={confirmingId === deployment.id}
+                onToggleRollback={() => setConfirmingId((current) => (current === deployment.id ? null : deployment.id))}
+                onRolledBack={() => setConfirmingId(null)}
+              />
+            ))}
+          </div>
+        </Card>
       )}
     </div>
   );
@@ -130,7 +101,7 @@ function DeploymentRow({
   deployment: Deployment;
   confirmingRollback: boolean;
   onToggleRollback: () => void;
-  onRolledBack: (deploymentId: number) => void;
+  onRolledBack: () => void;
 }) {
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
@@ -138,6 +109,7 @@ function DeploymentRow({
 
   const pending = isPendingDeploymentStatus(deployment.status);
   const canRollback = deployment.status === 'success' && deployment.releasePath !== null;
+  const dotStatus = DOT_STATUS_BY_DEPLOY[deployment.status];
 
   async function handleCancel() {
     setRowError(null);
@@ -157,10 +129,10 @@ function DeploymentRow({
     setRowError(null);
     setBusy(true);
     try {
-      const { deploymentId } = await rollbackProject(projectId, deployment.releasePath);
+      await rollbackProject(projectId, deployment.releasePath);
       await queryClient.invalidateQueries({ queryKey: ['deployments', projectId] });
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
-      onRolledBack(deploymentId);
+      onRolledBack();
     } catch (err) {
       setRowError(err instanceof ApiError ? err.message : 'Could not roll back. Try again.');
       setBusy(false);
@@ -168,68 +140,76 @@ function DeploymentRow({
   }
 
   return (
-    <>
-      <tr className="h-11">
-        <td className="px-4 py-3">
-          <StatusBadge status={deployment.status} />
-        </td>
-        <td className="px-4 py-3 text-ink-soft">{deployment.trigger}</td>
-        <td className="px-4 py-3">
-          {deployment.commitSha ? <Chip>{shortSha(deployment.commitSha)}</Chip> : <span className="text-ink-soft">not set</span>}
-        </td>
-        <td className="max-w-[280px] truncate px-4 py-3 text-ink-soft" title={deployment.commitMessage ?? undefined}>
-          {deployment.commitMessage ?? 'not set'}
-        </td>
-        <td className="px-4 py-3">
+    <div className="flex flex-col">
+      <div className="flex flex-wrap items-center gap-4 px-2 py-3">
+        <div className="flex w-28 shrink-0 items-center gap-2">
+          <StatusDot status={dotStatus} />
+          <span className={`text-sm font-medium ${DEPLOY_STATUS_TEXT_CLASS[deployment.status]}`}>
+            {DEPLOY_STATUS_LABEL[deployment.status]}
+          </span>
+        </div>
+
+        <Chip>{TRIGGER_LABEL[deployment.trigger]}</Chip>
+
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          {deployment.commitSha && <Chip>{shortSha(deployment.commitSha)}</Chip>}
+          <span className="min-w-0 flex-1 truncate text-sm text-soft" title={deployment.commitMessage ?? undefined}>
+            {deployment.commitMessage ?? 'no commit message'}
+          </span>
+        </div>
+
+        <div className="hidden w-16 shrink-0 text-right sm:block">
           <DurationText deployment={deployment} />
-        </td>
-        <td className="px-4 py-3 text-ink-soft">{deployment.startedAt !== null ? formatRelativeTime(deployment.startedAt) : 'queued'}</td>
-        <td className="px-4 py-3 text-right">
-          <div className="flex items-center justify-end gap-2">
-            <Link
-              href={`/deployments/${String(deployment.id)}`}
-              className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              View log
-            </Link>
-            {pending && (
-              <Button variant="destructive" className="px-2.5 py-1 text-xs" loading={busy} onClick={() => void handleCancel()}>
+        </div>
+
+        <div className="hidden w-28 shrink-0 text-right text-xs text-soft md:block">
+          {deployment.startedAt !== null ? formatRelativeTime(deployment.startedAt) : 'queued'}
+        </div>
+
+        <div className="flex shrink-0 items-center gap-1.5">
+          <Link
+            href={`/deployments/${String(deployment.id)}`}
+            className="inline-flex items-center gap-1 rounded-lg px-2 py-1.5 text-sm font-medium text-ink transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            View log
+            <ArrowRight size={14} strokeWidth={ICON_STROKE} aria-hidden />
+          </Link>
+          {pending && (
+            <Button variant="danger" size="sm" loading={busy} onClick={() => void handleCancel()}>
+              Cancel
+            </Button>
+          )}
+          {canRollback && (
+            <Button variant="secondary" size="sm" onClick={onToggleRollback} disabled={busy}>
+              Roll back
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {confirmingRollback && (
+        <div className="mx-2 mb-3 flex flex-col gap-2 rounded-xl bg-surface-2 px-4 py-3">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-sm text-ink">
+              Roll back to release <Chip>{releaseBasename(deployment.releasePath)}</Chip>? This restarts the app on that release.
+            </p>
+            <div className="flex shrink-0 items-center gap-2">
+              <Button variant="outline" size="sm" onClick={onToggleRollback} disabled={busy}>
                 Cancel
               </Button>
-            )}
-            {canRollback && (
-              <Button variant="secondary" className="px-2.5 py-1 text-xs" onClick={onToggleRollback} disabled={busy}>
-                Roll back
+              <Button size="sm" loading={busy} onClick={() => void handleRollback()}>
+                Confirm
               </Button>
-            )}
-          </div>
-        </td>
-      </tr>
-      {confirmingRollback && (
-        <tr>
-          <td colSpan={TABLE_COLUMN_COUNT} className="border-t border-line bg-panel/60 px-4 py-3">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-sm text-ink">
-                Roll back to release <Chip>{releaseBasename(deployment.releasePath)}</Chip>? This restarts the app on that release.
-              </p>
-              <div className="flex items-center gap-2">
-                <Button variant="secondary" className="px-2.5 py-1 text-xs" onClick={onToggleRollback} disabled={busy}>
-                  Cancel
-                </Button>
-                <Button className="px-2.5 py-1 text-xs" loading={busy} onClick={() => void handleRollback()}>
-                  Confirm
-                </Button>
-              </div>
             </div>
-            {rowError && (
-              <p role="alert" className="mt-2 text-xs text-stop">
-                {rowError}
-              </p>
-            )}
-          </td>
-        </tr>
+          </div>
+          {rowError && (
+            <p role="alert" className="text-xs text-danger">
+              {rowError}
+            </p>
+          )}
+        </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -239,23 +219,20 @@ function releaseBasename(releasePath: string | null): string {
   return segments[segments.length - 1] || releasePath;
 }
 
-function TableSkeleton() {
+function DeploymentsSkeletonRows() {
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
-      <div className="bg-panel px-4 py-3">
-        <Skeleton className="h-3 w-32" />
-      </div>
-      <div className="divide-y divide-line">
-        {[0, 1, 2, 3].map((row) => (
-          <div key={row} className="flex h-11 items-center gap-6 px-4">
-            <Skeleton className="h-4 w-20" />
-            <Skeleton className="h-4 w-16" />
-            <Skeleton className="h-4 w-20" />
-            <Skeleton className="h-4 flex-1" />
-            <Skeleton className="h-4 w-16" />
+    <div className="flex flex-col divide-y divide-line">
+      {[0, 1, 2, 3].map((row) => (
+        <div key={row} className="flex h-14 items-center gap-4 px-2">
+          <div className="flex w-28 shrink-0 items-center gap-2">
+            <Skeleton className="h-2 w-2 rounded-full" />
+            <Skeleton className="h-4 w-14" />
           </div>
-        ))}
-      </div>
+          <Skeleton className="h-6 w-16 rounded-full" />
+          <Skeleton className="h-4 flex-1" />
+          <Skeleton className="hidden h-4 w-12 sm:block" />
+        </div>
+      ))}
     </div>
   );
 }

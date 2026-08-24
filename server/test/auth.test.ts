@@ -64,7 +64,7 @@ describe('first-run setup + auth', () => {
 
     const me = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie } });
     expect(me.statusCode).toBe(200);
-    expect(me.json()).toMatchObject({ name: ADMIN.name, email: ADMIN.email });
+    expect(me.json()).toMatchObject({ name: ADMIN.name, email: ADMIN.email, role: 'owner' });
 
     const secondCreate = await app.inject({
       method: 'POST',
@@ -125,7 +125,49 @@ describe('first-run setup + auth', () => {
 
     const me = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie } });
     expect(me.statusCode).toBe(200);
-    expect(me.json()).toMatchObject({ email: ADMIN.email });
+    expect(me.json()).toMatchObject({ email: ADMIN.email, role: 'owner' });
+
+    await app.close();
+  });
+
+  it('POST /api/setup/admin, POST /api/auth/login, and GET /api/auth/me all expose the session user\'s role — the web UI gates admin/owner controls on it', async () => {
+    const app = await buildTestApp();
+
+    // The first-ever user is always 'owner' (see routes/auth.ts's setup/admin handler).
+    const setup = await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
+    expect(setup.json()).toMatchObject({ role: 'owner' });
+    const ownerCookie = sessionCookie(setup);
+
+    // Invite + accept a plain member and confirm 'member' (not the owner's role) comes back from
+    // every one of the three auth-surface responses that hand the web app its session user.
+    const invite = await app.inject({
+      method: 'POST',
+      url: '/api/users/invite',
+      headers: { cookie: ownerCookie },
+      payload: { email: 'mona@example.com', role: 'member' },
+    });
+    expect(invite.statusCode).toBe(201);
+    const token = (invite.json() as { inviteUrl: string }).inviteUrl.split('/').pop();
+
+    const accept = await app.inject({
+      method: 'POST',
+      url: `/api/invite/${String(token)}`,
+      payload: { name: 'Mona', password: 'super-secret-1' },
+    });
+    expect(accept.statusCode).toBe(200);
+    expect(accept.json()).toMatchObject({ email: 'mona@example.com', role: 'member' });
+    const memberCookie = sessionCookie(accept);
+
+    const memberMe = await app.inject({ method: 'GET', url: '/api/auth/me', headers: { cookie: memberCookie } });
+    expect(memberMe.json()).toMatchObject({ role: 'member' });
+
+    const memberLogin = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { email: 'mona@example.com', password: 'super-secret-1' },
+    });
+    expect(memberLogin.statusCode).toBe(200);
+    expect(memberLogin.json()).toMatchObject({ email: 'mona@example.com', role: 'member' });
 
     await app.close();
   });

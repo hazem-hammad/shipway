@@ -3,6 +3,8 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
 import { buildEnvFile, buildManagedVars, type SmtpConfig } from '../deploy/envfile.js';
+import { requireRole } from '../lib/authz.js';
+import { getActor, recordAudit } from '../services/audit.js';
 import { ProvisionError, deprovisionProject, provisionProject, refreshProjectConfig, type ProvisionDeps } from '../services/provisioner.js';
 import { allocatePort } from '../system/ports.js';
 import { SLUG_RE, isValidPublicDir } from '../system/templates.js';
@@ -12,6 +14,13 @@ type ProjectType = ProjectRow['type'];
 
 /** `owner/name`, mirroring the shape GitHub App installs surface repos in. */
 const REPO_RE = /^[\w.-]+\/[\w.-]+$/;
+
+/** An http(s) git URL (Task 8's Git-URL project source): `https?://` scheme, no whitespace or
+ * newlines anywhere in it (`\S` already excludes both), capped at 500 chars below. Credentials
+ * embedded in the URL (`https://user:token@host/...`) are deliberately allowed — that's the whole
+ * point for private repos without a GitHub App. */
+const REPO_URL_RE = /^https?:\/\/\S+$/;
+const repoUrlSchema = z.string().max(500).regex(REPO_URL_RE, 'expected an http(s) git URL');
 
 /** PHP versions the host has installed side-by-side (ondrej/php) and grants sudoers reloads for. */
 const PHP_VERSION_ENUM = z.enum(['8.1', '8.2', '8.3', '8.4']);
@@ -35,25 +44,36 @@ const publicDirSchema = z.string().refine(isValidPublicDir, { message: 'invalid 
 
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
 
-const createProjectSchema = z.object({
-  name: z.string().min(1),
-  slug: z.string().regex(SLUG_RE),
-  repo: z.string().regex(REPO_RE),
-  branch: z.string().min(1),
-  type: z.enum(['php', 'node', 'nextjs', 'static']),
-  phpVersion: PHP_VERSION_ENUM.optional(),
-  nodeVersion: NODE_VERSION_ENUM.optional(),
-  publicDir: publicDirSchema.optional(),
-  installCmd: z.string().optional(),
-  buildCmd: z.string().optional(),
-  startCmd: z.string().optional(),
-  preDeployScript: z.string().optional(),
-  postDeployScript: z.string().optional(),
-  sharedPaths: z.array(z.string()).optional(),
-  healthCheckPath: z.string().nullable().optional(),
-  autoDeploy: z.boolean().optional(),
-  notifyWebhookUrl: z.string().optional(),
-});
+// `repo` (GitHub App source, "owner/name") and `repoUrl` (Task 8's Git-URL source, any http(s) git
+// URL) are mutually exclusive project sources: exactly one is required, enforced by the `.refine`
+// below rather than a zod union so a bad request always 400s with one consistent shape instead of
+// zod's noisier union error. A repoUrl project skips any GitHub-App requirement entirely — nothing
+// downstream of this schema ever demands `github_app` be configured to create one.
+const createProjectSchema = z
+  .object({
+    name: z.string().min(1),
+    slug: z.string().regex(SLUG_RE),
+    repo: z.string().regex(REPO_RE).optional(),
+    repoUrl: repoUrlSchema.optional(),
+    branch: z.string().min(1),
+    type: z.enum(['php', 'node', 'nextjs', 'static']),
+    phpVersion: PHP_VERSION_ENUM.optional(),
+    nodeVersion: NODE_VERSION_ENUM.optional(),
+    publicDir: publicDirSchema.optional(),
+    installCmd: z.string().optional(),
+    buildCmd: z.string().optional(),
+    startCmd: z.string().optional(),
+    preDeployScript: z.string().optional(),
+    postDeployScript: z.string().optional(),
+    sharedPaths: z.array(z.string()).optional(),
+    healthCheckPath: z.string().nullable().optional(),
+    autoDeploy: z.boolean().optional(),
+    notifyWebhookUrl: z.string().optional(),
+  })
+  .refine((data) => (data.repo !== undefined) !== (data.repoUrl !== undefined), {
+    message: 'exactly one of "repo" or "repoUrl" is required',
+    path: ['repo'],
+  });
 
 /** slug/repo/type are immutable — checked against the raw body before this schema even runs. */
 const patchProjectSchema = z
@@ -79,6 +99,18 @@ const IMMUTABLE_PATCH_FIELDS = ['slug', 'repo', 'type'] as const;
 
 /** Fields whose change requires re-rendering/reinstalling the vhost and (node/nextjs) app unit. */
 const REFRESH_TRIGGER_FIELDS = ['phpVersion', 'publicDir', 'startCmd', 'nodeVersion'] as const;
+
+/** `PATCH /api/projects/:id` handles both general settings and the pre/post-deploy scripts (there's
+ * no separate scripts sub-route) — this picks the more specific `project.scripts.update` audit
+ * action when every changed field is one of the two script fields, and the general
+ * `project.update` otherwise. */
+const SCRIPT_ONLY_PATCH_FIELDS = new Set(['preDeployScript', 'postDeployScript']);
+function projectPatchAuditAction(changedFields: string[]): string {
+  if (changedFields.length > 0 && changedFields.every((field) => SCRIPT_ONLY_PATCH_FIELDS.has(field))) {
+    return 'project.scripts.update';
+  }
+  return 'project.update';
+}
 
 const deleteProjectBodySchema = z.object({ confirmName: z.string() });
 
@@ -210,12 +242,19 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       port = allocatePort(usedPorts);
     }
 
+    // Exactly one of repo/repoUrl passed the schema's `.refine` above. The `repo` column is
+    // NOT NULL, so a repoUrl project stores '' there rather than null — webhooks.ts's push matcher
+    // requires an exact, non-empty `full_name` match, so an empty `repo` can never be matched by a
+    // real (or malformed) GitHub push payload.
+    const usingRepoUrl = body.repoUrl !== undefined;
+
     app.db
       .insert(projects)
       .values({
         name: body.name,
         slug: body.slug,
-        repo: body.repo,
+        repo: usingRepoUrl ? '' : (body.repo ?? ''),
+        repoUrl: usingRepoUrl ? body.repoUrl! : null,
         branch: body.branch,
         type: body.type,
         phpVersion: body.phpVersion ?? defaults.phpVersion,
@@ -251,6 +290,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       const step = err instanceof ProvisionError ? err.step : 'unknown';
       return reply.code(502).send({ error: 'provisioning failed', step, detail: toErrorMessage(err) });
     }
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.create', targetType: 'project', targetName: created.slug, meta: { type: created.type } });
 
     return reply.code(201).send(toPublicProject(created));
   });
@@ -318,10 +360,18 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       }
     }
 
+    if (Object.keys(parsed.data).length > 0) {
+      const actor = getActor(app.db, request.session.get('userId'));
+      const action = projectPatchAuditAction(Object.keys(parsed.data));
+      recordAudit(app.db, { ...actor, action, targetType: 'project', targetName: updated.slug });
+    }
+
     return toPublicProject(updated);
   });
 
   app.delete('/api/projects/:id', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const paramsParsed = projectIdParamsSchema.safeParse(request.params);
     if (!paramsParsed.success) {
       return reply.code(404).send({ error: 'project not found' });
@@ -343,6 +393,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     }
 
     await deprovisionProject(deps(), id);
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.delete', targetType: 'project', targetName: project.slug });
 
     return reply.code(204).send();
   });
@@ -378,13 +431,16 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'invalid request body' });
     }
 
-    const existing = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, id)).get();
+    const existing = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'project not found' });
     }
 
     const envEncrypted = app.secretBox.encrypt(parsed.data.content);
     app.db.update(projects).set({ envEncrypted }).where(eq(projects.id, id)).run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.env.update', targetType: 'project', targetName: existing.slug });
 
     return reply.code(204).send();
   });
@@ -429,7 +485,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'config is required when mode is "custom"' });
     }
 
-    const existing = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, id)).get();
+    const existing = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'project not found' });
     }
@@ -437,6 +493,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const smtpConfigEncrypted = mode === 'custom' && config ? app.secretBox.encrypt(JSON.stringify(config)) : null;
 
     app.db.update(projects).set({ smtpMode: mode, smtpConfigEncrypted }).where(eq(projects.id, id)).run();
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'project.smtp.update', targetType: 'project', targetName: existing.slug, meta: { mode } });
 
     return reply.code(204).send();
   });

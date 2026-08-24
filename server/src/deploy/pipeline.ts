@@ -41,15 +41,26 @@ export interface PipelineDeps {
   sysops: SysOps;
   gitOps: GitOps;
   secretBox: SecretBox;
-  /** Resolves a project's `repo` (`"owner/name"`) to an authenticated clone URL. */
-  getCloneUrl: (repo: string) => Promise<string>;
+  /** Resolves a project's clone URL: `repoUrl` (Task 8's Git-URL source) verbatim when set, else
+   * `repo` (`"owner/name"`) to an authenticated GitHub App clone URL. */
+  getCloneUrl: (repo: string, repoUrl: string | null) => Promise<string>;
   runShell: (
     cmd: string,
     opts: { cwd: string; env: Record<string, string>; signal: AbortSignal; onOutput: (s: string) => void },
   ) => Promise<{ exitCode: number }>;
   /** Health-check GET (injectable so tests avoid the network). */
   fetchHttp: (url: string) => Promise<{ status: number }>;
-  notify: (p: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string }) => Promise<void>;
+  notify: (p: {
+    project: string;
+    status: 'success' | 'failed';
+    deploymentId: number;
+    message: string;
+    /** Set on a post-activate failure whose rollback attempt succeeded (see
+     * `handlePostActivateFailure`) — lets the caller (app.ts's notify wiring) emit `deploy_rolled_back`
+     * instead of `deploy_failed` on the notification bus. Unset for a plain failure or a pre-activate
+     * one, where nothing was ever rolled back. */
+    rolledBack?: boolean;
+  }) => Promise<void>;
   /** Injectable delay, used between health-check retries. Tests pass an instant stub. */
   sleep: (ms: number) => Promise<void>;
   /** Waits for a node-like app's port to accept connections. Defaults to a real TCP-connect poll. */
@@ -423,7 +434,7 @@ function pruneReleases(projectDir: string): void {
 async function notifySafe(
   deps: PipelineDeps,
   logger: DeployLogger,
-  payload: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string },
+  payload: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string; rolledBack?: boolean },
 ): Promise<void> {
   try {
     await deps.notify(payload);
@@ -454,7 +465,7 @@ async function runBuildPhase(
   try {
     logger.section('resolve');
     checkAborted(signal);
-    const url = await deps.getCloneUrl(project.repo);
+    const url = await deps.getCloneUrl(project.repo, project.repoUrl);
     const { sha, message } = await deps.gitOps.fetchBranchTip(projectDir, url, project.branch);
     patchDeployment(deps.db, deploymentId, { commitSha: sha, commitMessage: message });
 
@@ -535,12 +546,14 @@ async function handlePostActivateFailure(
   const message = errMessage(err);
   logger.line(`ERROR: ${message}`);
 
+  let rolledBack = false;
   if (previousReleasePath) {
     try {
       logger.section('rollback');
       activateRelease(projectDir, previousReleasePath);
       await restartRuntime(deps, project);
       logger.line('rolled back to previous release');
+      rolledBack = true;
     } catch (rollbackErr) {
       logger.line(`rollback failed: ${errMessage(rollbackErr)}`);
     }
@@ -548,7 +561,7 @@ async function handlePostActivateFailure(
 
   const finishedAt = Date.now();
   patchDeployment(deps.db, deploymentId, { status: 'failed', finishedAt });
-  await notifySafe(deps, logger, { project: project.slug, status: 'failed', deploymentId, message });
+  await notifySafe(deps, logger, { project: project.slug, status: 'failed', deploymentId, message, rolledBack: rolledBack || undefined });
   logger.close();
   return 'failed';
 }

@@ -1,13 +1,14 @@
 /**
  * Workers tab: background job/queue processes, each backed by N systemd instance units (see
  * server/src/services/workers.ts's `applyWorker`/`workerInstances`). Every mutation here is inline
- * (add row, edit row, typed-free delete confirm) — no modals, per DESIGN.md. "View logs" expands a
- * static readonly dump from `GET /api/workers/:id/logs` (journalctl tail across every instance);
- * it's fetched once per open, not streamed, so a simple dark mono panel is used instead of
- * LogTerminal's live auto-scroll machinery (task-25 controller ruling).
+ * (add card, edit row, delete confirm) — no modals, per DESIGN.md. "View logs" expands a static
+ * readonly dump from `GET /api/workers/:id/logs` (journalctl tail across every instance); it's
+ * fetched once per open, not streamed, so a simple fixed-term mono panel is used instead of
+ * LogTerminal's live auto-scroll machinery.
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { LoaderCircle, Play, Plus, RotateCcw, Square } from 'lucide-react';
 import {
   ApiError,
   createWorker,
@@ -20,13 +21,13 @@ import {
   type WorkerListItem,
 } from '../../api';
 import { useWorkers } from '../../hooks';
-import { BerthLight, Button, EmptyState, Field, Input, PageHeader, Skeleton, type BerthStatus } from '../../components/ui';
+import { Button, Card, CardHeader, EmptyState, Field, ICON_STROKE, Input, Skeleton, StatusDot, type StatusDotStatus } from '../../components/ui';
 
-const INSTANCE_BERTH: Record<WorkerInstance['status'], BerthStatus> = {
-  active: 'go',
-  failed: 'stop',
-  inactive: 'unknown',
-  unknown: 'unknown',
+const INSTANCE_DOT: Record<WorkerInstance['status'], StatusDotStatus> = {
+  active: 'ok',
+  failed: 'danger',
+  inactive: 'idle',
+  unknown: 'idle',
 };
 
 const INSTANCE_NUMBER_RE = /@(\d+)\.service$/;
@@ -45,32 +46,30 @@ export default function WorkersTab({ projectId }: { projectId: number }) {
 
   return (
     <div>
-      <PageHeader
-        title="Workers"
-        actions={
-          !adding && (
-            <Button onClick={() => setAdding(true)} className="px-2.5 py-1.5 text-xs">
-              Add worker
-            </Button>
-          )
-        }
-      />
-
-      {adding && <AddWorkerForm projectId={projectId} onDone={() => setAdding(false)} onCancel={() => setAdding(false)} />}
+      {adding ? (
+        <AddWorkerForm projectId={projectId} onDone={() => setAdding(false)} onCancel={() => setAdding(false)} />
+      ) : (
+        <div className="mb-5 flex justify-end">
+          <Button onClick={() => setAdding(true)}>
+            <Plus size={16} strokeWidth={2} aria-hidden />
+            Add worker
+          </Button>
+        </div>
+      )}
 
       {workersQuery.isPending ? (
-        <div className="flex flex-col gap-3">
-          <Skeleton className="h-24 w-full" />
-          <Skeleton className="h-24 w-full" />
+        <div className="flex flex-col gap-4">
+          <Skeleton className="h-32 w-full rounded-2xl" />
+          <Skeleton className="h-32 w-full rounded-2xl" />
         </div>
       ) : workersQuery.isError ? (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           Could not load workers.
         </p>
       ) : workersQuery.data.length === 0 && !adding ? (
         <EmptyState message="No workers. Add one to run queue consumers or background jobs." />
       ) : (
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-4">
           {workersQuery.data.map((worker) => (
             <WorkerCard key={worker.id} projectId={projectId} worker={worker} />
           ))}
@@ -104,50 +103,49 @@ function AddWorkerForm({ projectId, onDone, onCancel }: { projectId: number; onD
   }
 
   return (
-    <form
-      onSubmit={(event) => void handleSubmit(event)}
-      className="mb-4 flex flex-col gap-4 rounded-lg border border-line bg-panel/40 p-4"
-      noValidate
-    >
-      <div className="flex flex-wrap items-end gap-4">
-        <Field label="Name" hint="lowercase, digits, hyphens">
-          <Input mono required autoFocus value={name} onChange={(event) => setName(event.target.value)} className="w-40" />
-        </Field>
-        <Field label="Command">
-          <Input mono required value={command} onChange={(event) => setCommand(event.target.value)} className="w-80" />
-        </Field>
-        <Field label="Processes">
-          <ProcessesStepper value={processes} onChange={setProcesses} />
-        </Field>
-      </div>
-      {error && (
-        <p role="alert" className="text-sm text-stop">
-          {error}
-        </p>
-      )}
-      <div className="flex items-center gap-2">
-        <Button type="submit" loading={submitting} className="px-2.5 py-1 text-xs">
-          Add worker
-        </Button>
-        <Button type="button" variant="secondary" onClick={onCancel} disabled={submitting} className="px-2.5 py-1 text-xs">
-          Cancel
-        </Button>
-      </div>
-    </form>
+    <Card className="mb-5">
+      <CardHeader icon={<Plus size={20} strokeWidth={ICON_STROKE} />} title="Add worker" description="Runs as N systemd instances behind this project's env." />
+      <form onSubmit={(event) => void handleSubmit(event)} className="mt-4 flex flex-col gap-4" noValidate>
+        <div className="flex flex-wrap items-end gap-4">
+          <Field label="Name" hint="lowercase, digits, hyphens">
+            <Input mono required autoFocus value={name} onChange={(event) => setName(event.target.value)} className="w-44" />
+          </Field>
+          <Field label="Command">
+            <Input mono required value={command} onChange={(event) => setCommand(event.target.value)} className="w-80" />
+          </Field>
+          <Field label="Processes">
+            <ProcessesStepper value={processes} onChange={setProcesses} />
+          </Field>
+        </div>
+        {error && (
+          <p role="alert" className="text-sm text-danger">
+            {error}
+          </p>
+        )}
+        <div className="flex items-center gap-2">
+          <Button type="submit" loading={submitting}>
+            Add worker
+          </Button>
+          <Button type="button" variant="outline" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
+        </div>
+      </form>
+    </Card>
   );
 }
 
 function ProcessesStepper({ value, onChange, disabled }: { value: number; onChange: (next: number) => void; disabled?: boolean }) {
   return (
-    <div className="flex items-center gap-2">
+    <div className="flex h-11 items-center gap-2">
       <button
         type="button"
         aria-label="Decrease processes"
         disabled={disabled || value <= 1}
         onClick={() => onChange(Math.max(1, value - 1))}
-        className="grid h-8 w-8 place-items-center rounded-md border border-line bg-paper text-sm text-ink transition-colors duration-150 ease-out hover:bg-panel focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-40"
+        className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-surface text-base text-ink transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus disabled:cursor-not-allowed disabled:opacity-45"
       >
-        −
+        &minus;
       </button>
       <span className="w-6 text-center font-mono text-sm text-ink">{value}</span>
       <button
@@ -155,11 +153,38 @@ function ProcessesStepper({ value, onChange, disabled }: { value: number; onChan
         aria-label="Increase processes"
         disabled={disabled || value >= 8}
         onClick={() => onChange(Math.min(8, value + 1))}
-        className="grid h-8 w-8 place-items-center rounded-md border border-line bg-paper text-sm text-ink transition-colors duration-150 ease-out hover:bg-panel focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-40"
+        className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-surface text-base text-ink transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus disabled:cursor-not-allowed disabled:opacity-45"
       >
         +
       </button>
     </div>
+  );
+}
+
+function IconActionButton({
+  icon,
+  label,
+  onClick,
+  loading,
+  disabled,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  loading?: boolean;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={onClick}
+      disabled={disabled}
+      className="grid h-8 w-8 place-items-center rounded-lg border border-line bg-surface text-icon transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus disabled:cursor-not-allowed disabled:opacity-45"
+    >
+      {loading ? <LoaderCircle size={15} strokeWidth={2} className="animate-spin" aria-hidden /> : icon}
+    </button>
   );
 }
 
@@ -220,50 +245,33 @@ function WorkerCard({ projectId, worker }: { projectId: number; worker: WorkerLi
   }
 
   return (
-    <div className="rounded-lg border border-line bg-paper p-4">
+    <Card>
       <div className="flex flex-wrap items-start justify-between gap-4">
         <div className="min-w-0">
-          <p className="font-mono text-sm font-medium text-ink">{worker.name}</p>
-          <p className="max-w-md truncate font-mono text-xs text-ink-soft" title={worker.command}>
+          <p className="font-mono text-base font-semibold text-ink">{worker.name}</p>
+          <p className="mt-0.5 max-w-md truncate font-mono text-sm text-soft" title={worker.command}>
             {worker.command}
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <Button
-            variant="secondary"
-            className="px-2.5 py-1 text-xs"
-            loading={actionBusy === 'start'}
-            disabled={actionBusy !== null}
-            onClick={() => void handleAction('start')}
-          >
-            Start
+        <div className="flex shrink-0 items-center gap-1.5">
+          <IconActionButton icon={<Play size={15} strokeWidth={ICON_STROKE} />} label="Start" loading={actionBusy === 'start'} disabled={actionBusy !== null} onClick={() => void handleAction('start')} />
+          <IconActionButton icon={<Square size={15} strokeWidth={ICON_STROKE} />} label="Stop" loading={actionBusy === 'stop'} disabled={actionBusy !== null} onClick={() => void handleAction('stop')} />
+          <IconActionButton icon={<RotateCcw size={15} strokeWidth={ICON_STROKE} />} label="Restart" loading={actionBusy === 'restart'} disabled={actionBusy !== null} onClick={() => void handleAction('restart')} />
+          <span className="mx-1 h-5 w-px bg-line" aria-hidden />
+          <Button variant="outline" size="sm" onClick={() => setEditing((open) => !open)}>
+            {editing ? 'Cancel' : 'Edit'}
           </Button>
-          <Button
-            variant="secondary"
-            className="px-2.5 py-1 text-xs"
-            loading={actionBusy === 'stop'}
-            disabled={actionBusy !== null}
-            onClick={() => void handleAction('stop')}
-          >
-            Stop
-          </Button>
-          <Button
-            variant="secondary"
-            className="px-2.5 py-1 text-xs"
-            loading={actionBusy === 'restart'}
-            disabled={actionBusy !== null}
-            onClick={() => void handleAction('restart')}
-          >
-            Restart
+          <Button variant="danger" size="sm" onClick={() => setConfirmingDelete((open) => !open)}>
+            Delete
           </Button>
         </div>
       </div>
 
       {worker.instances.length > 0 && (
-        <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
+        <div className="mt-4 flex flex-wrap gap-x-5 gap-y-1.5 border-t border-line pt-3">
           {worker.instances.map((instance) => (
-            <span key={instance.unit} className="inline-flex items-center gap-1.5 text-xs text-ink-soft">
-              <BerthLight status={INSTANCE_BERTH[instance.status]} />
+            <span key={instance.unit} className="inline-flex items-center gap-1.5 text-sm text-soft">
+              <StatusDot status={INSTANCE_DOT[instance.status]} />
               <span className="font-mono">@{instanceNumber(instance.unit)}</span>
               <span>{instance.status}</span>
             </span>
@@ -272,59 +280,38 @@ function WorkerCard({ projectId, worker }: { projectId: number; worker: WorkerLi
       )}
 
       {actionError && (
-        <p role="alert" className="mt-2 text-xs text-stop">
+        <p role="alert" className="mt-3 text-sm text-danger">
           {actionError}
         </p>
       )}
 
-      <div className="mt-3 flex items-center gap-2 border-t border-line pt-3">
-        <button
-          type="button"
-          onClick={() => setEditing((open) => !open)}
-          className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        >
-          {editing ? 'Cancel edit' : 'Edit'}
-        </button>
-        <button
-          type="button"
-          onClick={() => setConfirmingDelete((open) => !open)}
-          className="rounded text-xs font-medium text-stop underline decoration-line underline-offset-2 hover:text-stop/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        >
-          Delete
-        </button>
-        <button
-          type="button"
-          onClick={() => void toggleLogs()}
-          className="rounded text-xs font-medium text-ink-soft underline decoration-line underline-offset-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-        >
-          {logsOpen ? 'Hide logs' : 'View logs'}
-        </button>
-      </div>
+      <button
+        type="button"
+        onClick={() => void toggleLogs()}
+        className="mt-4 inline-flex items-center gap-1 text-sm font-medium text-link transition-colors duration-150 ease-out hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      >
+        {logsOpen ? 'Hide logs' : 'View logs'}
+      </button>
 
       {editing && (
-        <EditWorkerForm
-          projectId={projectId}
-          worker={worker}
-          onDone={() => setEditing(false)}
-          onCancel={() => setEditing(false)}
-        />
+        <EditWorkerForm projectId={projectId} worker={worker} onDone={() => setEditing(false)} onCancel={() => setEditing(false)} />
       )}
 
       {confirmingDelete && (
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3 rounded-md border border-stop/30 bg-stop/5 px-4 py-3">
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl bg-surface-2 px-4 py-3">
           <p className="text-sm text-ink">
             Delete worker <span className="font-mono">{worker.name}</span>? This stops every instance.
           </p>
-          <div className="flex items-center gap-2">
-            <Button variant="secondary" className="px-2.5 py-1 text-xs" onClick={() => setConfirmingDelete(false)} disabled={deleting}>
+          <div className="flex shrink-0 items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setConfirmingDelete(false)} disabled={deleting}>
               Cancel
             </Button>
-            <Button variant="destructive" className="px-2.5 py-1 text-xs" loading={deleting} onClick={() => void handleDelete()}>
+            <Button variant="danger" size="sm" loading={deleting} onClick={() => void handleDelete()}>
               Confirm
             </Button>
           </div>
           {deleteError && (
-            <p role="alert" className="w-full text-xs text-stop">
+            <p role="alert" className="w-full text-xs text-danger">
               {deleteError}
             </p>
           )}
@@ -332,11 +319,11 @@ function WorkerCard({ projectId, worker }: { projectId: number; worker: WorkerLi
       )}
 
       {logsOpen && (
-        <div className="mt-3">
+        <div className="mt-4">
           {logsLoading ? (
-            <Skeleton className="h-40 w-full" />
+            <Skeleton className="h-40 w-full rounded-xl" />
           ) : logsError ? (
-            <p role="alert" className="text-xs text-stop">
+            <p role="alert" className="text-xs text-danger">
               {logsError}
             </p>
           ) : (
@@ -344,7 +331,7 @@ function WorkerCard({ projectId, worker }: { projectId: number; worker: WorkerLi
           )}
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -381,11 +368,7 @@ function EditWorkerForm({
   }
 
   return (
-    <form
-      onSubmit={(event) => void handleSubmit(event)}
-      className="mt-3 flex flex-col gap-4 rounded-md border border-line bg-panel/40 p-4"
-      noValidate
-    >
+    <form onSubmit={(event) => void handleSubmit(event)} className="mt-4 flex flex-col gap-4 rounded-xl bg-surface-2 p-4" noValidate>
       <div className="flex flex-wrap items-end gap-4">
         <Field label="Command">
           <Input mono required value={command} onChange={(event) => setCommand(event.target.value)} className="w-80" />
@@ -395,15 +378,15 @@ function EditWorkerForm({
         </Field>
       </div>
       {error && (
-        <p role="alert" className="text-sm text-stop">
+        <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}
       <div className="flex items-center gap-2">
-        <Button type="submit" loading={saving} className="px-2.5 py-1 text-xs">
+        <Button type="submit" size="sm" loading={saving}>
           Save
         </Button>
-        <Button type="button" variant="secondary" onClick={onCancel} disabled={saving} className="px-2.5 py-1 text-xs">
+        <Button type="button" variant="outline" size="sm" onClick={onCancel} disabled={saving}>
           Cancel
         </Button>
       </div>
@@ -411,15 +394,11 @@ function EditWorkerForm({
   );
 }
 
-/** A compact, static (non-streaming) reading of the term panel styling, for a journalctl tail. */
+/** A compact, static (non-streaming) reading of the terminal's fixed dark tokens, for a journalctl tail. */
 function WorkerLogPanel({ content }: { content: string }) {
   const lines = content === '' ? [] : content.replace(/\n$/, '').split('\n');
   return (
-    <div
-      role="log"
-      aria-label="Worker log"
-      className="max-h-72 overflow-y-auto rounded-md bg-term px-4 py-3 font-mono text-[13px] leading-[1.6] text-term-text"
-    >
+    <div role="log" aria-label="Worker log" className="max-h-72 overflow-y-auto rounded-xl bg-term px-4 py-3 font-mono text-[13px] leading-[1.6] text-term-text">
       {lines.length === 0 ? (
         <p className="text-term-text/45">No log output yet.</p>
       ) : (

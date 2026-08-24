@@ -2,11 +2,11 @@ import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { eq } from 'drizzle-orm';
+import { desc, eq } from 'drizzle-orm';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
-import { deployments, projects } from '../src/db/schema.js';
+import { auditEvents, deployments, projects } from '../src/db/schema.js';
 import { RESERVED_SLUGS } from '../src/routes/projects.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { FakeDnsClient } from '../src/services/cloudflare.js';
@@ -303,6 +303,103 @@ describe('POST /api/projects', () => {
 
     const list = await app.inject({ method: 'GET', url: '/api/projects', headers: { cookie } });
     expect(list.json()).toEqual([]);
+
+    await app.close();
+  });
+});
+
+describe('POST /api/projects — repoUrl source (Task 8)', () => {
+  it('creates with repoUrl when github is not configured, provisions it, and records an audit row (201)', async () => {
+    const { app, cookie, sysops, dns } = await buildProjectsTestApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: {
+        name: 'External',
+        slug: 'external',
+        repoUrl: 'https://git.example.com/acme/external.git',
+        branch: 'main',
+        type: 'static',
+      },
+    });
+
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.repo).toBe('');
+    expect(body.repoUrl).toBe('https://git.example.com/acme/external.git');
+
+    // Provisioning side effects ran exactly as they would for a repo-sourced project.
+    expect(dns.records.get('external.apps.example.com')).toBe('203.0.113.10');
+    expect(sysops.calls.some((c) => c.startsWith('installFile /etc/nginx/sites-available/shipway-external.conf'))).toBe(true);
+
+    const audit = app.db.select().from(auditEvents).orderBy(desc(auditEvents.id)).limit(1).get();
+    expect(audit).toMatchObject({ action: 'project.create', targetType: 'project', targetName: 'external' });
+
+    await app.close();
+  });
+
+  it('accepts a repoUrl with embedded credentials', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: { ...NODE_PAYLOAD, repo: undefined, repoUrl: 'https://x-access-token:ghp_abc123@github.com/acme/private.git' },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json().repoUrl).toBe('https://x-access-token:ghp_abc123@github.com/acme/private.git');
+
+    await app.close();
+  });
+
+  it('rejects a request with both repo and repoUrl (400)', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: { ...NODE_PAYLOAD, repoUrl: 'https://example.com/acme/app.git' },
+    });
+
+    expect(res.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('rejects a request with neither repo nor repoUrl (400)', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const { repo: _repo, ...withoutRepo } = NODE_PAYLOAD;
+
+    const res = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: withoutRepo });
+
+    expect(res.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it.each([
+    'not-a-url',
+    'ftp://example.com/acme/app.git',
+    'git@github.com:acme/app.git',
+    'https://exa mple.com/acme/app.git',
+    'https://example.com/acme/app.git\n',
+    `https://example.com/${'a'.repeat(500)}.git`,
+  ])('rejects an invalid repoUrl with 400 (%s)', async (repoUrl) => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: { ...NODE_PAYLOAD, repo: undefined, repoUrl },
+    });
+
+    expect(res.statusCode).toBe(400);
 
     await app.close();
   });

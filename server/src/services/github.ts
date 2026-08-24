@@ -167,6 +167,29 @@ export function cloneUrl(repoFullName: string, token: string): string {
   return `https://x-access-token:${token}@github.com/${repoFullName}.git`;
 }
 
+/**
+ * Resolves a project's clone URL: `repoUrl` (Task 8's Git-URL source) verbatim when set — no
+ * GitHub App required — else the GitHub App's authenticated clone URL for `repo` ("owner/name").
+ * Extracted out of `app.ts`'s pipeline wiring (the sole caller in production) so the repoUrl-first
+ * precedence is unit-testable without a real Fastify app or git operations; `github` only needs the
+ * one method this uses, so tests can pass a minimal fake instead of a fully constructed
+ * `GitHubService`.
+ */
+export async function resolveCloneUrl(
+  repo: string,
+  repoUrl: string | null,
+  github: Pick<GitHubService, 'getInstallationToken'> | null,
+): Promise<string> {
+  if (repoUrl) {
+    return repoUrl;
+  }
+  if (!github) {
+    throw new Error('cannot deploy: the GitHub App is not configured');
+  }
+  const token = await github.getInstallationToken();
+  return cloneUrl(repo, token);
+}
+
 /** The subset of GitHub's manifest-conversion response `GitHubService`'s callers need. */
 export interface ManifestConversion {
   appId: number;

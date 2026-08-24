@@ -61,10 +61,14 @@ export async function apiFetch<T>(path: string, opts: ApiFetchOptions = {}): Pro
 
 // ---- Shared response shapes ----
 
+/** Server-enforced team roles (`server/src/lib/authz.ts`): member < admin < owner. */
+export type Role = 'member' | 'admin' | 'owner';
+
 export interface Me {
   id: number;
   name: string;
   email: string;
+  role: Role;
 }
 
 export interface SetupStatus {
@@ -183,6 +187,9 @@ export interface Project {
   name: string;
   slug: string;
   repo: string;
+  /** Task 8's Git-URL project source: any http(s) git URL, set instead of `repo` (which is `''`
+   * for a repoUrl project — the column itself is NOT NULL). Null for GitHub-App-sourced projects. */
+  repoUrl: string | null;
   branch: string;
   type: ProjectType;
   phpVersion: string | null;
@@ -212,10 +219,12 @@ export interface ProjectListItem extends Project {
   lastDeployment: LastDeployment | null;
 }
 
+/** Exactly one of `repo` / `repoUrl` must be set — enforced server-side (400 otherwise). */
 export interface CreateProjectBody {
   name: string;
   slug: string;
-  repo: string;
+  repo?: string;
+  repoUrl?: string;
   branch: string;
   type: ProjectType;
   phpVersion?: string;
@@ -338,6 +347,51 @@ export function rollbackProject(id: number, releasePath: string): Promise<{ depl
 
 export function fetchDeploymentLog(id: number): Promise<{ content: string }> {
   return apiFetch<{ content: string }>(`/api/deployments/${String(id)}/log`);
+}
+
+/** A row of `GET /api/deployments` (Task 5's global list, Task 7's Deployments page): a deployment
+ * joined with its owning project's name/slug. */
+export interface GlobalDeployment {
+  id: number;
+  projectId: number;
+  projectName: string;
+  projectSlug: string;
+  status: DeploymentStatus;
+  trigger: 'push' | 'manual' | 'rollback';
+  commitSha: string | null;
+  commitMessage: string | null;
+  startedAt: number | null;
+  finishedAt: number | null;
+}
+
+/** `GET /api/deployments` — recent deployments across every project, newest first; capped at 50
+ * server-side unless `limit` is given (server max 100). */
+export function fetchGlobalDeployments(limit?: number): Promise<GlobalDeployment[]> {
+  const query = limit !== undefined ? `?limit=${String(limit)}` : '';
+  return apiFetch<GlobalDeployment[]>(`/api/deployments${query}`);
+}
+
+// ---- Overview (Home dashboard) ----
+
+export interface OverviewRecentProject {
+  id: number;
+  name: string;
+  slug: string;
+  type: ProjectType;
+  lastDeployment: { status: DeploymentStatus; finishedAt: number | null } | null;
+}
+
+export interface Overview {
+  user: { name: string };
+  projects: number;
+  deployments: number;
+  /** Human-readable names of any system units currently down (e.g. "Nginx"); `[]` when healthy. */
+  servicesDown: string[];
+  recentProjects: OverviewRecentProject[];
+}
+
+export function fetchOverview(): Promise<Overview> {
+  return apiFetch<Overview>('/api/overview');
 }
 
 // ---- Workers ----
@@ -525,18 +579,53 @@ export function fetchServerStats(): Promise<ServerStats> {
   return apiFetch<ServerStats>('/api/server/stats');
 }
 
-// ---- Users ----
+// ---- Team (users, invites, roles) ----
+
+export type UserStatus = 'active' | 'invited';
 
 export interface User {
   id: number;
   name: string;
   email: string;
+  role: Role;
+  status: UserStatus;
+  /** `null` for an active user; epoch ms for a still-pending invite. */
+  inviteExpiresAt: number | null;
   createdAt: number;
 }
 
 export interface CreateUserBody {
   name: string;
   email: string;
+  password: string;
+}
+
+/** Only `member`/`admin` are invitable — the owner role is a permanent singleton. */
+export type InvitableRole = 'member' | 'admin';
+
+export interface InviteUserBody {
+  email: string;
+  role: InvitableRole;
+}
+
+/** Shared response shape for both `POST /api/users/invite` and `POST /api/users/:id/reinvite` —
+ * `inviteUrl` (`/invite/<token>`) is the only place the token is ever returned; it can't be
+ * retrieved again later, only regenerated via reinvite. */
+export interface InviteResult {
+  id: number;
+  email: string;
+  role: InvitableRole;
+  inviteUrl: string;
+  expiresAt: number;
+}
+
+export interface InvitePreview {
+  email: string;
+  valid: boolean;
+}
+
+export interface AcceptInviteBody {
+  name: string;
   password: string;
 }
 
@@ -548,8 +637,143 @@ export function createUser(body: CreateUserBody): Promise<User> {
   return apiFetch<User>('/api/users', { method: 'POST', body });
 }
 
+export function inviteUser(body: InviteUserBody): Promise<InviteResult> {
+  return apiFetch<InviteResult>('/api/users/invite', { method: 'POST', body });
+}
+
+export function reinviteUser(id: number): Promise<InviteResult> {
+  return apiFetch<InviteResult>(`/api/users/${String(id)}/reinvite`, { method: 'POST' });
+}
+
+export function fetchInvite(token: string): Promise<InvitePreview> {
+  return apiFetch<InvitePreview>(`/api/invite/${token}`);
+}
+
+export function acceptInvite(token: string, body: AcceptInviteBody): Promise<Me> {
+  return apiFetch<Me>(`/api/invite/${token}`, { method: 'POST', body });
+}
+
+export function changeUserRole(id: number, role: InvitableRole): Promise<User> {
+  return apiFetch<User>(`/api/users/${String(id)}/role`, { method: 'PATCH', body: { role } });
+}
+
 export function deleteUser(id: number): Promise<void> {
   return apiFetch<void>(`/api/users/${String(id)}`, { method: 'DELETE' });
+}
+
+// ---- Notifications (delivery channels + event matrix) ----
+
+export type NotifyEvent = 'deploy_failed' | 'deploy_succeeded' | 'deploy_canceled' | 'deploy_rolled_back' | 'service_down' | 'service_recovered';
+export type NotifyEventCategory = 'deployment' | 'services';
+
+export interface NotificationChannel {
+  id: number;
+  name: string;
+  url: string;
+}
+
+export interface NotificationEventMeta {
+  event: NotifyEvent;
+  label: string;
+  description: string;
+  category: NotifyEventCategory;
+}
+
+export interface NotificationSubscription {
+  event: string;
+  channelId: number;
+}
+
+export interface NotificationsMatrix {
+  channels: NotificationChannel[];
+  events: NotificationEventMeta[];
+  subscriptions: NotificationSubscription[];
+}
+
+export interface CreateChannelBody {
+  name: string;
+  url: string;
+}
+
+export function fetchNotifications(): Promise<NotificationsMatrix> {
+  return apiFetch<NotificationsMatrix>('/api/notifications');
+}
+
+export function createChannel(body: CreateChannelBody): Promise<NotificationChannel> {
+  return apiFetch<NotificationChannel>('/api/notifications/channels', { method: 'POST', body });
+}
+
+export function deleteChannel(id: number): Promise<void> {
+  return apiFetch<void>(`/api/notifications/channels/${String(id)}`, { method: 'DELETE' });
+}
+
+export function testChannel(id: number): Promise<{ ok: boolean }> {
+  return apiFetch<{ ok: boolean }>(`/api/notifications/channels/${String(id)}/test`, { method: 'POST' });
+}
+
+export interface PutSubscriptionBody {
+  event: string;
+  channelId: number;
+  enabled: boolean;
+}
+
+export function putSubscription(body: PutSubscriptionBody): Promise<PutSubscriptionBody> {
+  return apiFetch<PutSubscriptionBody>('/api/notifications/subscriptions', { method: 'PUT', body });
+}
+
+// ---- Audit log ----
+
+export type AuditCategory = 'all' | 'deployments' | 'projects' | 'databases' | 'team' | 'settings';
+
+export interface AuditEvent {
+  id: number;
+  actorId: number | null;
+  actorName: string;
+  action: string;
+  targetType: string;
+  targetName: string;
+  meta: unknown;
+  createdAt: number;
+}
+
+export interface AuditListParams {
+  category?: AuditCategory;
+  q?: string;
+  actorId?: number;
+  since?: number;
+  cursor?: number;
+  limit?: number;
+}
+
+export interface AuditListResult {
+  events: AuditEvent[];
+  nextCursor: number | null;
+  counts: Record<AuditCategory, number>;
+}
+
+export function fetchAudit(params: AuditListParams = {}): Promise<AuditListResult> {
+  const query = new URLSearchParams();
+  if (params.category) query.set('category', params.category);
+  if (params.q) query.set('q', params.q);
+  if (params.actorId !== undefined) query.set('actorId', String(params.actorId));
+  if (params.since !== undefined) query.set('since', String(params.since));
+  if (params.cursor !== undefined) query.set('cursor', String(params.cursor));
+  if (params.limit !== undefined) query.set('limit', String(params.limit));
+  const qs = query.toString();
+  return apiFetch<AuditListResult>(`/api/audit${qs ? `?${qs}` : ''}`);
+}
+
+export interface AuditConfig {
+  enabled: boolean;
+  retentionDays: 30 | 90 | 365;
+}
+
+export function fetchAuditConfig(): Promise<AuditConfig> {
+  return apiFetch<AuditConfig>('/api/audit/config');
+}
+
+export function putAuditConfig(body: Partial<AuditConfig>): Promise<AuditConfig> {
+  return apiFetch<AuditConfig>('/api/audit/config', { method: 'PUT', body });
 }
 
 // ---- GitHub App (settings management) ----

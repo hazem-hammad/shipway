@@ -8,6 +8,7 @@
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Check, Copy, Database as DatabaseIcon, Eye, EyeOff, Mail, Plus } from 'lucide-react';
 import {
   ApiError,
   createDatabase,
@@ -19,16 +20,20 @@ import {
   type DbEngine,
 } from '../api';
 import { useDatabases, useProjects, useServicesInfo } from '../hooks';
-import { Button, Chip, EmptyState, Field, Input, PageHeader, Panel, Select, Skeleton } from '../components/ui';
+import { Badge, Button, Card, CardHeader, Chip, EmptyState, Field, ICON_STROKE, Input, PageHeader, Select, Skeleton } from '../components/ui';
 import { formatRelativeTime } from '../lib/format';
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
-const TABLE_COLUMN_COUNT = 5;
 
 const ENGINE_OPTIONS: { value: DbEngine; label: string }[] = [
   { value: 'mysql', label: 'MySQL' },
   { value: 'postgres', label: 'Postgres' },
 ];
+
+const ENGINE_LABEL: Record<DbEngine, string> = {
+  mysql: 'MySQL',
+  postgres: 'Postgres',
+};
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
@@ -47,87 +52,76 @@ export default function DatabasesPage() {
     <div>
       <PageHeader
         title="Databases"
+        subtitle="MySQL and Postgres databases on this server"
         actions={
           !creating &&
           !createdCreds && (
-            <Button onClick={() => setCreating(true)} className="px-2.5 py-1.5 text-xs">
+            <Button onClick={() => setCreating(true)}>
+              <Plus size={18} strokeWidth={2} aria-hidden />
               New database
             </Button>
           )
         }
       />
 
-      {creating && (
-        <CreateDatabaseForm
-          onCreated={(created) => {
-            setCreating(false);
-            setCreatedCreds(created);
-          }}
-          onCancel={() => setCreating(false)}
-        />
-      )}
-
-      {createdCreds && (
-        <div className="mb-6">
-          <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-sm font-semibold text-ink">Database created</h2>
-            <button
-              type="button"
-              onClick={() => setCreatedCreds(null)}
-              className="rounded text-xs font-medium text-ink-soft underline decoration-line underline-offset-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              Dismiss
-            </button>
-          </div>
-          <CredentialsPanel
-            databaseId={createdCreds.id}
-            engine={createdCreds.engine}
-            name={createdCreds.name}
-            username={createdCreds.username}
-            password={createdCreds.password}
-            oneTime
+      <div className="flex flex-col gap-5">
+        {creating && (
+          <CreateDatabaseForm
+            onCreated={(created) => {
+              setCreating(false);
+              setCreatedCreds(created);
+            }}
+            onCancel={() => setCreating(false)}
           />
-        </div>
-      )}
+        )}
 
-      {databasesQuery.isPending ? (
-        <TableSkeleton />
-      ) : databasesQuery.isError ? (
-        <p role="alert" className="text-sm text-stop">
-          Could not load databases.
-        </p>
-      ) : databasesQuery.data.length === 0 && !creating ? (
-        <EmptyState message="No databases yet. Provision one to get connection credentials." />
-      ) : (
-        <div className="overflow-x-auto rounded-lg border border-line">
-          <table className="w-full min-w-[720px] border-collapse text-left text-sm">
-            <thead className="bg-panel text-xs font-medium text-ink-soft">
-              <tr>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Engine
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Name
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Linked project
-                </th>
-                <th scope="col" className="px-4 py-2.5 font-medium">
-                  Created
-                </th>
-                <th scope="col" className="px-4 py-2.5"></th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-line">
+        {createdCreds && (
+          <Card>
+            <div className="flex items-center justify-between gap-4">
+              <h2 className="text-lg font-semibold text-ink">Database created</h2>
+              <button
+                type="button"
+                onClick={() => setCreatedCreds(null)}
+                className="rounded text-sm font-medium text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+              >
+                Dismiss
+              </button>
+            </div>
+            <div className="mt-4">
+              <CredentialsPanel
+                databaseId={createdCreds.id}
+                engine={createdCreds.engine}
+                name={createdCreds.name}
+                username={createdCreds.username}
+                password={createdCreds.password}
+                oneTime
+              />
+            </div>
+          </Card>
+        )}
+
+        {databasesQuery.isPending ? (
+          <Card>
+            <DatabasesSkeletonRows />
+          </Card>
+        ) : databasesQuery.isError ? (
+          <p role="alert" className="text-sm text-danger">
+            Could not load databases.
+          </p>
+        ) : databasesQuery.data.length === 0 ? (
+          creating ? null : <EmptyState message="No databases yet. Provision one to get connection credentials." />
+        ) : (
+          <Card>
+            <div className="divide-y divide-line">
               {databasesQuery.data.map((database) => (
                 <DatabaseRow key={database.id} database={database} />
               ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+            </div>
+          </Card>
+        )}
 
-      <ServicesInfoPanels />
+        <ServicesInfoPanels />
+      </div>
     </div>
   );
 }
@@ -173,72 +167,69 @@ function CreateDatabaseForm({ onCreated, onCancel }: { onCreated: (created: Data
   }
 
   return (
-    <form
-      onSubmit={(event) => void handleSubmit(event)}
-      className="mb-6 flex max-w-[560px] flex-col gap-4 rounded-lg border border-line bg-panel/40 p-4"
-      noValidate
-    >
-      <div role="radiogroup" aria-label="Engine" className="flex gap-2">
-        {ENGINE_OPTIONS.map((option) => (
-          <label
-            key={option.value}
-            className={`flex flex-1 items-center justify-center gap-2 rounded-md border px-3 py-2 text-sm font-medium transition-colors duration-150 ease-out ${
-              engine === option.value ? 'border-accent bg-accent-soft text-accent' : 'border-line bg-paper text-ink hover:bg-panel'
-            }`}
-          >
-            <input
-              type="radio"
-              name="db-engine"
-              value={option.value}
-              checked={engine === option.value}
-              onChange={() => setEngine(option.value)}
-              className="focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-              style={{ accentColor: 'var(--color-accent)' }}
-            />
-            {option.label}
-          </label>
-        ))}
-      </div>
-
-      <Field label="Name" hint="Lowercase, digits, underscores; starts with a letter. Up to 32 chars." error={nameError ?? undefined}>
-        <Input
-          mono
-          required
-          autoFocus
-          value={name}
-          onChange={(event) => {
-            setName(event.target.value);
-            setNameError(null);
-          }}
-        />
-      </Field>
-
-      <Field label="Link to project" hint="Optional. You can also add the connection env later.">
-        <Select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-          <option value="">None</option>
-          {(projectsQuery.data ?? []).map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
+    <Card>
+      <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[560px] flex-col gap-4" noValidate>
+        <div role="radiogroup" aria-label="Engine" className="flex gap-3">
+          {ENGINE_OPTIONS.map((option) => (
+            <label
+              key={option.value}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-xl border px-4 py-3.5 text-base font-semibold transition-colors duration-150 ease-out ${
+                engine === option.value ? 'border-focus bg-surface-2 text-ink' : 'border-line bg-surface text-ink hover:bg-surface-2'
+              }`}
+            >
+              <input
+                type="radio"
+                name="db-engine"
+                value={option.value}
+                checked={engine === option.value}
+                onChange={() => setEngine(option.value)}
+                className="h-4 w-4 accent-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+              />
+              {option.label}
+            </label>
           ))}
-        </Select>
-      </Field>
+        </div>
 
-      {formError && (
-        <p role="alert" className="text-sm text-stop">
-          {formError}
-        </p>
-      )}
+        <Field label="Name" hint="Lowercase, digits, underscores; starts with a letter. Up to 32 chars." error={nameError ?? undefined}>
+          <Input
+            mono
+            required
+            autoFocus
+            value={name}
+            onChange={(event) => {
+              setName(event.target.value);
+              setNameError(null);
+            }}
+          />
+        </Field>
 
-      <div className="flex items-center gap-2">
-        <Button type="submit" loading={submitting} className="px-2.5 py-1 text-xs">
-          Create database
-        </Button>
-        <Button type="button" variant="secondary" onClick={onCancel} disabled={submitting} className="px-2.5 py-1 text-xs">
-          Cancel
-        </Button>
-      </div>
-    </form>
+        <Field label="Link to project" hint="Optional. You can also add the connection env later.">
+          <Select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+            <option value="">None</option>
+            {(projectsQuery.data ?? []).map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        {formError && (
+          <p role="alert" className="text-sm text-danger">
+            {formError}
+          </p>
+        )}
+
+        <div className="flex items-center gap-2">
+          <Button type="submit" loading={submitting}>
+            Create database
+          </Button>
+          <Button type="button" variant="outline" onClick={onCancel} disabled={submitting}>
+            Cancel
+          </Button>
+        </div>
+      </form>
+    </Card>
   );
 }
 
@@ -272,65 +263,51 @@ function DatabaseRow({ database }: { database: DatabaseListItem }) {
   }
 
   return (
-    <>
-      <tr className="h-11">
-        <td className="px-4 py-3">
-          <Chip>{database.engine}</Chip>
-        </td>
-        <td className="px-4 py-3 font-mono text-ink">{database.name}</td>
-        <td className="px-4 py-3 text-ink-soft">{database.projectName ?? 'Not linked'}</td>
-        <td className="px-4 py-3 text-ink-soft">{formatRelativeTime(database.createdAt)}</td>
-        <td className="px-4 py-3 text-right">
-          <div className="flex items-center justify-end gap-3">
-            <button
-              type="button"
-              onClick={() => void toggleReveal()}
-              className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              {expanded === 'reveal' ? 'Hide credentials' : 'Reveal credentials'}
-            </button>
-            <button
-              type="button"
-              onClick={toggleDrop}
-              className="rounded text-xs font-medium text-stop underline decoration-line underline-offset-2 hover:text-stop/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-            >
-              Drop
-            </button>
-          </div>
-        </td>
-      </tr>
+    <div className="flex flex-col">
+      <div className="flex h-14 items-center gap-4 px-2">
+        <Badge className="shrink-0">{ENGINE_LABEL[database.engine]}</Badge>
+        <div className="min-w-0 flex-1">
+          <div className="truncate font-mono text-base font-semibold text-ink">{database.name}</div>
+          <div className="mt-0.5 truncate text-sm text-soft">{database.projectName ?? 'Not linked'}</div>
+        </div>
+        <span className="hidden shrink-0 text-sm text-soft sm:block">{formatRelativeTime(database.createdAt)}</span>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button variant="outline" size="sm" onClick={() => void toggleReveal()}>
+            {expanded === 'reveal' ? 'Hide credentials' : 'Credentials'}
+          </Button>
+          <Button variant="danger" size="sm" onClick={toggleDrop}>
+            Drop
+          </Button>
+        </div>
+      </div>
 
       {expanded === 'reveal' && (
-        <tr>
-          <td colSpan={TABLE_COLUMN_COUNT} className="border-t border-line bg-panel/60 px-4 py-3">
-            {revealLoading ? (
-              <Skeleton className="h-32 w-full max-w-[560px]" />
-            ) : revealError ? (
-              <p role="alert" className="text-sm text-stop">
-                {revealError}
-              </p>
-            ) : credentials ? (
-              <CredentialsPanel
-                databaseId={database.id}
-                engine={database.engine}
-                name={database.name}
-                username={credentials.username}
-                password={credentials.password}
-                oneTime={false}
-              />
-            ) : null}
-          </td>
-        </tr>
+        <div className="mx-2 mb-3">
+          {revealLoading ? (
+            <Skeleton className="h-32 w-full max-w-[560px] rounded-xl" />
+          ) : revealError ? (
+            <p role="alert" className="text-sm text-danger">
+              {revealError}
+            </p>
+          ) : credentials ? (
+            <CredentialsPanel
+              databaseId={database.id}
+              engine={database.engine}
+              name={database.name}
+              username={credentials.username}
+              password={credentials.password}
+              oneTime={false}
+            />
+          ) : null}
+        </div>
       )}
 
       {expanded === 'drop' && (
-        <tr>
-          <td colSpan={TABLE_COLUMN_COUNT} className="border-t border-line bg-stop/5 px-4 py-3">
-            <DropConfirm database={database} onDropped={() => setExpanded(null)} />
-          </td>
-        </tr>
+        <div className="mx-2 mb-3">
+          <DropConfirm database={database} onDropped={() => setExpanded(null)} />
+        </div>
       )}
-    </>
+    </div>
   );
 }
 
@@ -356,10 +333,9 @@ function DropConfirm({ database, onDropped }: { database: DatabaseListItem; onDr
   }
 
   return (
-    <div>
+    <div className="rounded-xl bg-surface-2 p-4">
       <p className="text-sm text-ink">
-        This permanently deletes database <Chip>{database.name}</Chip> and its user. Type{' '}
-        <Chip>{database.name}</Chip> to confirm.
+        This permanently deletes database <Chip>{database.name}</Chip> and its user. Type <Chip>{database.name}</Chip> to confirm.
       </p>
       <Input
         mono
@@ -369,12 +345,12 @@ function DropConfirm({ database, onDropped }: { database: DatabaseListItem; onDr
         className="mt-2 max-w-xs"
       />
       {error && (
-        <p role="alert" className="mt-2 text-sm text-stop">
+        <p role="alert" className="mt-2 text-sm text-danger">
           {error}
         </p>
       )}
       <div className="mt-3">
-        <Button variant="destructive" disabled={!canDrop} loading={dropping} onClick={() => void handleDrop()} className="px-2.5 py-1 text-xs">
+        <Button variant="danger" size="sm" disabled={!canDrop} loading={dropping} onClick={() => void handleDrop()}>
           Drop database
         </Button>
       </div>
@@ -421,9 +397,10 @@ function CredentialsPanel({
   }
 
   return (
-    <div className="max-w-[560px] rounded-lg border border-line bg-paper p-4">
-      <p className="mb-3 text-sm text-ink">
-        <Chip>{engine}</Chip> <span className="ml-1 font-mono">{name}</span>
+    <div className="max-w-[560px] rounded-xl bg-surface-2 p-4">
+      <p className="mb-3 flex items-center gap-2">
+        <Badge>{ENGINE_LABEL[engine]}</Badge>
+        <span className="font-mono text-sm font-semibold text-ink">{name}</span>
       </p>
       <div className="flex flex-col gap-2">
         <CredentialRow label="Host" value="127.0.0.1" />
@@ -432,7 +409,7 @@ function CredentialsPanel({
         <CredentialRow label="Password" value={password} />
       </div>
 
-      {oneTime && <p className="mt-3 text-xs text-hold">Save these now. The password is shown once.</p>}
+      {oneTime && <p className="mt-3 text-sm text-warn">Save these now. The password is shown once.</p>}
 
       <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
         <Select value={injectProjectId} onChange={(event) => setInjectProjectId(event.target.value)} className="w-56">
@@ -443,18 +420,12 @@ function CredentialsPanel({
             </option>
           ))}
         </Select>
-        <Button
-          variant="secondary"
-          className="px-2.5 py-1 text-xs"
-          disabled={injectProjectId === ''}
-          loading={injecting}
-          onClick={() => void handleInject()}
-        >
+        <Button variant="secondary" size="sm" disabled={injectProjectId === ''} loading={injecting} onClick={() => void handleInject()}>
           Add to project env
         </Button>
-        {injectResult === 'ok' && <span className="text-xs text-go">Added to the project&rsquo;s environment.</span>}
+        {injectResult === 'ok' && <Badge tone="ok">Added to the project&rsquo;s environment</Badge>}
         {injectResult === 'fail' && (
-          <span role="alert" className="text-xs text-stop">
+          <span role="alert" className="text-sm text-danger">
             {injectMessage}
           </span>
         )}
@@ -477,16 +448,17 @@ function CredentialRow({ label, value }: { label: string; value: string }) {
   }
 
   return (
-    <div className="flex items-center justify-between gap-3 rounded-md border border-line bg-panel/40 px-3 py-2">
+    <div className="flex items-center justify-between gap-3 rounded-lg bg-surface px-3 py-2.5">
       <div className="min-w-0">
-        <p className="text-xs text-ink-soft">{label}</p>
+        <p className="text-xs text-soft">{label}</p>
         <p className="truncate font-mono text-sm text-ink">{value}</p>
       </div>
       <button
         type="button"
         onClick={() => void handleCopy()}
-        className="shrink-0 rounded px-2 py-1 text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        className="inline-flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-xs font-medium text-soft transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
       >
+        {copied ? <Check size={14} strokeWidth={ICON_STROKE} aria-hidden /> : <Copy size={14} strokeWidth={ICON_STROKE} aria-hidden />}
         {copied ? 'Copied' : 'Copy'}
       </button>
     </div>
@@ -500,7 +472,7 @@ function ServicesInfoPanels() {
   if (!redis && !mailpit) return null;
 
   return (
-    <div className="mt-8 grid gap-4 sm:grid-cols-2">
+    <div className="grid gap-4 sm:grid-cols-2">
       {redis && <RedisPanel host={redis.host} port={redis.port} password={redis.password} />}
       {mailpit && (
         <MailpitPanel
@@ -515,37 +487,44 @@ function ServicesInfoPanels() {
   );
 }
 
+function RevealToggle({ revealed, onToggle }: { revealed: boolean; onToggle: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      className="inline-flex items-center gap-1 rounded text-xs font-medium text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+    >
+      {revealed ? <EyeOff size={14} strokeWidth={ICON_STROKE} aria-hidden /> : <Eye size={14} strokeWidth={ICON_STROKE} aria-hidden />}
+      {revealed ? 'Hide' : 'Reveal'}
+    </button>
+  );
+}
+
 function RedisPanel({ host, port, password }: { host: string; port: number; password?: string }) {
   const [revealed, setRevealed] = useState(false);
   return (
-    <Panel>
-      <h2 className="mb-3 text-sm font-semibold text-ink">Redis</h2>
-      <dl className="flex flex-col gap-2 text-sm">
+    <Card>
+      <CardHeader icon={<DatabaseIcon size={20} strokeWidth={ICON_STROKE} />} title="Redis" description="Shared cache and queue broker." />
+      <dl className="mt-4 flex flex-col gap-2 text-sm">
         <div className="flex items-center justify-between">
-          <dt className="text-ink-soft">Host</dt>
+          <dt className="text-soft">Host</dt>
           <dd className="font-mono text-ink">{host}</dd>
         </div>
         <div className="flex items-center justify-between">
-          <dt className="text-ink-soft">Port</dt>
+          <dt className="text-soft">Port</dt>
           <dd className="font-mono text-ink">{port}</dd>
         </div>
         {password && (
           <div className="flex items-center justify-between">
-            <dt className="text-ink-soft">Password</dt>
+            <dt className="text-soft">Password</dt>
             <dd className="flex items-center gap-2">
               <span className="font-mono text-ink">{revealed ? password : '•'.repeat(8)}</span>
-              <button
-                type="button"
-                onClick={() => setRevealed((v) => !v)}
-                className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-              >
-                {revealed ? 'Hide' : 'Reveal'}
-              </button>
+              <RevealToggle revealed={revealed} onToggle={() => setRevealed((v) => !v)} />
             </dd>
           </div>
         )}
       </dl>
-    </Panel>
+    </Card>
   );
 }
 
@@ -564,35 +543,29 @@ function MailpitPanel({
 }) {
   const [revealed, setRevealed] = useState(false);
   return (
-    <Panel>
-      <h2 className="mb-3 text-sm font-semibold text-ink">Mailpit</h2>
-      <dl className="flex flex-col gap-2 text-sm">
+    <Card>
+      <CardHeader icon={<Mail size={20} strokeWidth={ICON_STROKE} />} title="Mailpit" description="Local SMTP catch-all for outgoing mail." />
+      <dl className="mt-4 flex flex-col gap-2 text-sm">
         <div className="flex items-center justify-between">
-          <dt className="text-ink-soft">SMTP host</dt>
+          <dt className="text-soft">SMTP host</dt>
           <dd className="font-mono text-ink">{smtpHost}</dd>
         </div>
         <div className="flex items-center justify-between">
-          <dt className="text-ink-soft">SMTP port</dt>
+          <dt className="text-soft">SMTP port</dt>
           <dd className="font-mono text-ink">{smtpPort}</dd>
         </div>
         {username && (
           <div className="flex items-center justify-between">
-            <dt className="text-ink-soft">Web UI username</dt>
+            <dt className="text-soft">Web UI username</dt>
             <dd className="font-mono text-ink">{username}</dd>
           </div>
         )}
         {webPassword && (
           <div className="flex items-center justify-between">
-            <dt className="text-ink-soft">Web UI password</dt>
+            <dt className="text-soft">Web UI password</dt>
             <dd className="flex items-center gap-2">
               <span className="font-mono text-ink">{revealed ? webPassword : '•'.repeat(8)}</span>
-              <button
-                type="button"
-                onClick={() => setRevealed((v) => !v)}
-                className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
-              >
-                {revealed ? 'Hide' : 'Reveal'}
-              </button>
+              <RevealToggle revealed={revealed} onToggle={() => setRevealed((v) => !v)} />
             </dd>
           </div>
         )}
@@ -601,30 +574,28 @@ function MailpitPanel({
         href={webUrl}
         target="_blank"
         rel="noreferrer noopener"
-        className="mt-3 inline-block text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+        className="mt-3 inline-block text-sm font-medium text-link hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
       >
         Open Mailpit web UI
       </a>
-    </Panel>
+    </Card>
   );
 }
 
-function TableSkeleton() {
+function DatabasesSkeletonRows() {
   return (
-    <div className="overflow-hidden rounded-lg border border-line">
-      <div className="bg-panel px-4 py-3">
-        <Skeleton className="h-3 w-32" />
-      </div>
-      <div className="divide-y divide-line">
-        {[0, 1, 2].map((row) => (
-          <div key={row} className="flex h-11 items-center gap-6 px-4">
-            <Skeleton className="h-4 w-16" />
-            <Skeleton className="h-4 w-28" />
+    <div className="divide-y divide-line">
+      {[0, 1, 2].map((row) => (
+        <div key={row} className="flex h-14 items-center gap-4 px-2">
+          <Skeleton className="h-6 w-16 rounded-full" />
+          <div className="min-w-0 flex-1">
             <Skeleton className="h-4 w-32" />
-            <Skeleton className="h-4 flex-1" />
+            <Skeleton className="mt-1.5 h-3 w-24" />
           </div>
-        ))}
-      </div>
+          <Skeleton className="hidden h-4 w-16 sm:block" />
+          <Skeleton className="h-8 w-24 rounded-xl" />
+        </div>
+      ))}
     </div>
   );
 }

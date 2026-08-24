@@ -1,4 +1,5 @@
 import Database from 'better-sqlite3';
+import { asc, eq } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import type { BetterSQLite3Database } from 'drizzle-orm/better-sqlite3';
 import { migrate } from 'drizzle-orm/better-sqlite3/migrator';
@@ -6,6 +7,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as schema from './schema.js';
+import { users } from './schema.js';
 
 export type ShipwayDb = BetterSQLite3Database<typeof schema>;
 
@@ -15,6 +17,24 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // so in both cases the migrations folder is two levels up, at the server
 // package root: `server/drizzle`.
 const MIGRATIONS_FOLDER = path.resolve(__dirname, '../../drizzle');
+
+/**
+ * If no user currently has `role: 'owner'`, promotes the earliest-created user (lowest `id`) to
+ * owner. A no-op on a fresh, empty `users` table (the first `POST /api/setup/admin` call creates
+ * its user as `'owner'` directly — see `routes/auth.ts` — so this never has to act on a fresh
+ * install) and a no-op once an owner already exists. Exists so a db migrated from v1 (whose users
+ * all default to `role: 'member'` via migration 0001) ends up with exactly one owner on first boot
+ * after the upgrade.
+ */
+function promoteEarliestUserToOwner(db: ShipwayDb): void {
+  const existingOwner = db.select({ id: users.id }).from(users).where(eq(users.role, 'owner')).limit(1).get();
+  if (existingOwner) return;
+
+  const earliest = db.select({ id: users.id }).from(users).orderBy(asc(users.id)).limit(1).get();
+  if (!earliest) return;
+
+  db.update(users).set({ role: 'owner' }).where(eq(users.id, earliest.id)).run();
+}
 
 /**
  * Opens (creating if necessary) the SQLite database at `dbPath`, applies
@@ -32,6 +52,7 @@ export function openDb(dbPath: string): ShipwayDb {
 
   const db = drizzle({ client, schema });
   migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+  promoteEarliestUserToOwner(db);
 
   return db;
 }

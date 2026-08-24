@@ -2,6 +2,8 @@ import { randomBytes } from 'node:crypto';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { getSetting, setSetting } from '../db/settings.js';
+import { requireRole } from '../lib/authz.js';
+import { getActor, recordAudit } from '../services/audit.js';
 import { exchangeManifestCode, GitHubService, type GithubAppConfig } from '../services/github.js';
 
 const GITHUB_APP_SETTING_KEY = 'github_app';
@@ -85,6 +87,8 @@ export async function githubRoutes(
   });
 
   app.get('/api/github/manifest', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const parsed = manifestQuerySchema.safeParse(request.query);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid request' });
@@ -138,11 +142,14 @@ export async function githubRoutes(
       slug: conversion.slug,
     };
     setSetting(app.db, GITHUB_APP_SETTING_KEY, next);
+    recordAudit(app.db, { actorId: null, actorName: 'github', action: 'github.configure', targetType: 'settings', targetName: 'github_app' });
 
     return reply.redirect('/settings/github?created=1');
   });
 
   app.put('/api/github/app', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const parsed = manualAppSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid request body' });
@@ -158,10 +165,15 @@ export async function githubRoutes(
     };
     setSetting(app.db, GITHUB_APP_SETTING_KEY, next);
 
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'github.configure', targetType: 'settings', targetName: 'github_app' });
+
     return buildStatus(next);
   });
 
   app.post('/api/github/resolve-installation', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
     const cfg = getSetting<GithubAppConfig>(app.db, GITHUB_APP_SETTING_KEY);
     if (!cfg) {
       return reply.code(503).send(NOT_CONFIGURED);
@@ -175,6 +187,9 @@ export async function githubRoutes(
       return reply.code(502).send({ error: 'failed to resolve installation' });
     }
     setSetting(app.db, GITHUB_APP_SETTING_KEY, { ...cfg, installationId });
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'github.configure', targetType: 'settings', targetName: 'github_app', meta: { installationId } });
 
     return { installationId };
   });

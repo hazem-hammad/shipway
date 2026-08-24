@@ -1,77 +1,214 @@
 @import 'tailwindcss';
 
-@import '@fontsource/ibm-plex-sans/400.css';
-@import '@fontsource/ibm-plex-sans/500.css';
-@import '@fontsource/ibm-plex-sans/600.css';
+@import '@fontsource/outfit/400.css';
+@import '@fontsource/outfit/500.css';
+@import '@fontsource/outfit/600.css';
 @import '@fontsource/ibm-plex-mono/400.css';
 @import '@fontsource/ibm-plex-mono/500.css';
 
 /*
- * Design tokens, straight from DESIGN.md. OKLCH, neutrals tinted toward the harbor hue (220-240).
- * Naming these under Tailwind's `--color-*` / `--font-*` / `--text-*` namespaces auto-generates
- * matching utilities (bg-paper, text-ink-soft, border-line, font-mono, text-base, ...) — no need to
- * hand-roll a config file for the palette or the type scale.
+ * ===========================================================================
+ * Shipway v2 design tokens (DESIGN.md is binding).
+ *
+ * The tokens live as plain CSS custom properties on :root (light) with a
+ * `.dark` override block, and are mapped into Tailwind via `@theme inline`
+ * so the generated utilities emit var(...) and flip automatically with the
+ * `dark` class on <html>.
+ *
+ * UTILITY VOCABULARY — use these names everywhere from Task 1 on:
+ *
+ *   surface            | utility examples                  | token
+ *   -------------------+-----------------------------------+---------------
+ *   page background    | bg-page                           | --bg
+ *   cards / sidebar    | bg-surface                        | --surface
+ *   nested wells,hover | bg-surface-2                      | --surface-2
+ *   active nav,pressed | bg-surface-3                      | --surface-3
+ *   hairlines          | border-line, divide-line          | --border
+ *   primary text       | text-ink                          | --text
+ *   secondary text     | text-soft                         | --text-soft
+ *   labels/placeholder | text-faint                        | --text-faint
+ *   icon stroke        | text-icon                         | --icon
+ *   solid buttons      | bg-primary text-primary-fg        | --primary
+ *   focus ring         | ring-focus                        | --focus (40% alpha baked in)
+ *   semantic           | text-ok / text-warn / text-danger | --ok / --warn / --danger
+ *   ok badge           | bg-ok-tint text-ok-tint-fg        | --ok-tint(-fg)
+ *   icon-chip tints    | bg-tint-{orange,purple,green}     | --tint-*(-fg)
+ *   gradient CTA       | class `cta` (below)               | --cta-from/--cta-to
+ *   terminal (fixed)   | bg-term text-term-text            | --term* (same in both themes)
+ *
+ *   type scale (px)    | 11    12    13.5  14    15    16    22    28
+ *   utility            | 2xs   xs    sm    base  lg    xl    2xl   3xl
+ *   (nav items are 14.5px: use text-[14.5px]; body copy is text-base.)
+ *
+ *   fonts: font-sans = Outfit (UI), font-mono = IBM Plex Mono (data: shas,
+ *   env, tokens, cron, terminal).
+ * ===========================================================================
  */
-@theme {
-  --color-ink: oklch(0.25 0.02 240);
-  --color-ink-soft: oklch(0.45 0.015 235);
-  --color-paper: oklch(0.977 0.004 220);
-  --color-panel: oklch(0.945 0.006 225);
-  --color-line: oklch(0.88 0.008 225);
-  --color-accent: oklch(0.52 0.1 215);
-  --color-accent-soft: oklch(0.93 0.03 215);
-  --color-go: oklch(0.6 0.15 150);
-  --color-stop: oklch(0.55 0.18 25);
-  --color-hold: oklch(0.7 0.13 75);
-  --color-term: oklch(0.21 0.02 235);
-  --color-term-text: oklch(0.88 0.02 160);
 
-  --font-sans: 'IBM Plex Sans', ui-sans-serif, system-ui, sans-serif;
+:root {
+  --bg: #f7f7f8;
+  --surface: #ffffff;
+  --surface-2: #f4f4f5;
+  --surface-3: #ededef;
+  --border: #ececee;
+  --text: #18181b;
+  --text-soft: #8e8e93;
+  --text-faint: #a8a8ad;
+  --icon: #6b6b70;
+  --primary: #141416;
+  --primary-fg: #ffffff;
+  --cta-from: #8b5cf6;
+  --cta-to: #3b82f6;
+  --cta-fg: #ffffff;
+  --ok: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --ok-tint: #e8f8ee;
+  --ok-tint-fg: #1b9e4b;
+  --tint-orange: #fff3e8;
+  --tint-orange-fg: #f59e0b;
+  --tint-purple: #f3efff;
+  --tint-purple-fg: #8b5cf6;
+  --tint-green: #e8f8ee;
+  --tint-green-fg: #22c55e;
+  --link: #3b82f6;
+  --focus: rgb(59 130 246 / 0.4);
+}
+
+.dark {
+  --bg: #0f0f10;
+  --surface: #1a1a1c;
+  --surface-2: #232326;
+  --surface-3: #2a2a2e;
+  --border: #26262a;
+  --text: #f4f4f5;
+  --text-soft: #8e8e93;
+  --text-faint: #6e6e73;
+  --icon: #a0a0a5;
+  --primary: #ffffff;
+  --primary-fg: #141416;
+  /* Dark CTA is solid lime, black text (DESIGN.md): both gradient stops collapse to lime. */
+  --cta-from: #c8f135;
+  --cta-to: #c8f135;
+  --cta-fg: #141416;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --danger: #f87171;
+  --ok-tint: #173322;
+  --ok-tint-fg: #4ade80;
+  --tint-orange: rgb(245 158 11 / 0.15);
+  --tint-orange-fg: #fbbf24;
+  --tint-purple: rgb(139 92 246 / 0.15);
+  --tint-purple-fg: #a78bfa;
+  --tint-green: rgb(34 197 94 / 0.15);
+  --tint-green-fg: #4ade80;
+  --link: #60a5fa;
+  --focus: rgb(200 241 53 / 0.4);
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme inline {
+  /* Kill Tailwind's stock palette so token names are the only color vocabulary. */
+  --color-*: initial;
+
+  /* ---- v2 vocabulary ---- */
+  --color-page: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-surface-3: var(--surface-3);
+  --color-line: var(--border);
+  --color-ink: var(--text);
+  --color-soft: var(--text-soft);
+  --color-faint: var(--text-faint);
+  --color-icon: var(--icon);
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+  --color-focus: var(--focus);
+  --color-link: var(--link);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-ok-tint: var(--ok-tint);
+  --color-ok-tint-fg: var(--ok-tint-fg);
+  --color-tint-orange: var(--tint-orange);
+  --color-tint-orange-fg: var(--tint-orange-fg);
+  --color-tint-purple: var(--tint-purple);
+  --color-tint-purple-fg: var(--tint-purple-fg);
+  --color-tint-green: var(--tint-green);
+  --color-tint-green-fg: var(--tint-green-fg);
+  --color-white: #ffffff;
+  --color-black: #000000;
+  --color-transparent: transparent;
+  --color-current: currentColor;
+
+  /* Terminal: fixed dark surface in BOTH themes (DESIGN.md). */
+  --color-term: #141416;
+  --color-term-text: #d6e4dc;
+  --color-term-stage: #a5b4fc;
+  --color-term-err: #f87171;
+
+  /* ---- type ---- */
+  --font-sans: 'Outfit', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 
-  /* Fixed rem scale, ratio ~1.2: 12 / 13 / 14 (base) / 16 / 20 / 24 — weight does hierarchy work
-     before size does (see DESIGN.md's Typography section). Mapped onto Tailwind's usual size
-     names so component code still reads as `text-sm`, `text-lg`, etc. */
-  --text-xs: 0.75rem;
-  --text-sm: 0.8125rem;
-  --text-base: 0.875rem;
-  --text-lg: 1rem;
-  --text-xl: 1.25rem;
-  --text-2xl: 1.5rem;
+  --text-2xs: 0.6875rem; /* 11px  section labels */
+  --text-xs: 0.75rem; /*    12px  table headers, timestamps */
+  --text-sm: 0.84375rem; /* 13.5px labels, descriptions */
+  --text-base: 0.875rem; /* 14px  body */
+  --text-lg: 0.9375rem; /*  15px  page subtitle, CTA label */
+  --text-xl: 1rem; /*        16px  card title */
+  --text-2xl: 1.375rem; /*   22px  empty-state headline */
+  --text-3xl: 1.75rem; /*    28px  page title */
 }
 
 @layer base {
   body {
-    background-color: var(--color-paper);
-    color: var(--color-ink);
+    background-color: var(--bg);
+    color: var(--text);
     font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
   }
 }
 
-/* Berth-light pulse: the one recurring identity mark (DESIGN.md, Signature). 1.6s ease-in-out,
-   infinite, applied only to running/queued lamps — and switched off entirely for anyone who asked
-   for reduced motion. */
-@keyframes berth-pulse {
+@utility cta {
+  /* The one loud gradient: New Project pill (light). Dark collapses to solid lime. */
+  background-image: linear-gradient(to right, var(--cta-from), var(--cta-to));
+  color: var(--cta-fg);
+}
+
+@utility section-label {
+  /* 11px/600 uppercase 0.08em tracking, --text-faint (DESIGN.md Typography). */
+  font-size: 0.6875rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-faint);
+}
+
+/* Status-dot pulse: subtle 1.6s opacity pulse on running/queued dots only, and switched off
+   entirely for anyone who asked for reduced motion (DESIGN.md Status dots + Motion). */
+@keyframes dot-pulse {
   0%,
   100% {
     opacity: 1;
   }
   50% {
-    opacity: 0.5;
+    opacity: 0.45;
   }
 }
 
-.berth-pulse {
-  animation: berth-pulse 1.6s ease-in-out infinite;
+.dot-pulse {
+  animation: dot-pulse 1.6s ease-in-out infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .berth-pulse {
+  .dot-pulse {
     animation: none;
   }
 }
 
-/* Skeleton loading: a panel-tint shimmer, never a centered spinner (DESIGN.md, Components). */
+/* Skeleton loading: a surface-tint shimmer, never a centered spinner. */
 @keyframes shimmer {
   0% {
     background-position: 150% 0;
@@ -84,9 +221,9 @@
 .skeleton {
   background-image: linear-gradient(
     100deg,
-    var(--color-panel) 30%,
-    color-mix(in oklch, var(--color-panel), var(--color-line) 65%) 50%,
-    var(--color-panel) 70%
+    var(--surface-2) 30%,
+    var(--surface-3) 50%,
+    var(--surface-2) 70%
   );
   background-size: 300% 100%;
   animation: shimmer 1.8s ease-in-out infinite;

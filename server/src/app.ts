@@ -9,30 +9,35 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
-import { deployments, projects } from './db/schema.js';
-import { getSetting } from './db/settings.js';
+import { notificationChannels, notificationSubscriptions } from './db/schema.js';
+import { deleteSetting, getSetting } from './db/settings.js';
 import { DeployQueue, type DeployQueueDeps } from './deploy/queue.js';
 import type { DeployLogger } from './deploy/logger.js';
 import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
 import { makeRunShell } from './deploy/runshell.js';
 import { SecretBox } from './lib/secretbox.js';
+import { auditRoutes } from './routes/audit.js';
 import { authRoutes } from './routes/auth.js';
 import { cloudflareRoutes } from './routes/cloudflare.js';
 import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
+import { notificationRoutes } from './routes/notifications.js';
+import { overviewRoutes } from './routes/overview.js';
 import { projectRoutes } from './routes/projects.js';
 import { serverRoutes } from './routes/server.js';
 import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { workerRoutes } from './routes/workers.js';
+import { recordAudit, runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle } from './services/audit.js';
 import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
+import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
 import { makeGitOps } from './services/git.js';
-import { cloneUrl, GitHubService, type GithubAppConfig } from './services/github.js';
-import { sendDeployNotification } from './services/notify.js';
+import { GitHubService, resolveCloneUrl, type GithubAppConfig } from './services/github.js';
+import { startServiceWatch, type ServiceWatchHandle } from './services/servicewatch.js';
 import { makeSysOps, type SysOps } from './sysops/index.js';
 
 declare module 'fastify' {
@@ -60,6 +65,13 @@ declare module 'fastify' {
     queue: DeployQueue;
     /** Provisions/deprovisions MySQL/Postgres databases; backed by `mysql_admin_url`/`postgres_admin_url` settings. */
     dbAdmin: DbAdmin;
+    /** The 60s service-status poller's handle (Task 4), or `undefined` when it isn't running — see
+     * `buildApp`'s `deps.serviceWatch` for when that is. `app.close()` stops it via an `onClose` hook. */
+    serviceWatch: ServiceWatchHandle | undefined;
+    /** The hourly audit-retention purge timer's handle (Task 5), or `undefined` when it isn't
+     * running — see `buildApp`'s `deps.auditPurge` for when that is. `app.close()` stops it via an
+     * `onClose` hook. A purge also always runs once synchronously at boot regardless of this. */
+    auditPurge: AuditPurgeHandle | undefined;
   }
 }
 
@@ -91,9 +103,11 @@ const DEFAULT_WEB_DIST_DIR = path.resolve(__dirname, '../../web/dist');
  * Path prefixes under `/api/` that do NOT require an authenticated session. Everything else under
  * `/api/` is guarded by the global `onRequest` hook below. `/api/health` itself is checked
  * separately as an exact match (see `isPublicApiPath`), not a prefix, so a future route like
- * `/api/healthcheck` doesn't accidentally slip through unauthenticated too.
+ * `/api/healthcheck` doesn't accidentally slip through unauthenticated too. `/api/invite/` is
+ * public (Task 3): the invitee has no session yet — `GET` previews the pending invite and `POST`
+ * activates it — both routes validate the token itself as their credential (see `routes/users.ts`).
  */
-const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/setup/', '/api/webhooks/'];
+const PUBLIC_API_PREFIXES = ['/api/auth/', '/api/setup/', '/api/webhooks/', '/api/invite/'];
 
 function isPublicApiPath(path: string): boolean {
   if (path === '/api/health') return true;
@@ -120,6 +134,56 @@ function loadOrCreateSessionKey(keyPath: string): Buffer {
   return key;
 }
 
+/** How often the service-status poller reads `SYSTEM_UNITS` in production (Task 4). */
+const SERVICE_WATCH_INTERVAL_MS = 60_000;
+
+/** How often the audit-retention purge timer runs in production (Task 5, spec: "hourly timer + boot"). */
+const AUDIT_PURGE_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * One-time migration (Task 4, spec §2's notifybus bullet): if the legacy global
+ * `notify_webhook_url` setting is set and no notification channel exists yet, creates a "Default"
+ * channel with that URL subscribed to `deploy_failed` (and also `deploy_succeeded` when the legacy
+ * `notify_on_success` setting was `true`) — carrying v1's webhook behavior forward as a Task 4
+ * channel. Then clears the legacy `notify_webhook_url` setting so `deploynotify.ts`'s global
+ * fallback (services/deploynotify.ts:54-63) no longer fires alongside the new channel — otherwise an
+ * upgraded install posts twice per event to the same URL (final-review.md finding I-1). Per-project
+ * `notifyWebhookUrl` overrides are a separate, still-supported feature and are left untouched.
+ *
+ * Naturally idempotent — once ANY channel exists (this migration's own "Default", or one a user
+ * created by hand first), it never runs again, and once `notify_webhook_url` is cleared the `if
+ * (!webhookUrl) return;` guard below makes every later boot a no-op — so this can just be called
+ * unconditionally on every boot.
+ */
+function migrateLegacyWebhookChannel(db: ShipwayDb): void {
+  const webhookUrl = getSetting<string>(db, 'notify_webhook_url');
+  if (!webhookUrl) return;
+
+  const existingChannel = db.select({ id: notificationChannels.id }).from(notificationChannels).limit(1).get();
+  if (existingChannel) return;
+
+  db.insert(notificationChannels).values({ name: 'Default', url: webhookUrl }).run();
+  const created = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, 'Default')).get();
+  if (!created) return; // unreachable: just inserted this row above
+
+  db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: created.id }).run();
+  if (getSetting<boolean>(db, 'notify_on_success') === true) {
+    db.insert(notificationSubscriptions).values({ event: 'deploy_succeeded', channelId: created.id }).run();
+  }
+
+  // Silence the legacy global fallback now that the Default channel covers it — see the doc
+  // comment above (finding I-1). Per-project notifyWebhookUrl overrides are untouched.
+  deleteSetting(db, 'notify_webhook_url');
+
+  recordAudit(db, {
+    actorId: null,
+    actorName: 'system',
+    action: 'notification.migrated',
+    targetType: 'notification_channel',
+    targetName: 'Default',
+  });
+}
+
 export async function buildApp(
   cfg: Config,
   deps: {
@@ -139,6 +203,17 @@ export async function buildApp(
      * `web/dist` sibling package. Lets tests exercise the SPA-fallback static serving (present and
      * absent) without depending on whether `web` has actually been built in the checkout. */
     webDistDir?: string;
+    /** Test-only override: starts the Task 4 service-status poller with this config instead of the
+     * default "skip entirely under `NODE_ENV=test`" behavior — lets tests exercise the wiring (short
+     * `intervalMs`, a fake `fetchImpl`) deterministically. In production this is never passed; the
+     * poller always runs at `SERVICE_WATCH_INTERVAL_MS`. */
+    serviceWatch?: { intervalMs: number; fetchImpl?: typeof fetch };
+    /** Test-only override: starts the Task 5 hourly audit-retention purge timer at this interval
+     * instead of the default "skip entirely under `NODE_ENV=test`" behavior — lets tests drive it
+     * deterministically via `.tick()`. In production this is never passed; the timer always runs at
+     * `AUDIT_PURGE_INTERVAL_MS`. The boot-time purge itself is unconditional either way (see
+     * `runAuditPurgeOnce(app.db)` below, right after `migrateLegacyWebhookChannel`). */
+    auditPurge?: { intervalMs: number };
   } = {},
 ): Promise<FastifyInstance> {
   const app = Fastify({
@@ -162,6 +237,11 @@ export async function buildApp(
 
   app.decorate('cfg', cfg);
   app.decorate('db', openDb(cfg.dbPath));
+  migrateLegacyWebhookChannel(app.db);
+  // Task 5's boot-time audit-retention purge: unconditional (not gated by test mode, unlike the
+  // hourly timer below) since it's a single cheap DELETE — mirrors `migrateLegacyWebhookChannel`
+  // running unconditionally on every boot too.
+  runAuditPurgeOnce(app.db);
   app.decorate('github', () => {
     const githubAppCfg = getSetting<GithubAppConfig>(app.db, 'github_app');
     return githubAppCfg ? new GitHubService(githubAppCfg) : null;
@@ -193,39 +273,27 @@ export async function buildApp(
 
   const fetchImpl = deps.fetchImpl ?? fetch;
 
-  // Resolves a project's `repo` ("owner/name") to an authenticated HTTPS clone URL via the
-  // configured GitHub App's installation token. Throws a clear error (surfaced in the deploy log,
-  // see pipeline.ts's `handlePreActivateFailure`) if the app isn't configured/installed yet, rather
-  // than letting a confusing git/auth failure be the first sign something's wrong.
-  async function getCloneUrl(repo: string): Promise<string> {
-    const github = app.github();
-    if (!github) {
-      throw new Error('cannot deploy: the GitHub App is not configured');
-    }
-    const token = await github.getInstallationToken();
-    return cloneUrl(repo, token);
+  // Resolves a project's clone URL: `repoUrl` (Task 8's Git-URL source) verbatim when set, else
+  // `repo` ("owner/name") via the configured GitHub App's installation token. Throws a clear error
+  // (surfaced in the deploy log, see pipeline.ts's `handlePreActivateFailure`) if a repo-sourced
+  // project's app isn't configured/installed yet, rather than letting a confusing git/auth failure
+  // be the first sign something's wrong. Thin wrapper over `resolveCloneUrl` — see that function's
+  // doc comment for why the precedence logic itself lives there instead of here.
+  async function getCloneUrl(repo: string, repoUrl: string | null): Promise<string> {
+    return resolveCloneUrl(repo, repoUrl, app.github());
   }
 
-  // Resolves the webhook to notify for a given deploy: the project's own `notifyWebhookUrl` if
-  // set, else the global `notify_webhook_url` setting; skips silently (no webhook configured
-  // anywhere) and skips `'success'` notifications unless `notify_on_success` is set — failures are
-  // always sent regardless of that setting.
-  async function notify(p: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string }): Promise<void> {
-    if (p.status === 'success' && getSetting<boolean>(app.db, 'notify_on_success') !== true) {
-      return;
-    }
-
-    const deploymentRow = app.db.select({ projectId: deployments.projectId }).from(deployments).where(eq(deployments.id, p.deploymentId)).get();
-    const projectRow = deploymentRow
-      ? app.db.select({ notifyWebhookUrl: projects.notifyWebhookUrl }).from(projects).where(eq(projects.id, deploymentRow.projectId)).get()
-      : undefined;
-
-    const webhookUrl = projectRow?.notifyWebhookUrl ?? getSetting<string>(app.db, 'notify_webhook_url');
-    if (!webhookUrl) {
-      return;
-    }
-
-    await sendDeployNotification(fetchImpl, webhookUrl, p);
+  // Wired as `PipelineDeps.notify`: preserves v1's per-project/global webhook override (gated by
+  // `notify_on_success`) AND additionally (always — Task 4's bus events are additive) emits the
+  // matching `notifybus` event to every channel subscribed to it. See `services/deploynotify.ts`.
+  async function notify(p: {
+    project: string;
+    status: 'success' | 'failed';
+    deploymentId: number;
+    message: string;
+    rolledBack?: boolean;
+  }): Promise<void> {
+    await notifyDeployTerminal(app.db, fetchImpl, p);
   }
 
   const pipelineDeps: PipelineDeps = {
@@ -250,7 +318,17 @@ export async function buildApp(
       run:
         deps.queueRun ??
         (async (deploymentId: number, signal: AbortSignal, logger: DeployLogger) => {
-          await runDeploy(pipelineDeps, deploymentId, logger, signal);
+          const result = await runDeploy(pipelineDeps, deploymentId, logger, signal);
+          // The pipeline's own `notify` hook is deliberately never called for a cancellation
+          // (unchanged v1 behavior — see deploy/pipeline.ts), so it's the one terminal status the
+          // bus needs a separate emission for, driven off `runDeploy`'s own return value instead.
+          if (result === 'canceled') {
+            try {
+              await notifyDeployCanceled(app.db, fetchImpl, deploymentId);
+            } catch (err) {
+              app.log.error({ err }, 'notifyDeployCanceled failed');
+            }
+          }
         }),
     }),
   );
@@ -314,6 +392,9 @@ export async function buildApp(
   await app.register(cronRoutes);
   await app.register(serverRoutes);
   await app.register(webhookRoutes);
+  await app.register(notificationRoutes, { fetchImpl: deps.fetchImpl });
+  await app.register(auditRoutes);
+  await app.register(overviewRoutes);
 
   // Serves the built web SPA (see `web/`, Task 22) when present. Guarded on existence so dev mode
   // — where `web/dist` may not exist yet, since `web` ships its own Vite dev server instead — never
@@ -347,6 +428,37 @@ export async function buildApp(
       return reply.sendFile('index.html');
     });
   }
+
+  // Service-status poller (Task 4): runs at `SERVICE_WATCH_INTERVAL_MS` in production. Under
+  // `NODE_ENV=test` (vitest's default) it's skipped entirely unless a test explicitly opts in via
+  // `deps.serviceWatch`, so the hundreds of app-level tests that never touch it don't each leave a
+  // background timer running. Stopped via an `onClose` hook so `app.close()` always leaves no open
+  // handles behind — otherwise a real interval would keep the process (and vitest) alive forever.
+  const serviceWatchEnabled = deps.serviceWatch !== undefined || process.env.NODE_ENV !== 'test';
+  app.decorate(
+    'serviceWatch',
+    serviceWatchEnabled
+      ? startServiceWatch({
+          db: app.db,
+          sysops: app.sysops,
+          intervalMs: deps.serviceWatch?.intervalMs ?? SERVICE_WATCH_INTERVAL_MS,
+          fetchImpl: deps.serviceWatch?.fetchImpl ?? fetchImpl,
+        })
+      : undefined,
+  );
+  app.addHook('onClose', () => {
+    app.serviceWatch?.stop();
+  });
+
+  // Hourly audit-retention purge timer (Task 5): same test-gating shape as the service-status
+  // poller just above — skipped under `NODE_ENV=test` unless a test injects `deps.auditPurge`, and
+  // stopped via `onClose`. The boot-time purge itself already ran unconditionally, right after
+  // `migrateLegacyWebhookChannel` above, regardless of this timer's on/off state.
+  const auditPurgeEnabled = deps.auditPurge !== undefined || process.env.NODE_ENV !== 'test';
+  app.decorate('auditPurge', auditPurgeEnabled ? startAuditPurge(app.db, deps.auditPurge?.intervalMs ?? AUDIT_PURGE_INTERVAL_MS) : undefined);
+  app.addHook('onClose', () => {
+    app.auditPurge?.stop();
+  });
 
   // Re-queues rows left `queued`/`running` by a previous process (e.g. a restart) — must run after
   // every route is registered, since it can start deploys immediately via the queue's `run`.

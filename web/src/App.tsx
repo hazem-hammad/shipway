@@ -3,13 +3,16 @@ import { useMe, useSetupStatus } from './hooks';
 import { ShellSkeleton } from './components/ui';
 import Layout from './components/Layout';
 import Login from './pages/Login';
+import InviteAccept from './pages/InviteAccept';
 import SetupWizard from './pages/SetupWizard';
+import HomePage from './pages/Home';
 import ProjectsPage from './pages/Projects';
 import ProjectNewPage from './pages/ProjectNew';
 import ProjectLayout from './pages/project/ProjectLayout';
 import DatabasesPage from './pages/Databases';
-import ServerPage from './pages/Server';
+import DeploymentsPage from './pages/Deployments';
 import SettingsPage from './pages/Settings';
+import AuditLogPage from './pages/AuditLog';
 
 export default function App() {
   const setupStatus = useSetupStatus();
@@ -43,6 +46,9 @@ function AuthenticatedGate() {
     return (
       <Switch>
         <Route path="/login" component={Login} />
+        {/* Public: an invitee has no session yet — must render before/outside the authenticated
+            Layout switch below, exactly like /login (see InviteAccept.tsx's doc comment). */}
+        <Route path="/invite/:token" component={InviteAccept} />
         <Route>
           <Redirect to="/login" />
         </Route>
@@ -53,14 +59,16 @@ function AuthenticatedGate() {
   return (
     <Layout user={me.data}>
       <Switch>
+        <Route path="/" component={HomePage} />
         <Route path="/projects/new" component={ProjectNewPage} />
         <Route path="/projects" component={ProjectsPage} />
         <Route path="/projects/:id" nest component={ProjectLayout} />
         <Route path="/databases" component={DatabasesPage} />
-        <Route path="/server" component={ServerPage} />
+        <Route path="/deployments" component={DeploymentsPage} />
         <Route path="/settings/:section?" component={SettingsPage} />
+        <Route path="/audit" component={AuditLogPage} />
         <Route>
-          <Redirect to="/projects" />
+          <Redirect to="/" />
         </Route>
       </Switch>
     </Layout>

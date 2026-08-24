@@ -17,3 +17,8 @@ export function setSetting(db: ShipwayDb, key: string, value: unknown): void {
     .onConflictDoUpdate({ target: settings.key, set: { value: encoded } })
     .run();
 }
+
+/** Deletes the row for `key`, if any. Idempotent — a no-op when the key is already unset. */
+export function deleteSetting(db: ShipwayDb, key: string): void {
+  db.delete(settings).where(eq(settings.key, key)).run();
+}

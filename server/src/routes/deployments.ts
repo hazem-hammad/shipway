@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import * as fs from 'node:fs';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
+import { getActor, recordAudit } from '../services/audit.js';
 
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
 const deploymentIdParamsSchema = z.object({ id: z.coerce.number().int() });
@@ -10,6 +11,13 @@ const rollbackBodySchema = z.object({ releasePath: z.string().min(1) });
 
 /** `GET /api/projects/:id/deployments` returns at most this many rows, newest first. */
 const DEPLOYMENTS_LIST_LIMIT = 50;
+
+/** `GET /api/deployments` (Task 5's global list): default/max `limit`, mirroring the audit list's
+ * pagination limits (`routes/audit.ts`). */
+const GLOBAL_DEPLOYMENTS_DEFAULT_LIMIT = 50;
+const GLOBAL_DEPLOYMENTS_MAX_LIMIT = 100;
+
+const globalListQuerySchema = z.object({ limit: z.coerce.number().int().positive().optional() });
 
 /** Full text of a deployment's log file, or `''` if `logPath` is unset or the file doesn't exist. */
 function readLogFile(logPath: string | null): string {
@@ -26,18 +34,53 @@ function readLogFile(logPath: string | null): string {
  * WebSocket upgrade route, since `buildApp`'s `onRequest` hook runs before the upgrade completes.
  */
 export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
+  // Task 5's global deployments list (spec §1's "Global deployments" row / §2's
+  // `GET /api/deployments?limit=100`): recent deployments across every project, newest first, with
+  // the owning project's name/slug joined in — distinct from `/api/projects/:id/deployments` above
+  // (one project's history), which Fastify's router never confuses with this exact-path route.
+  app.get('/api/deployments', async (request, reply) => {
+    const parsedQuery = globalListQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) {
+      return reply.code(400).send({ error: 'invalid query' });
+    }
+    const limit = Math.min(parsedQuery.data.limit ?? GLOBAL_DEPLOYMENTS_DEFAULT_LIMIT, GLOBAL_DEPLOYMENTS_MAX_LIMIT);
+
+    return app.db
+      .select({
+        id: deployments.id,
+        projectId: deployments.projectId,
+        projectName: projects.name,
+        projectSlug: projects.slug,
+        status: deployments.status,
+        trigger: deployments.trigger,
+        commitSha: deployments.commitSha,
+        commitMessage: deployments.commitMessage,
+        startedAt: deployments.startedAt,
+        finishedAt: deployments.finishedAt,
+      })
+      .from(deployments)
+      .innerJoin(projects, eq(deployments.projectId, projects.id))
+      .orderBy(desc(deployments.id))
+      .limit(limit)
+      .all();
+  });
+
   app.post('/api/projects/:id/deploy', async (request, reply) => {
     const paramsParsed = projectIdParamsSchema.safeParse(request.params);
     if (!paramsParsed.success) {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    const project = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
+    const project = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
     if (!project) {
       return reply.code(404).send({ error: 'project not found' });
     }
 
     const deploymentId = app.queue.enqueue({ projectId: project.id, trigger: 'manual' });
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'deploy.trigger', targetType: 'project', targetName: project.slug, meta: { trigger: 'manual', deploymentId } });
+
     return reply.code(202).send({ deploymentId });
   });
 
@@ -47,7 +90,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    const project = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
+    const project = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
     if (!project) {
       return reply.code(404).send({ error: 'project not found' });
     }
@@ -71,6 +114,10 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const deploymentId = app.queue.enqueue({ projectId: project.id, trigger: 'rollback', releasePath });
+
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'deploy.rollback', targetType: 'project', targetName: project.slug, meta: { releasePath, deploymentId } });
+
     return reply.code(202).send({ deploymentId });
   });
 
@@ -113,12 +160,17 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'deployment not found' });
     }
 
-    const row = app.db.select({ id: deployments.id }).from(deployments).where(eq(deployments.id, paramsParsed.data.id)).get();
+    const row = app.db.select({ id: deployments.id, projectId: deployments.projectId }).from(deployments).where(eq(deployments.id, paramsParsed.data.id)).get();
     if (!row) {
       return reply.code(404).send({ error: 'deployment not found' });
     }
 
     app.queue.cancel(row.id);
+
+    const project = app.db.select({ slug: projects.slug }).from(projects).where(eq(projects.id, row.projectId)).get();
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'deploy.cancel', targetType: 'deployment', targetName: project?.slug ?? String(row.id) });
+
     return reply.code(202).send({});
   });
 

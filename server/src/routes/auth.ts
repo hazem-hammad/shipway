@@ -3,6 +3,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { users } from '../db/schema.js';
 import { hashPassword, verifyPassword } from '../lib/passwords.js';
+import { recordAudit } from '../services/audit.js';
 
 const setupAdminSchema = z.object({
   name: z.string().min(1),
@@ -101,7 +102,10 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       if (existing) {
         return null;
       }
-      tx.insert(users).values({ name, email, passwordHash }).run();
+      // The very first user is always created as 'owner' directly (spec §2) — there's no earlier
+      // user for `db/index.ts`'s boot-time promotion to act on, since that only runs at db-open
+      // time, before this handler exists to insert anyone.
+      tx.insert(users).values({ name, email, passwordHash, role: 'owner' }).run();
       return tx.select().from(users).where(eq(users.email, email)).get() ?? null;
     });
 
@@ -110,7 +114,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     }
 
     request.session.set('userId', created.id);
-    return reply.code(201).send({ id: created.id, name: created.name, email: created.email });
+    return reply.code(201).send({ id: created.id, name: created.name, email: created.email, role: created.role });
   });
 
   app.post('/api/auth/login', async (request, reply) => {
@@ -126,18 +130,30 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
     const { email, password } = parsed.data;
     const user = app.db.select().from(users).where(eq(users.email, email)).get();
-    // Always run a real argon2id verify, even for an unknown email, against DUMMY_PASSWORD_HASH —
-    // see its doc comment. This keeps "unknown email" and "wrong password" 401s equally expensive.
-    const valid = await verifyPassword(user ? user.passwordHash : DUMMY_PASSWORD_HASH, password);
+    // Always run a real argon2id verify against DUMMY_PASSWORD_HASH — see its doc comment — for
+    // both an unknown email AND a `status: 'invited'` user (Task 3: invited users can't log in
+    // until they activate via `/api/invite/:token`; their `passwordHash` is an unusable sentinel
+    // anyway, but we still route around it explicitly here rather than relying on that). This keeps
+    // "unknown email", "not yet activated", and "wrong password" 401s equally expensive — an
+    // attacker can't distinguish any of the three from response timing.
+    const canAttemptLogin = user !== undefined && user.status === 'active';
+    const valid = await verifyPassword(canAttemptLogin ? user.passwordHash : DUMMY_PASSWORD_HASH, password);
 
-    if (!user || !valid) {
+    if (!canAttemptLogin || !valid) {
       recordFailure(ip);
+      recordAudit(app.db, {
+        actorId: user?.id ?? null,
+        actorName: email,
+        action: 'auth.login_failed',
+        targetType: 'auth',
+        targetName: email,
+      });
       return reply.code(401).send({ error: 'invalid email or password' });
     }
 
     resetAttempts(ip);
     request.session.set('userId', user.id);
-    return { id: user.id, name: user.name, email: user.email };
+    return { id: user.id, name: user.name, email: user.email, role: user.role };
   });
 
   app.post('/api/auth/logout', async (request, reply) => {
@@ -156,6 +172,6 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(401).send({ error: 'unauthorized' });
     }
 
-    return { id: user.id, name: user.name, email: user.email };
+    return { id: user.id, name: user.name, email: user.email, role: user.role };
   });
 }

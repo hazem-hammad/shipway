@@ -21,6 +21,7 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { projects } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
+import { recordAudit } from '../services/audit.js';
 import { verifyWebhookSignature, type GithubAppConfig } from '../services/github.js';
 
 const GITHUB_APP_SETTING_KEY = 'github_app';
@@ -31,7 +32,11 @@ const DELETED_BRANCH_SHA = '0'.repeat(40);
 const pushPayloadSchema = z.object({
   ref: z.string(),
   after: z.string(),
-  repository: z.object({ full_name: z.string() }),
+  // `.min(1)`: defense in depth for Task 8's Git-URL project source, which stores `repo: ''` (the
+  // `repo` column is NOT NULL). GitHub itself never sends an empty `full_name`, but without this the
+  // match below (`eq(projects.repo, payload.repository.full_name)`) would happily match a repoUrl
+  // project against a malformed/empty payload value.
+  repository: z.object({ full_name: z.string().min(1) }),
   head_commit: z.object({ message: z.string() }).nullable().optional(),
 });
 
@@ -102,14 +107,25 @@ export async function webhookRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(200).send({ ignored: true });
     }
 
-    const deployed = matchingProjects.map((project) =>
-      app.queue.enqueue({
+    const deployed = matchingProjects.map((project) => {
+      const deploymentId = app.queue.enqueue({
         projectId: project.id,
         trigger: 'push',
         commitSha: payload.after,
         commitMessage: payload.head_commit?.message,
-      }),
-    );
+      });
+
+      recordAudit(app.db, {
+        actorId: null,
+        actorName: 'github',
+        action: 'deploy.trigger',
+        targetType: 'project',
+        targetName: project.slug,
+        meta: { trigger: 'push', commitSha: payload.after, deploymentId },
+      });
+
+      return deploymentId;
+    });
 
     return reply.code(200).send({ deployed });
   });
