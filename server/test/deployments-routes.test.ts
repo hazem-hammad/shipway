@@ -457,6 +457,12 @@ function onceEventArgs<T extends unknown[]>(ws: WebSocket, event: string): Promi
 }
 
 describe('WS /api/deployments/:id/logs/stream', () => {
+  // Real TCP listen + a real WebSocket client round-tripping three phases (backlog, live line,
+  // close) — under full-suite load (44 files' worth of servers/sockets contending for the event
+  // loop) the default 5000ms per-test timeout can be tight even though nothing is actually stuck;
+  // every wait below is already gated on an explicit signal (a `deferred()` release or a socket
+  // event), not a fixed delay, so a longer bound here only buys headroom against scheduler jitter
+  // without hiding a real hang (see runshell.test.ts's `sleep`-abort test for the same pattern).
   it('sends the backlog, then live lines, then closes when the run ends', async () => {
     const dataDir = tmpDataDir();
     const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir });
@@ -500,7 +506,7 @@ describe('WS /api/deployments/:id/logs/stream', () => {
 
     ws.terminate();
     await app.close();
-  });
+  }, 20000);
 
   it('rejects an unauthenticated WebSocket connection', async () => {
     const dataDir = tmpDataDir();

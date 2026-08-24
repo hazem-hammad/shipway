@@ -6,14 +6,19 @@ The whole point of Shipway versus a general-purpose PaaS is that it is fast, sma
 
 ## Features
 
-- **Deploys from GitHub** via a GitHub App: push to a project's branch and Shipway builds and activates a new release automatically, or trigger one by hand.
+- **Home dashboard**: a greeting, an overview of recent projects, quick-action tiles, and an activity rail showing project/deployment counts and system status at a glance.
+- **Deploys from GitHub** via a GitHub App, or from any **Git URL** for repos outside GitHub: push to a project's branch and Shipway builds and activates a new release automatically, or trigger one by hand.
 - **Zero-downtime releases**: each deploy lands in its own release folder; going live is an atomic symlink flip. Instant rollback to any of the last 5 releases.
 - **PHP, Node, Next.js, and static projects**, each served as a native process (php-fpm, a systemd unit, or a plain nginx root) with multiple runtime versions installed side by side.
 - **Live deploy logs** streamed over WebSocket while a deploy runs, and persisted to disk afterward.
+- **Global deployments view** listing recent deploys across every project, alongside each project's own history.
 - **Databases**: create/drop MySQL and Postgres databases with a dedicated user, reveal credentials on demand, inject them straight into a project's env.
 - **Workers and cron**: background worker processes (systemd, restart-on-crash) and a managed crontab block, both editable per project.
 - **Per-project SMTP** with Mailpit as the default catch-all inbox, or a project's own SMTP credentials.
-- **Deploy notifications** to Slack/Discord/Telegram-compatible webhooks.
+- **Team roles and invite links**: Owner, Admin, and Member roles enforced server-side; adding someone to the team is a copyable invite link, no email infrastructure required.
+- **Notification channels and event matrix**: named delivery channels (Slack/Discord/Telegram-compatible webhooks) subscribed per event (deploy failed/succeeded/canceled/rolled back, service down/recovered), with test-send from the dashboard.
+- **Audit log**: every mutating action is recorded with actor, action, and target, filterable by category and searchable, with configurable retention and automatic purge.
+- **Light and dark theme**, following the system preference by default with a manual toggle.
 - **One wildcard SSL certificate** for every project's subdomain, issued and renewed automatically via Let's Encrypt DNS-01.
 
 ## Architecture

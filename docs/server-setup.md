@@ -57,6 +57,14 @@ The first time you open `https://deploy.<base-domain>`, Shipway walks you throug
 
 From there, **Projects > New** lists the installation's repositories and lets you pick a branch, runtime, and commands.
 
+## Team, notifications, and audit log
+
+The account created in the setup wizard becomes the **owner**. Everyone after that is invited from **Settings > Team**: send an invite (email + Member or Admin role) and Shipway hands back a one-time link, `/invite/<token>`, valid for 7 days, no outgoing email required. The invitee opens the link, sets a name and password, and is signed in immediately. There is no separate "add user" form; invite links are how every team member after the first gets added, and roles (Owner/Admin/Member) are enforced on every write, not just shown in the UI.
+
+**Settings > Notifications** replaces the single global webhook URL with named delivery channels (each a Slack/Discord/Telegram-compatible webhook URL, auto-detected) and a per-event matrix: subscribe any channel to deploy failed/succeeded/canceled/rolled back, or service down/recovered, independently. A test-send button confirms a channel is reachable before you rely on it. A `notify_webhook_url` set under v1 is migrated automatically into a channel named "Default" the first time Shipway boots on v2.
+
+**Audit log** (Settings rail, or the sidebar's Audit log item) records every mutating action across the dashboard, actor, action, and target, filterable by category (Deployments, Projects, Databases, Team, Settings) and searchable. Retention defaults to 90 days (30/90/365 available) with automatic purge; recording itself can be turned off from the same right-rail card if you don't want the history kept at all.
+
 ## Where things live on disk
 
 | Path | What |
