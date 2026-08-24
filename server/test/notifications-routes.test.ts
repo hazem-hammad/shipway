@@ -11,10 +11,25 @@ import { buildOwnerApp, createAdmin, createMember } from './helpers.js';
 
 const FORBIDDEN_ADMIN = { error: 'requires admin' };
 
+interface PublicChannel {
+  id: number;
+  name: string;
+  type: 'webhook' | 'teams' | 'email';
+  url: string | null;
+  target: string | null;
+}
+
 interface MatrixResponse {
-  channels: { id: number; name: string; url: string }[];
+  channels: PublicChannel[];
   events: { event: string; label: string; description: string; category: string }[];
   subscriptions: { event: string; channelId: number }[];
+}
+
+/** Configures instance mail (driver: mailpit — no validation, no real credentials needed) via the
+ * Task 3 route, a prerequisite for creating/keeping an `email`-typed channel. */
+async function configureMail(app: Awaited<ReturnType<typeof buildOwnerApp>>['app'], cookie: string): Promise<void> {
+  const res = await app.inject({ method: 'PUT', url: '/api/settings/mail', headers: { cookie }, payload: { driver: 'mailpit' } });
+  if (res.statusCode !== 200) throw new Error(`configureMail: PUT /api/settings/mail failed (${res.statusCode}): ${res.body}`);
 }
 
 describe('GET /api/notifications', () => {
@@ -34,7 +49,7 @@ describe('GET /api/notifications', () => {
     const body = res.json() as MatrixResponse;
 
     expect(body.channels).toHaveLength(1);
-    expect(body.channels[0]).toMatchObject({ name: 'ops', url: 'https://hooks.slack.com/services/aaa' });
+    expect(body.channels[0]).toMatchObject({ name: 'ops', type: 'webhook', url: 'https://hooks.slack.com/services/aaa', target: null });
     expect(body.events).toHaveLength(6);
     const eventNames = body.events.map((e) => e.event).sort();
     expect(eventNames).toEqual(
@@ -483,6 +498,360 @@ describe('PUT /api/notifications/subscriptions', () => {
       payload: { event: 'deploy_failed', channelId: 999999, enabled: true },
     });
     expect(res.statusCode).toBe(404);
+
+    await app.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Channel type: teams / email (plan Task 4 / spec §3 "Delivery channels")
+// ---------------------------------------------------------------------------
+
+describe('POST /api/notifications/channels — type: teams', () => {
+  it('creates a teams channel with a valid http(s) url, same as a webhook channel', async () => {
+    const { app, cookie } = await buildOwnerApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'teams-ops', type: 'teams', url: 'https://acme.webhook.office.com/webhookb2/abc/IncomingWebhook/def' },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as PublicChannel;
+    expect(body).toMatchObject({ name: 'teams-ops', type: 'teams', url: 'https://acme.webhook.office.com/webhookb2/abc/IncomingWebhook/def', target: null });
+
+    await app.close();
+  });
+
+  it('400s a teams channel with a missing/invalid url', async () => {
+    const { app, cookie } = await buildOwnerApp();
+
+    const missing = await app.inject({ method: 'POST', url: '/api/notifications/channels', headers: { cookie }, payload: { name: 'x', type: 'teams' } });
+    expect(missing.statusCode).toBe(400);
+
+    const invalid = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'y', type: 'teams', url: 'not-a-url' },
+    });
+    expect(invalid.statusCode).toBe(400);
+
+    await app.close();
+  });
+});
+
+describe('POST /api/notifications/channels — type: email', () => {
+  it('400s with a clear message when instance mail is not configured', async () => {
+    const { app, cookie } = await buildOwnerApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: string }).error).toContain('configure instance mail');
+
+    await app.close();
+  });
+
+  it('400s for a syntactically invalid email address, even with mail configured', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'not-an-email' },
+    });
+    expect(res.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('400s for a missing target address', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+
+    const res = await app.inject({ method: 'POST', url: '/api/notifications/channels', headers: { cookie }, payload: { name: 'ops-email', type: 'email' } });
+    expect(res.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('creates an email channel once mail is configured and the address is valid — url null, target set', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as PublicChannel;
+    expect(body).toMatchObject({ name: 'ops-email', type: 'email', url: null, target: 'ops@example.com' });
+
+    const row = app.db.select().from(notificationChannels).where(eq(notificationChannels.id, body.id)).get();
+    expect(row?.url).toBeNull();
+    expect(row?.target).toBe('ops@example.com');
+
+    await app.close();
+  });
+
+  it('member 403s creating an email channel (same admin gate as every other channel type)', async () => {
+    const { app } = await buildOwnerApp();
+    const { cookie: memberCookie } = await createMember(app);
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie: memberCookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    expect(res.statusCode).toBe(403);
+
+    await app.close();
+  });
+
+  it('a duplicate name is still 409 even across different types', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+    await app.inject({ method: 'POST', url: '/api/notifications/channels', headers: { cookie }, payload: { name: 'ops', url: 'https://hooks.slack.com/services/aaa' } });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops', type: 'email', target: 'ops@example.com' },
+    });
+    expect(res.statusCode).toBe(409);
+
+    await app.close();
+  });
+
+  it('omitting type defaults to webhook (backward-compatible payload shape)', async () => {
+    const { app, cookie } = await buildOwnerApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'legacy-shape', url: 'https://hooks.slack.com/services/aaa' },
+    });
+    expect(res.statusCode).toBe(201);
+    expect((res.json() as PublicChannel).type).toBe('webhook');
+
+    await app.close();
+  });
+});
+
+describe('PATCH /api/notifications/channels/:id — changing type', () => {
+  it('switching an existing webhook channel to email requires a target AND mail already configured', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops', url: 'https://hooks.slack.com/services/aaa' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    // Mail not yet configured — even with a target supplied, this must 400 with the same message
+    // POST would give.
+    const notConfigured = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/channels/${String(id)}`,
+      headers: { cookie },
+      payload: { type: 'email', target: 'ops@example.com' },
+    });
+    expect(notConfigured.statusCode).toBe(400);
+    expect((notConfigured.json() as { error: string }).error).toContain('configure instance mail');
+
+    await configureMail(app, cookie);
+
+    const ok = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/channels/${String(id)}`,
+      headers: { cookie },
+      payload: { type: 'email', target: 'ops@example.com' },
+    });
+    expect(ok.statusCode).toBe(200);
+    const body = ok.json() as PublicChannel;
+    expect(body).toMatchObject({ type: 'email', url: null, target: 'ops@example.com' });
+
+    await app.close();
+  });
+
+  it('switching type to email WITHOUT supplying a target 400s rather than silently keeping the old url as a "target"', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops', url: 'https://hooks.slack.com/services/aaa' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    const res = await app.inject({ method: 'PATCH', url: `/api/notifications/channels/${String(id)}`, headers: { cookie }, payload: { type: 'email' } });
+    expect(res.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('switching an email channel back to webhook requires a fresh url (the old target does not carry over)', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    const missingUrl = await app.inject({ method: 'PATCH', url: `/api/notifications/channels/${String(id)}`, headers: { cookie }, payload: { type: 'webhook' } });
+    expect(missingUrl.statusCode).toBe(400);
+
+    const ok = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/channels/${String(id)}`,
+      headers: { cookie },
+      payload: { type: 'webhook', url: 'https://hooks.slack.com/services/back' },
+    });
+    expect(ok.statusCode).toBe(200);
+    expect(ok.json()).toMatchObject({ type: 'webhook', url: 'https://hooks.slack.com/services/back', target: null });
+
+    await app.close();
+  });
+
+  it('a PATCH that only touches name keeps the existing type/url/target untouched', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    const res = await app.inject({ method: 'PATCH', url: `/api/notifications/channels/${String(id)}`, headers: { cookie }, payload: { name: 'ops-email-renamed' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ name: 'ops-email-renamed', type: 'email', url: null, target: 'ops@example.com' });
+
+    await app.close();
+  });
+});
+
+describe('POST /api/notifications/channels/:id/test — per-type', () => {
+  it('an email channel test-send returns {ok: false, error} when instance mail is not configured', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    // Un-configure mail again after the channel already exists (a realistic later state).
+    await app.inject({ method: 'PUT', url: '/api/settings/mail', headers: { cookie }, payload: { driver: 'none' } });
+
+    const res = await app.inject({ method: 'POST', url: `/api/notifications/channels/${String(id)}/test`, headers: { cookie } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: false, error: 'instance mail is not configured' });
+
+    await app.close();
+  });
+
+  it('an email channel test-send never 500s when the configured smtp host is unreachable', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await app.inject({
+      method: 'PUT',
+      url: '/api/settings/mail',
+      headers: { cookie },
+      // Port 1 is reserved (TCPMUX) and never has an SMTP listener — connection is refused fast.
+      payload: { driver: 'smtp', host: '127.0.0.1', port: 1, fromAddress: 'a@b.com' },
+    });
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    const res = await app.inject({ method: 'POST', url: `/api/notifications/channels/${String(id)}/test`, headers: { cookie } });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { ok: boolean; error?: string };
+    expect(body.ok).toBe(false);
+    expect(typeof body.error).toBe('string');
+
+    await app.close();
+  }, 10_000);
+
+  it('a teams channel test-send posts a MessageCard body and returns {ok: true}', async () => {
+    const calls: { url: string; body: string }[] = [];
+    const fetchImpl = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      calls.push({ url: input.toString(), body: (init?.body as string) ?? '' });
+      return Promise.resolve({ ok: true, status: 200 } as Response);
+    }) as typeof fetch;
+    const { app, cookie } = await buildOwnerApp({ fetchImpl });
+
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'teams-ops', type: 'teams', url: 'https://relay.example.com/teams-in' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    const res = await app.inject({ method: 'POST', url: `/api/notifications/channels/${String(id)}/test`, headers: { cookie } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true });
+
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(calls[0]?.body ?? '{}') as { '@type': string };
+    expect(body['@type']).toBe('MessageCard');
+
+    await app.close();
+  });
+});
+
+describe('GET /api/notifications — matrix includes type/target', () => {
+  it('lists a mix of webhook/teams/email channels with their type and target', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+
+    await app.inject({ method: 'POST', url: '/api/notifications/channels', headers: { cookie }, payload: { name: 'webhook-ops', url: 'https://hooks.slack.com/services/aaa' } });
+    await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'teams-ops', type: 'teams', url: 'https://relay.example.com/teams-in' },
+    });
+    await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'email-ops', type: 'email', target: 'ops@example.com' },
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/api/notifications', headers: { cookie } });
+    const body = res.json() as MatrixResponse;
+    const byName = new Map(body.channels.map((c) => [c.name, c]));
+
+    expect(byName.get('webhook-ops')).toMatchObject({ type: 'webhook', url: 'https://hooks.slack.com/services/aaa', target: null });
+    expect(byName.get('teams-ops')).toMatchObject({ type: 'teams', url: 'https://relay.example.com/teams-in', target: null });
+    expect(byName.get('email-ops')).toMatchObject({ type: 'email', url: null, target: 'ops@example.com' });
 
     await app.close();
   });

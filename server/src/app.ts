@@ -305,7 +305,7 @@ export async function buildApp(
     message: string;
     rolledBack?: boolean;
   }): Promise<void> {
-    await notifyDeployTerminal(app.db, fetchImpl, p);
+    await notifyDeployTerminal(app.db, fetchImpl, p, app.secretBox);
   }
 
   const pipelineDeps: PipelineDeps = {
@@ -351,7 +351,7 @@ export async function buildApp(
           // bus needs a separate emission for, driven off `runDeploy`'s own return value instead.
           if (result === 'canceled') {
             try {
-              await notifyDeployCanceled(app.db, fetchImpl, deploymentId);
+              await notifyDeployCanceled(app.db, fetchImpl, deploymentId, app.secretBox);
             } catch (err) {
               app.log.error({ err }, 'notifyDeployCanceled failed');
             }
@@ -471,6 +471,7 @@ export async function buildApp(
           sysops: app.sysops,
           intervalMs: deps.serviceWatch?.intervalMs ?? SERVICE_WATCH_INTERVAL_MS,
           fetchImpl: deps.serviceWatch?.fetchImpl ?? fetchImpl,
+          secretBox: app.secretBox,
         })
       : undefined,
   );

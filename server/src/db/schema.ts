@@ -128,12 +128,23 @@ export const cronJobs = sqliteTable('cron_jobs', {
   command: text('command').notNull(),
 });
 
-/** Named notification delivery targets (webhook URL; Slack-compatible/Discord/Telegram
- * auto-detected by `services/notify.ts`'s formatter — see Task 4). */
+/** Named notification delivery targets. `type` picks the delivery mechanism (migration 0002, plan
+ * Task 4): `'webhook'` (default; Slack-compatible/Discord/Telegram auto-detected by
+ * `services/notify.ts`'s formatter, and Microsoft Teams auto-detected the same way from a
+ * `webhook.office.com`/`logic.azure.com` URL even without an explicit `type: 'teams'`), `'teams'`
+ * (explicit — always formatted as a Teams MessageCard regardless of URL), or `'email'` (routes
+ * through instance mail to `target` instead of posting to `url`). `url` is nullable so an email
+ * channel can leave it unset; `target` is the email address for `type: 'email'` channels, null for
+ * everything else. Existing pre-migration rows read back as `type: 'webhook'` with their `url`
+ * untouched — see `drizzle/0002_*.sql`. */
 export const notificationChannels = sqliteTable('notification_channels', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull().unique(),
-  url: text('url').notNull(),
+  url: text('url'),
+  type: text('type', { enum: ['webhook', 'teams', 'email'] })
+    .notNull()
+    .default('webhook'),
+  target: text('target'),
   createdAt: integer('created_at', { mode: 'number' })
     .notNull()
     .$defaultFn(() => Date.now()),

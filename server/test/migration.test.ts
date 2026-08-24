@@ -55,6 +55,78 @@ function buildLegacyV1Db(dbPath: string): void {
   client.close();
 }
 
+describe('migration 0002 — fresh install', () => {
+  it('notification_channels gets type (default webhook) + nullable target/url columns', () => {
+    const db = openDb(tmpDbPath());
+
+    const columns = db.all<{ name: string; notnull: number; dflt_value: string | null }>(sql`PRAGMA table_info(notification_channels)`);
+    const byName = new Map(columns.map((c) => [c.name, c]));
+
+    expect(byName.get('type')).toMatchObject({ notnull: 1, dflt_value: "'webhook'" });
+    expect(byName.get('target')).toMatchObject({ notnull: 0 });
+    expect(byName.get('url')).toMatchObject({ notnull: 0 });
+  });
+
+  it('a channel inserted with no type/url/target defaults to webhook + null/null', () => {
+    const db = openDb(tmpDbPath());
+    db.insert(notificationChannels).values({ name: 'default-shape', url: 'https://hooks.slack.com/services/x' }).run();
+
+    const row = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'default-shape')).get();
+    expect(row?.type).toBe('webhook');
+    expect(row?.target).toBeNull();
+  });
+
+  it('an email channel can be inserted with a null url and a target address', () => {
+    const db = openDb(tmpDbPath());
+    db.insert(notificationChannels).values({ name: 'ops-email', type: 'email', target: 'ops@example.com' }).run();
+
+    const row = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'ops-email')).get();
+    expect(row?.url).toBeNull();
+    expect(row?.type).toBe('email');
+    expect(row?.target).toBe('ops@example.com');
+  });
+});
+
+describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
+  it('preserves an existing webhook-shaped channel row, backfilling type: webhook and target: null', () => {
+    const dbPath = tmpDbPath();
+    const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-legacy-0001-migrations-'));
+    fs.mkdirSync(path.join(legacyDir, 'meta'));
+    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, '0000_clever_nick_fury.sql'), path.join(legacyDir, '0000_clever_nick_fury.sql'));
+    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, '0001_overconfident_karen_page.sql'), path.join(legacyDir, '0001_overconfident_karen_page.sql'));
+    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0000_snapshot.json'), path.join(legacyDir, 'meta/0000_snapshot.json'));
+    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0001_snapshot.json'), path.join(legacyDir, 'meta/0001_snapshot.json'));
+    const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta/_journal.json'), 'utf8')) as { entries: { tag: string }[] };
+    journal.entries = journal.entries.filter((e) => e.tag !== '0002_notification_channel_type_target');
+    fs.writeFileSync(path.join(legacyDir, 'meta/_journal.json'), JSON.stringify(journal));
+
+    const client = new Database(dbPath);
+    client.pragma('journal_mode = WAL');
+    client.pragma('foreign_keys = ON');
+    const preDb = drizzle({ client });
+    migrate(preDb, { migrationsFolder: legacyDir });
+
+    // Raw insert against the pre-0002 shape (no type/target columns exist yet on disk).
+    client.prepare("INSERT INTO notification_channels (name, url, created_at) VALUES (?, ?, ?)").run('legacy-slack', 'https://hooks.slack.com/services/legacy', Date.now());
+    client.close();
+
+    // Production path: applies the pending 0002 migration.
+    const db = openDb(dbPath);
+    const row = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'legacy-slack')).get();
+    expect(row).toBeDefined();
+    expect(row?.url).toBe('https://hooks.slack.com/services/legacy');
+    expect(row?.type).toBe('webhook');
+    expect(row?.target).toBeNull();
+  });
+
+  it('running the full migration set fresh matches applying it on top of an existing db (no schema divergence)', () => {
+    const freshPath = tmpDbPath();
+    const fresh = openDb(freshPath);
+    const freshColumns = fresh.all<{ name: string }>(sql`PRAGMA table_info(notification_channels)`).map((c) => c.name).sort();
+    expect(freshColumns).toEqual(['created_at', 'id', 'name', 'target', 'type', 'url'].sort());
+  });
+});
+
 describe('migration 0001 — fresh install', () => {
   it('creates every v2 table/column on a brand-new db', () => {
     const db = openDb(tmpDbPath());

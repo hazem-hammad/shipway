@@ -15,6 +15,7 @@ import { eq } from 'drizzle-orm';
 import type { ShipwayDb } from '../db/index.js';
 import { deployments, projects } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
+import type { SecretBox } from '../lib/secretbox.js';
 import { EVENTS, emitEvent, type NotifyEvent } from './notifybus.js';
 import { sendDeployNotification } from './notify.js';
 
@@ -42,7 +43,7 @@ function busMessage(projectSlug: string, deploymentId: number, commitSha: string
   return `[${projectSlug}] deploy #${String(deploymentId)}${sha ? ` ${sha}` : ''} ${detail}`;
 }
 
-export async function notifyDeployTerminal(db: ShipwayDb, fetchImpl: typeof fetch, p: DeployNotifyPayload): Promise<void> {
+export async function notifyDeployTerminal(db: ShipwayDb, fetchImpl: typeof fetch, p: DeployNotifyPayload, secretBox?: SecretBox): Promise<void> {
   const deploymentRow = db
     .select({ projectId: deployments.projectId, commitSha: deployments.commitSha })
     .from(deployments)
@@ -66,10 +67,10 @@ export async function notifyDeployTerminal(db: ShipwayDb, fetchImpl: typeof fetc
   // that are themselves subscribed to the event (see emitEvent).
   const event: NotifyEvent = p.status === 'success' ? 'deploy_succeeded' : p.rolledBack ? 'deploy_rolled_back' : 'deploy_failed';
   const message = busMessage(p.project, p.deploymentId, deploymentRow?.commitSha, p.message);
-  await emitEvent(db, event, { title: EVENTS[event].label, message }, fetchImpl);
+  await emitEvent(db, event, { title: EVENTS[event].label, message }, fetchImpl, secretBox);
 }
 
-export async function notifyDeployCanceled(db: ShipwayDb, fetchImpl: typeof fetch, deploymentId: number): Promise<void> {
+export async function notifyDeployCanceled(db: ShipwayDb, fetchImpl: typeof fetch, deploymentId: number, secretBox?: SecretBox): Promise<void> {
   const row = db
     .select({ slug: projects.slug, commitSha: deployments.commitSha })
     .from(deployments)
@@ -79,5 +80,5 @@ export async function notifyDeployCanceled(db: ShipwayDb, fetchImpl: typeof fetc
   if (!row) return;
 
   const message = busMessage(row.slug, deploymentId, row.commitSha, 'deploy canceled');
-  await emitEvent(db, 'deploy_canceled', { title: EVENTS.deploy_canceled.label, message }, fetchImpl);
+  await emitEvent(db, 'deploy_canceled', { title: EVENTS.deploy_canceled.label, message }, fetchImpl, secretBox);
 }

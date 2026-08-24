@@ -1,7 +1,12 @@
 /**
  * Settings > Notifications (server/src/routes/notifications.ts, Task 4): "Delivery channels" — named
- * webhook targets (Slack-compatible/Discord/Telegram, auto-detected server-side) — and "What to be
- * notified about", the per-event subscription matrix.
+ * webhook/Teams/email targets — and "What to be notified about", the per-event subscription matrix.
+ *
+ * A channel's `type` picks how it's delivered: `'webhook'` (Slack-compatible/Discord/Telegram,
+ * auto-detected server-side by URL), `'teams'` (Microsoft Teams MessageCard — also auto-detected
+ * from a webhook.office.com/logic.azure.com `url`, but an explicit `type: 'teams'` channel always
+ * gets Teams formatting), or `'email'` (routes through instance mail to a `target` address instead
+ * of a URL, and requires mail to already be configured in Settings > Mail).
  *
  * The matrix has no per-channel checkbox grid (that doesn't scale past 2-3 channels and reads as a
  * spreadsheet); instead each event row is collapsed to a "n channels" chip + a master Toggle, and
@@ -10,9 +15,9 @@
  * OFF unsubscribes all. There's deliberately no "channelId per event" popover — DESIGN.md bans
  * modals/popovers where inline/progressive works.
  */
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, type ReactNode, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Bell, Check, ChevronDown, Plus } from 'lucide-react';
+import { Bell, Check, ChevronDown, Mail as MailIcon, MessageSquare, Plus, Webhook } from 'lucide-react';
 import {
   ApiError,
   createChannel,
@@ -20,16 +25,29 @@ import {
   putSubscription,
   testChannel,
   type NotificationChannel,
+  type NotificationChannelType,
   type NotificationEventMeta,
   type NotificationsMatrix,
   type NotifyEventCategory,
 } from '../../api';
-import { useNotifications } from '../../hooks';
-import { Button, Card, CardHeader, Checkbox, EmptyState, Field, ICON_STROKE, Input, Skeleton, Tabs, Toggle } from '../../components/ui';
+import { useMailConfig, useNotifications } from '../../hooks';
+import { Badge, Button, Card, CardHeader, Checkbox, EmptyState, Field, ICON_STROKE, Input, Skeleton, Tabs, Toggle } from '../../components/ui';
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
 }
+
+const CHANNEL_TYPE_LABEL: Record<NotificationChannelType, string> = {
+  webhook: 'Webhook',
+  teams: 'Microsoft Teams',
+  email: 'Email',
+};
+
+const CHANNEL_TYPE_OPTIONS: { value: NotificationChannelType; label: string; blurb: string; icon: ReactNode }[] = [
+  { value: 'webhook', label: 'Webhook', blurb: 'Slack, Discord, Telegram, or any Slack-compatible URL.', icon: <Webhook size={18} strokeWidth={ICON_STROKE} aria-hidden /> },
+  { value: 'teams', label: 'Microsoft Teams', blurb: 'A Teams channel connector webhook.', icon: <MessageSquare size={18} strokeWidth={ICON_STROKE} aria-hidden /> },
+  { value: 'email', label: 'Email', blurb: 'Sent through instance mail to one address.', icon: <MailIcon size={18} strokeWidth={ICON_STROKE} aria-hidden /> },
+];
 
 const CATEGORY_TABS: { id: 'all' | NotifyEventCategory; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -140,8 +158,13 @@ function DeliveryChannelsCard({ channels, isPending, isError }: { channels: Noti
 
 function AddChannelForm({ onDone, onCancel }: { onDone: () => void; onCancel: () => void }) {
   const queryClient = useQueryClient();
+  const mailQuery = useMailConfig();
+  const mailConfigured = mailQuery.data?.configured ?? false;
+
   const [name, setName] = useState('');
+  const [type, setType] = useState<NotificationChannelType>('webhook');
   const [url, setUrl] = useState('');
+  const [target, setTarget] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -150,7 +173,7 @@ function AddChannelForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
     setSubmitting(true);
     setError(null);
     try {
-      await createChannel({ name, url });
+      await createChannel(type === 'email' ? { name, type, target } : { name, type, url });
       await queryClient.invalidateQueries({ queryKey: ['notifications'] });
       onDone();
     } catch (err) {
@@ -164,21 +187,79 @@ function AddChannelForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
     }
   }
 
+  const emailBlocked = type === 'email' && !mailConfigured;
+  const canSubmit = name.trim() !== '' && (type === 'email' ? target.trim() !== '' && mailConfigured : url.trim() !== '');
+
   return (
     <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[560px] flex-col gap-4 rounded-xl bg-surface-2 p-4" noValidate>
       <Field label="Name">
         <Input required autoFocus value={name} onChange={(event) => setName(event.target.value)} />
       </Field>
-      <Field label="Webhook URL" hint="Slack-compatible, Discord, or Telegram sendMessage URL.">
-        <Input mono type="url" required placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
-      </Field>
+
+      <div role="radiogroup" aria-label="Channel type" className="flex flex-col gap-2">
+        {CHANNEL_TYPE_OPTIONS.map((option) => (
+          <label
+            key={option.value}
+            className={`flex items-start gap-3 rounded-xl border px-4 py-3 transition-colors duration-150 ease-out ${
+              type === option.value ? 'border-focus bg-surface' : 'border-line bg-surface hover:bg-surface-3'
+            }`}
+          >
+            <input
+              type="radio"
+              name="channel-type"
+              value={option.value}
+              checked={type === option.value}
+              onChange={() => {
+                setType(option.value);
+                setError(null);
+              }}
+              className="mt-1 h-4 w-4 accent-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+            />
+            <span className="mt-0.5 shrink-0 text-icon">{option.icon}</span>
+            <span>
+              <span className="block text-sm font-semibold text-ink">{option.label}</span>
+              <span className="block text-[13px] text-soft">{option.blurb}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      {type !== 'email' ? (
+        <Field label="Webhook URL" hint={type === 'teams' ? 'Incoming Webhook URL from the Teams channel connector.' : 'Slack-compatible, Discord, or Telegram sendMessage URL.'}>
+          <Input mono type="url" required placeholder="https://" value={url} onChange={(event) => setUrl(event.target.value)} />
+        </Field>
+      ) : (
+        <Field
+          label="Email address"
+          hint={
+            mailQuery.isPending
+              ? undefined
+              : mailConfigured
+                ? undefined
+                : 'Instance mail is not configured yet — set it up in Settings > Mail first.'
+          }
+        >
+          <Input mono type="email" required placeholder="you@example.com" value={target} onChange={(event) => setTarget(event.target.value)} />
+        </Field>
+      )}
+
+      {emailBlocked && !mailQuery.isPending && (
+        <p className="text-[13px] text-soft">
+          The Add button stays disabled until instance mail is configured — see{' '}
+          <a href="/settings/mail" className="font-medium text-ink underline underline-offset-2">
+            Settings &gt; Mail
+          </a>
+          .
+        </p>
+      )}
+
       {error && (
         <p role="alert" className="text-sm text-danger">
           {error}
         </p>
       )}
       <div className="flex items-center gap-2">
-        <Button type="submit" loading={submitting}>
+        <Button type="submit" loading={submitting} disabled={!canSubmit || submitting}>
           Add channel
         </Button>
         <Button type="button" variant="outline" onClick={onCancel} disabled={submitting}>
@@ -193,21 +274,29 @@ function ChannelRow({ channel }: { channel: NotificationChannel }) {
   const queryClient = useQueryClient();
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<'ok' | 'fail' | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const destination = channel.type === 'email' ? channel.target : channel.url;
+
   async function handleTest() {
     setTesting(true);
     setTestResult(null);
+    setTestError(null);
     try {
-      const { ok } = await testChannel(channel.id);
+      const { ok, error: sendError } = await testChannel(channel.id);
       setTestResult(ok ? 'ok' : 'fail');
+      if (!ok && sendError) setTestError(sendError);
     } catch {
       setTestResult('fail');
     } finally {
       setTesting(false);
-      setTimeout(() => setTestResult(null), 3000);
+      setTimeout(() => {
+        setTestResult(null);
+        setTestError(null);
+      }, 3000);
     }
   }
 
@@ -227,8 +316,11 @@ function ChannelRow({ channel }: { channel: NotificationChannel }) {
     <div className="flex flex-col py-1">
       <div className="flex h-14 items-center gap-3">
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm font-semibold text-ink">{channel.name}</div>
-          <div className="truncate font-mono text-xs text-soft">{channel.url}</div>
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm font-semibold text-ink">{channel.name}</span>
+            <Badge>{CHANNEL_TYPE_LABEL[channel.type]}</Badge>
+          </div>
+          <div className="truncate font-mono text-xs text-soft">{destination}</div>
         </div>
         <div className="flex shrink-0 items-center gap-3">
           {testResult === 'ok' && (
@@ -236,7 +328,11 @@ function ChannelRow({ channel }: { channel: NotificationChannel }) {
               <Check size={13} strokeWidth={ICON_STROKE} aria-hidden /> Sent
             </span>
           )}
-          {testResult === 'fail' && <span className="text-xs font-medium text-danger">Failed</span>}
+          {testResult === 'fail' && (
+            <span className="text-xs font-medium text-danger" title={testError ?? undefined}>
+              Failed
+            </span>
+          )}
           <button
             type="button"
             onClick={() => void handleTest()}

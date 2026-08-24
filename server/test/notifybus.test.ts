@@ -3,24 +3,48 @@
  * `GET /api/notifications`) and `emitEvent` (fans a `{title, message}` payload out to every channel
  * currently subscribed to that event, reusing `services/notify.ts`'s URL-format detection).
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { eq } from 'drizzle-orm';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { openDb, type ShipwayDb } from '../src/db/index.js';
 import { notificationChannels, notificationSubscriptions } from '../src/db/schema.js';
+import { SecretBox } from '../src/lib/secretbox.js';
+import { saveMailConfig } from '../src/services/mailer.js';
+import type { MailTransport } from '../src/services/mailer.js';
 import { EVENTS, emitEvent, type NotifyEvent } from '../src/services/notifybus.js';
+import type { TeamsMessageCard } from '../src/services/notify.js';
 
-function tmpDb(): ShipwayDb {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-notifybus-test-'));
-  return openDb(path.join(dir, 'shipway.db'));
+interface TestFixtures {
+  db: ShipwayDb;
+  secretBox: SecretBox;
 }
 
-function insertChannel(db: ShipwayDb, name: string, url: string): number {
-  db.insert(notificationChannels).values({ name, url }).run();
+function tmpFixtures(): TestFixtures {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-notifybus-test-'));
+  const db = openDb(path.join(dir, 'shipway.db'));
+  const secretBox = SecretBox.load(path.join(dir, 'secret.key'));
+  return { db, secretBox };
+}
+
+function tmpDb(): ShipwayDb {
+  return tmpFixtures().db;
+}
+
+type ChannelType = 'webhook' | 'teams' | 'email';
+
+function insertChannel(db: ShipwayDb, name: string, url: string, type: ChannelType = 'webhook'): number {
+  db.insert(notificationChannels).values({ name, url, type }).run();
   const row = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, name)).get();
   if (!row) throw new Error('failed to insert test channel');
+  return row.id;
+}
+
+function insertEmailChannel(db: ShipwayDb, name: string, target: string): number {
+  db.insert(notificationChannels).values({ name, type: 'email', target }).run();
+  const row = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, name)).get();
+  if (!row) throw new Error('failed to insert test email channel');
   return row.id;
 }
 
@@ -162,5 +186,165 @@ describe('emitEvent', () => {
     // No channels subscribed, so the default fetch is never actually invoked — this just proves the
     // 4th arg is optional per the spec's `emitEvent(db, event, payload, fetchImpl?)` signature.
     await expect(emitEvent(db, 'deploy_succeeded', { title: 'x', message: 'y' })).resolves.toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dispatch by channel type (plan Task 4 / spec §3 "Delivery channels")
+// ---------------------------------------------------------------------------
+
+describe('emitEvent — teams-typed channels', () => {
+  it('formats an explicit type: teams channel as a MessageCard even when its URL does not match the auto-detect pattern', async () => {
+    const db = tmpDb();
+    const channelId = insertChannel(db, 'teams-ops', 'https://relay.example.com/teams-in', 'teams');
+    subscribe(db, 'deploy_failed', channelId);
+
+    const { fetchImpl, calls } = fakeFetch();
+    await emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: '[shop] deploy #12 build failed' }, fetchImpl);
+
+    expect(calls).toHaveLength(1);
+    const body = JSON.parse(calls[0]?.init?.body as string) as TeamsMessageCard;
+    expect(body['@type']).toBe('MessageCard');
+    expect(body.title).toBe('Deploy failed');
+    // Same flattened "title: message" text every other webhook format gets (see the "sends 'title:
+    // message' as the text" test above) — the MessageCard's separate `title` field is additive, not
+    // a replacement for it.
+    expect(body.text).toBe('Deploy failed: [shop] deploy #12 build failed');
+    expect(body.themeColor).toBe('DC2626'); // failure -> red
+  });
+
+  it('auto-detects Teams formatting for a webhook-typed channel whose URL is a webhook.office.com endpoint', async () => {
+    const db = tmpDb();
+    const channelId = insertChannel(db, 'auto-teams', 'https://acme.webhook.office.com/webhookb2/abc/IncomingWebhook/def', 'webhook');
+    subscribe(db, 'deploy_succeeded', channelId);
+
+    const { fetchImpl, calls } = fakeFetch();
+    await emitEvent(db, 'deploy_succeeded', { title: 'Deploy succeeded', message: '[shop] deploy #13 ok' }, fetchImpl);
+
+    const body = JSON.parse(calls[0]?.init?.body as string) as TeamsMessageCard;
+    expect(body['@type']).toBe('MessageCard');
+    expect(body.themeColor).toBe('16A34A'); // success -> green
+  });
+
+  it('uses the neutral/gray themeColor for deploy_canceled', async () => {
+    const db = tmpDb();
+    const channelId = insertChannel(db, 'teams-cancel', 'https://relay.example.com/teams-in', 'teams');
+    subscribe(db, 'deploy_canceled', channelId);
+
+    const { fetchImpl, calls } = fakeFetch();
+    await emitEvent(db, 'deploy_canceled', { title: 'Deploy canceled', message: 'x' }, fetchImpl);
+
+    const body = JSON.parse(calls[0]?.init?.body as string) as TeamsMessageCard;
+    expect(body.themeColor).toBe('6B7280');
+  });
+});
+
+describe('emitEvent — email-typed channels', () => {
+  it('sends via the mailer to the channel target, subject = event label, body = the message', async () => {
+    const { db, secretBox } = tmpFixtures();
+    saveMailConfig(db, secretBox, { driver: 'smtp', host: 'smtp.example.com', port: 587, secure: false, fromAddress: 'noreply@example.com' });
+    const channelId = insertEmailChannel(db, 'ops-email', 'ops@example.com');
+    subscribe(db, 'deploy_failed', channelId);
+
+    const sendMailMock = vi.fn().mockResolvedValue({ messageId: 'abc' });
+    const fakeTransport: MailTransport = { sendMail: sendMailMock };
+
+    await emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: '[shop] deploy #12 build failed' }, fetch, secretBox, () => fakeTransport);
+
+    expect(sendMailMock).toHaveBeenCalledWith({
+      from: 'noreply@example.com',
+      to: 'ops@example.com',
+      subject: 'Deploy failed',
+      text: '[shop] deploy #12 build failed',
+      html: undefined,
+    });
+  });
+
+  it('skips (never throws) when instance mail is not configured', async () => {
+    const { db, secretBox } = tmpFixtures();
+    // instance mail left at its default driver: 'none'
+    const channelId = insertEmailChannel(db, 'ops-email', 'ops@example.com');
+    subscribe(db, 'deploy_failed', channelId);
+
+    const sendMailMock = vi.fn();
+    await expect(
+      emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: 'x' }, fetch, secretBox, () => ({ sendMail: sendMailMock })),
+    ).resolves.toBeUndefined();
+    expect(sendMailMock).not.toHaveBeenCalled();
+  });
+
+  it('skips (never throws) when no secretBox is supplied at all', async () => {
+    const db = tmpDb();
+    const channelId = insertEmailChannel(db, 'ops-email', 'ops@example.com');
+    subscribe(db, 'deploy_failed', channelId);
+
+    await expect(emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: 'x' }, fetch)).resolves.toBeUndefined();
+  });
+
+  it('skips (never throws) when the email channel has no target', async () => {
+    const { db, secretBox } = tmpFixtures();
+    saveMailConfig(db, secretBox, { driver: 'mailpit', host: '127.0.0.1', port: 1025, secure: false, fromAddress: 'shipway@localhost' });
+    db.insert(notificationChannels).values({ name: 'broken-email', type: 'email' }).run();
+    const channel = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, 'broken-email')).get()!;
+    subscribe(db, 'deploy_failed', channel.id);
+
+    const sendMailMock = vi.fn();
+    await expect(
+      emitEvent(db, 'deploy_failed', { title: 'x', message: 'y' }, fetch, secretBox, () => ({ sendMail: sendMailMock })),
+    ).resolves.toBeUndefined();
+    expect(sendMailMock).not.toHaveBeenCalled();
+  });
+
+  it('never throws when the mailer transport itself fails', async () => {
+    const { db, secretBox } = tmpFixtures();
+    saveMailConfig(db, secretBox, { driver: 'mailpit', host: '127.0.0.1', port: 1025, secure: false, fromAddress: 'shipway@localhost' });
+    const channelId = insertEmailChannel(db, 'ops-email', 'ops@example.com');
+    subscribe(db, 'deploy_failed', channelId);
+
+    const fakeTransport: MailTransport = { sendMail: vi.fn().mockRejectedValue(new Error('connection refused')) };
+    await expect(
+      emitEvent(db, 'deploy_failed', { title: 'x', message: 'y' }, fetch, secretBox, () => fakeTransport),
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('emitEvent — mixed channel types isolate each other’s failures', () => {
+  it('a failing webhook channel does not block a healthy teams channel or a healthy email channel subscribed to the same event', async () => {
+    const { db, secretBox } = tmpFixtures();
+    saveMailConfig(db, secretBox, { driver: 'mailpit', host: '127.0.0.1', port: 1025, secure: false, fromAddress: 'shipway@localhost' });
+
+    const webhookId = insertChannel(db, 'flaky-webhook', 'https://hooks.slack.com/services/flaky', 'webhook');
+    const teamsId = insertChannel(db, 'healthy-teams', 'https://relay.example.com/teams-in', 'teams');
+    const emailId = insertEmailChannel(db, 'healthy-email', 'ops@example.com');
+    subscribe(db, 'deploy_failed', webhookId);
+    subscribe(db, 'deploy_failed', teamsId);
+    subscribe(db, 'deploy_failed', emailId);
+
+    const { fetchImpl, calls } = fakeFetch((url) => (url.includes('flaky') ? new Error('network down') : { ok: true, status: 200 }));
+    const sendMailMock = vi.fn().mockResolvedValue({ messageId: 'abc' });
+
+    await expect(
+      emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: 'oops' }, fetchImpl, secretBox, () => ({ sendMail: sendMailMock })),
+    ).resolves.toBeUndefined();
+
+    // The flaky webhook was attempted and failed, but the teams channel still got its HTTP call...
+    expect(calls.some((c) => c.url.includes('relay.example.com'))).toBe(true);
+    // ...and the email channel still got its delivery attempt.
+    expect(sendMailMock).toHaveBeenCalledWith(expect.objectContaining({ to: 'ops@example.com' }));
+  });
+
+  it('an unconfigured email channel does not block a healthy webhook channel subscribed to the same event', async () => {
+    const db = tmpDb();
+    const webhookId = insertChannel(db, 'healthy-webhook', 'https://hooks.slack.com/services/healthy', 'webhook');
+    const emailId = insertEmailChannel(db, 'unconfigured-email', 'ops@example.com');
+    subscribe(db, 'deploy_failed', webhookId);
+    subscribe(db, 'deploy_failed', emailId);
+
+    // No secretBox passed at all — the email channel is unusable, the webhook is not.
+    const { fetchImpl, calls } = fakeFetch();
+    await expect(emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: 'oops' }, fetchImpl)).resolves.toBeUndefined();
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toContain('healthy');
   });
 });

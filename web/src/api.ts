@@ -725,10 +725,20 @@ export function deleteUser(id: number): Promise<void> {
 export type NotifyEvent = 'deploy_failed' | 'deploy_succeeded' | 'deploy_canceled' | 'deploy_rolled_back' | 'service_down' | 'service_recovered';
 export type NotifyEventCategory = 'deployment' | 'services';
 
+/** `'webhook'` (Slack-compatible/Discord/Telegram, auto-detected server-side by URL) | `'teams'`
+ * (Microsoft Teams MessageCard; also auto-detected from a webhook.office.com/logic.azure.com `url`)
+ * | `'email'` (routes through instance mail to `target` instead of `url`) — plan Task 4 / spec §3
+ * "Delivery channels". */
+export type NotificationChannelType = 'webhook' | 'teams' | 'email';
+
 export interface NotificationChannel {
   id: number;
   name: string;
-  url: string;
+  type: NotificationChannelType;
+  /** Set for `type: 'webhook'`/`'teams'`, `null` for `'email'`. */
+  url: string | null;
+  /** The destination email address for `type: 'email'`, `null` otherwise. */
+  target: string | null;
 }
 
 export interface NotificationEventMeta {
@@ -751,7 +761,11 @@ export interface NotificationsMatrix {
 
 export interface CreateChannelBody {
   name: string;
-  url: string;
+  type?: NotificationChannelType;
+  /** Required for `type: 'webhook'`/`'teams'`. */
+  url?: string;
+  /** Required for `type: 'email'`. */
+  target?: string;
 }
 
 export function fetchNotifications(): Promise<NotificationsMatrix> {
@@ -766,8 +780,10 @@ export function deleteChannel(id: number): Promise<void> {
   return apiFetch<void>(`/api/notifications/channels/${String(id)}`, { method: 'DELETE' });
 }
 
-export function testChannel(id: number): Promise<{ ok: boolean }> {
-  return apiFetch<{ ok: boolean }>(`/api/notifications/channels/${String(id)}/test`, { method: 'POST' });
+/** `error` is only ever set for a failed `type: 'email'` test-send (the mailer's own error message);
+ * webhook/teams failures stay a bare `{ok: false}`. */
+export function testChannel(id: number): Promise<{ ok: boolean; error?: string }> {
+  return apiFetch<{ ok: boolean; error?: string }>(`/api/notifications/channels/${String(id)}/test`, { method: 'POST' });
 }
 
 export interface PutSubscriptionBody {

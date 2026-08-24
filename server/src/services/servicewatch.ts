@@ -8,6 +8,7 @@
  * for services nobody has polled before.
  */
 import type { ShipwayDb } from '../db/index.js';
+import type { SecretBox } from '../lib/secretbox.js';
 import { recordAudit } from './audit.js';
 import { EVENTS, emitEvent } from './notifybus.js';
 import { SERVICE_NAMES } from './stats.js';
@@ -31,6 +32,10 @@ export interface ServiceWatchDeps {
   sysops: SysOps;
   intervalMs: number;
   fetchImpl?: typeof fetch;
+  /** Needed only to deliver an `'email'`-typed notification channel (Task 4) — omitted, an email
+   * channel subscribed to `service_down`/`service_recovered` is skipped (logged) rather than
+   * crashing the poll pass. Production wiring (`app.ts`) always passes `app.secretBox`. */
+  secretBox?: SecretBox;
 }
 
 export interface ServiceWatchHandle {
@@ -64,7 +69,7 @@ async function pollOnce(deps: ServiceWatchDeps, state: Map<SystemUnit, boolean>)
     const event = down ? 'service_down' : 'service_recovered';
     const action = down ? 'service.down' : 'service.recovered';
 
-    await emitEvent(deps.db, event, { title: EVENTS[event].label, message }, deps.fetchImpl);
+    await emitEvent(deps.db, event, { title: EVENTS[event].label, message }, deps.fetchImpl, deps.secretBox);
     recordAudit(deps.db, { actorId: null, actorName: 'system', action, targetType: 'service', targetName: unit });
   }
 }
