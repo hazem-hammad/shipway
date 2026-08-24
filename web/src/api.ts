@@ -157,6 +157,51 @@ export function verifyCloudflare(): Promise<CloudflareVerifyResult> {
   return apiFetch<CloudflareVerifyResult>('/api/cloudflare/verify');
 }
 
+// ---- Instance mail ----
+
+/** The SMTP settings Shipway itself uses for invites/notifications (`server/src/services/mailer.ts`,
+ * plan Task 3) — entirely separate from a project's own SMTP tab (`putProjectSmtp` below). */
+export type MailDriver = 'none' | 'mailpit' | 'smtp';
+
+export interface MailConfig {
+  driver: MailDriver;
+  host: string;
+  port: number;
+  secure: boolean;
+  /** Masked as "•••1234" when a password is set, `null` otherwise — same convention as
+   * `Settings.cloudflare_token`. */
+  username: string | null;
+  password: string | null;
+  fromAddress: string;
+  fromName: string | null;
+  /** `false` only for `driver: 'none'`. */
+  configured: boolean;
+}
+
+export interface MailConfigUpdate {
+  driver: MailDriver;
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  username?: string;
+  /** Omit to keep the current password; a masked echo also keeps it; `''` clears it. */
+  password?: string;
+  fromAddress?: string;
+  fromName?: string;
+}
+
+export function fetchMailConfig(): Promise<MailConfig> {
+  return apiFetch<MailConfig>('/api/settings/mail');
+}
+
+export function putMailConfig(body: MailConfigUpdate): Promise<MailConfig> {
+  return apiFetch<MailConfig>('/api/settings/mail', { method: 'PUT', body });
+}
+
+export function testMailConfig(to: string): Promise<{ ok: boolean; error?: string }> {
+  return apiFetch<{ ok: boolean; error?: string }>('/api/settings/mail/test', { method: 'POST', body: { to } });
+}
+
 // ---- GitHub App ----
 
 export function fetchGithubManifest(baseUrl: string): Promise<GithubManifest> {

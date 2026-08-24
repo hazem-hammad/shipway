@@ -10,12 +10,13 @@
  * error — the sub-nav row itself is still live and correctly highlighted.
  */
 import { Link, useParams } from 'wouter';
-import { Bell, Cloud, GitBranch, Server, Settings as SettingsIcon, Users } from 'lucide-react';
+import { Bell, Cloud, GitBranch, Mail, Server, Settings as SettingsIcon, Users } from 'lucide-react';
 import { useMe } from '../hooks';
 import { Card, CardHeader, EmptyState, ICON_STROKE, PageHeader, PageWithRail } from '../components/ui';
 import GeneralSection from './settings/General';
 import GithubSection from './settings/GitHub';
 import CloudflareSection from './settings/Cloudflare';
+import MailSection from './settings/Mail';
 import TeamSection from './settings/Team';
 import NotificationsSection from './settings/Notifications';
 import InstanceSection from './settings/Instance';
@@ -31,6 +32,7 @@ const SECTIONS: SectionDef[] = [
   { key: 'general', href: '/settings/general', label: 'General', icon: SettingsIcon },
   { key: 'github', href: '/settings/github', label: 'GitHub', icon: GitBranch },
   { key: 'cloudflare', href: '/settings/cloudflare', label: 'Cloudflare', icon: Cloud },
+  { key: 'mail', href: '/settings/mail', label: 'Mail', icon: Mail },
   { key: 'team', href: '/settings/team', label: 'Team', icon: Users },
   { key: 'notifications', href: '/settings/notifications', label: 'Notifications', icon: Bell },
   { key: 'instance', href: '/settings/instance', label: 'Instance', icon: Server },
@@ -94,6 +96,8 @@ function SectionContent({ active }: { active: string }) {
       return <GithubSection />;
     case 'cloudflare':
       return <CloudflareSection />;
+    case 'mail':
+      return <MailSection />;
     case 'team':
       return <TeamSection />;
     case 'notifications':

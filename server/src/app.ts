@@ -23,6 +23,7 @@ import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
+import { mailRoutes } from './routes/mail.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { overviewRoutes } from './routes/overview.js';
 import { projectRoutes } from './routes/projects.js';
@@ -409,6 +410,7 @@ export async function buildApp(
   await app.register(userRoutes);
   await app.register(settingsRoutes);
   await app.register(cloudflareRoutes);
+  await app.register(mailRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);

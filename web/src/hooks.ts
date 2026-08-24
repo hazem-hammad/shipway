@@ -11,6 +11,7 @@ import {
   fetchGithubStatus,
   fetchGlobalDeployments,
   fetchInvite,
+  fetchMailConfig,
   fetchMe,
   fetchNotifications,
   fetchOverview,
@@ -33,6 +34,7 @@ import {
   type GithubStatus,
   type GlobalDeployment,
   type InvitePreview,
+  type MailConfig,
   type Me,
   type NotificationsMatrix,
   type Overview,
@@ -213,6 +215,13 @@ export function useServicesInfo(): UseQueryResult<ServicesInfo> {
 /** Host resource usage + shared service status (DESIGN.md/task-25 ruling: polls every 10s). */
 export function useServerStats(): UseQueryResult<ServerStats> {
   return useQuery({ queryKey: ['server-stats'], queryFn: fetchServerStats, refetchInterval: 10_000 });
+}
+
+// ---- Settings > Mail ----
+
+/** Instance mail config (`server/src/routes/mail.ts`); member-readable, same as `useSettings`. */
+export function useMailConfig(): UseQueryResult<MailConfig> {
+  return useQuery({ queryKey: ['mail-config'], queryFn: fetchMailConfig });
 }
 
 // ---- Settings > Team ----
