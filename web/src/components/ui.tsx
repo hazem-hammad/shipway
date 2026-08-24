@@ -2,10 +2,6 @@
  * Shared UI primitives, built once from DESIGN.md v2 (the OpenShip-replica system) so every page
  * composes these instead of reinventing them: buttons, fields, toggles, cards with icon-squircle
  * headers, badges, status dots, tabs, skeletons, empty states.
- *
- * Compatibility: v1 exports (BerthLight/BerthStatus, Panel, Chip, ProgressRail, ShellSkeleton and
- * the old Button/EmptyState prop shapes) are kept so not-yet-restyled pages still compile and
- * render decently; they are removed once the last page is restyled.
  */
 import type {
   ButtonHTMLAttributes,
@@ -25,15 +21,6 @@ export const ICON_STROKE = 1.75;
 // ---------------------------------------------------------------------------
 
 export type StatusDotStatus = 'ok' | 'warn' | 'danger' | 'idle';
-/** Legacy v1 status names, still accepted so old call sites compile. */
-export type BerthStatus = 'go' | 'stop' | 'hold' | 'unknown';
-
-const LEGACY_STATUS: Record<BerthStatus, StatusDotStatus> = {
-  go: 'ok',
-  stop: 'danger',
-  hold: 'warn',
-  unknown: 'idle',
-};
 
 const DOT_COLOR: Record<StatusDotStatus, string> = {
   ok: 'var(--ok)',
@@ -50,7 +37,7 @@ const DOT_LABEL: Record<StatusDotStatus, string> = {
 };
 
 export interface StatusDotProps {
-  status: StatusDotStatus | BerthStatus;
+  status: StatusDotStatus;
   /** Defaults to pulsing only for `warn` (running/queued), per DESIGN.md. */
   pulse?: boolean;
   label?: string;
@@ -58,27 +45,23 @@ export interface StatusDotProps {
 }
 
 export function StatusDot({ status, pulse, label, className = '' }: StatusDotProps) {
-  const normalized: StatusDotStatus = status in LEGACY_STATUS ? LEGACY_STATUS[status as BerthStatus] : (status as StatusDotStatus);
-  const shouldPulse = pulse ?? normalized === 'warn';
+  const shouldPulse = pulse ?? status === 'warn';
 
   return (
     <span
       role="img"
-      aria-label={label ?? `status: ${DOT_LABEL[normalized]}`}
+      aria-label={label ?? `status: ${DOT_LABEL[status]}`}
       className={`inline-block h-2 w-2 shrink-0 rounded-full ${shouldPulse ? 'dot-pulse' : ''} ${className}`}
-      style={{ backgroundColor: DOT_COLOR[normalized] }}
+      style={{ backgroundColor: DOT_COLOR[status] }}
     />
   );
 }
-
-/** v1 name for StatusDot; old pages keep compiling until they are restyled. */
-export const BerthLight = StatusDot;
 
 // ---------------------------------------------------------------------------
 // Button
 // ---------------------------------------------------------------------------
 
-export type ButtonVariant = 'primary' | 'secondary' | 'outline' | 'danger' | 'cta' | 'destructive';
+export type ButtonVariant = 'primary' | 'secondary' | 'outline' | 'danger' | 'cta';
 export type ButtonSize = 'md' | 'sm';
 
 const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
@@ -90,8 +73,6 @@ const BUTTON_VARIANTS: Record<ButtonVariant, string> = {
   danger: 'text-danger hover:bg-danger/10 active:bg-danger/15',
   // The one loud gradient (sidebar New Project); solid lime in dark via the `cta` utility.
   cta: 'cta rounded-full font-semibold hover:opacity-95 active:opacity-90',
-  /** legacy v1 name for `danger` */
-  destructive: 'text-danger hover:bg-danger/10 active:bg-danger/15',
 };
 
 const BUTTON_SIZES: Record<ButtonSize, string> = {
@@ -375,11 +356,6 @@ export function CardHeader({ icon, iconTone = 'neutral', title, description, act
   );
 }
 
-/** v1 name; renders with the v2 card anatomy so old pages look right until restyled. */
-export function Panel({ children, className = '' }: { children: ReactNode; className?: string }) {
-  return <Card className={className}>{children}</Card>;
-}
-
 // ---------------------------------------------------------------------------
 // Avatar — initial-letter circle (DESIGN.md App shell, account card).
 // ---------------------------------------------------------------------------
@@ -575,34 +551,4 @@ export function EmptyState({ title, message, action, secondaryAction, icon, clas
 /** A mono chip for inline machine-ish values: slugs, SHAs, ports. */
 export function Chip({ children }: { children: ReactNode }) {
   return <span className="inline-flex items-center rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-xs text-soft">{children}</span>;
-}
-
-// ---------------------------------------------------------------------------
-// Progress rail — the setup wizard's stepper, on v2 status dots.
-// ---------------------------------------------------------------------------
-
-export interface ProgressRailProps {
-  steps: string[];
-  /** 0-based index of the step currently active. Earlier steps render as done (green). */
-  currentIndex: number;
-}
-
-export function ProgressRail({ steps, currentIndex }: ProgressRailProps) {
-  return (
-    <ol className="mb-8 flex items-center">
-      {steps.map((label, index) => {
-        const status: StatusDotStatus = index < currentIndex ? 'ok' : index === currentIndex ? 'warn' : 'idle';
-        const reached = index <= currentIndex;
-        return (
-          <li key={label} className="flex flex-1 items-center last:flex-none">
-            <span className="flex items-center gap-2">
-              <StatusDot status={status} />
-              <span className={`text-xs font-medium whitespace-nowrap ${reached ? 'text-ink' : 'text-soft'}`}>{label}</span>
-            </span>
-            {index < steps.length - 1 && <span className="mx-3 h-px flex-1 bg-line" aria-hidden />}
-          </li>
-        );
-      })}
-    </ol>
-  );
 }

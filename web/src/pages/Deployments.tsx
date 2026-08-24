@@ -2,11 +2,12 @@
  * The global Deployments page (route `/deployments`, DESIGN.md's Tables & lists + spec's "global
  * deployments"): recent deployments across every project, newest first, via `GET /api/deployments`
  * (Task 5). One card of hairline-separated 56px rows, composed entirely from `components/ui.tsx`
- * primitives, matching Projects.tsx's row anatomy and Home.tsx's (Task 6) compositional style. The
- * whole row navigates to that deployment's log on its owning project.
+ * primitives, matching Projects.tsx's row anatomy and Home.tsx's (Task 6) compositional style. Each
+ * row's primary navigation is a real stretched `<Link>` to that deployment's log on its owning
+ * project (see DeploymentRow's doc comment).
  */
 import { useEffect, useState } from 'react';
-import { useLocation } from 'wouter';
+import { Link } from 'wouter';
 import { ArrowRight } from 'lucide-react';
 import type { DeploymentStatus, GlobalDeployment } from '../api';
 import { useGlobalDeployments } from '../hooks';
@@ -80,24 +81,26 @@ export default function DeploymentsPage() {
 // Row
 // ---------------------------------------------------------------------------
 
+/**
+ * The row is a relative container with the primary navigation rendered as a real, stretched
+ * `<Link>` (absolutely positioned, filling the row, `z-0`) so the whole row is keyboard- and
+ * screen-reader-native (Enter activates it, cmd/ctrl-click opens a new tab) without a hand-rolled
+ * `role="link"` + `onKeyDown` shim. Nothing else in this row is independently interactive, so
+ * nothing needs to sit above it in the stacking order — see ProjectRow in Projects.tsx for the
+ * same pattern with a secondary interactive element layered on top.
+ */
 function DeploymentRow({ deployment }: { deployment: GlobalDeployment }) {
-  const [, navigate] = useLocation();
   const dotStatus = DOT_STATUS_BY_DEPLOY[deployment.status];
   const href = `/projects/${String(deployment.projectId)}/deployments/${String(deployment.id)}`;
 
   return (
-    <div
-      role="link"
-      tabIndex={0}
-      onClick={() => navigate(href)}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          navigate(href);
-        }
-      }}
-      className="group flex h-14 cursor-pointer items-center gap-4 rounded-xl px-2 transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-    >
+    <div className="group relative flex h-14 items-center gap-4 rounded-xl px-2 transition-colors duration-150 ease-out hover:bg-surface-2">
+      <Link
+        href={href}
+        aria-label={`Open deployment for ${deployment.projectName}, ${DEPLOY_STATUS_LABEL[deployment.status]}`}
+        className="absolute inset-0 z-0 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      />
+
       <div className="flex w-24 shrink-0 items-center gap-2">
         <StatusDot status={dotStatus} />
         <span className={`text-sm font-medium ${DEPLOY_STATUS_TEXT_CLASS[deployment.status]}`}>
@@ -106,7 +109,7 @@ function DeploymentRow({ deployment }: { deployment: GlobalDeployment }) {
       </div>
 
       <div className="w-44 shrink-0">
-        <div className="truncate text-base font-semibold text-ink">{deployment.projectName}</div>
+        <div className="truncate text-lg font-semibold text-ink">{deployment.projectName}</div>
         <div className="truncate font-mono text-sm text-soft">{deployment.projectSlug}</div>
       </div>
 

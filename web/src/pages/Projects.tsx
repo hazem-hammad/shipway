@@ -2,11 +2,12 @@
  * The Projects list (route `/projects`, DESIGN.md's Tables & lists): one card of hairline-separated
  * 56px rows — status dot, name + subdomain link, type badge, last-deploy meta, a row Deploy button,
  * and a ghosted chevron — composed entirely from `components/ui.tsx` primitives, matching Home.tsx's
- * (Task 6) compositional style. The whole row navigates to the project; the subdomain link and the
- * Deploy button both stop that click from bubbling.
+ * (Task 6) compositional style. The row's primary navigation is a real stretched `<Link>` layered
+ * behind the row's content; the subdomain link and the Deploy button are independently interactive
+ * elements raised above it (see ProjectRow's doc comment).
  */
 import { useState } from 'react';
-import { useLocation, useSearch } from 'wouter';
+import { Link, useLocation, useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import { ArrowRight, ExternalLink, Plus } from 'lucide-react';
 import { ApiError, deployProject, type DeploymentStatus, type LastDeployment, type ProjectListItem, type ProjectType } from '../api';
@@ -143,6 +144,15 @@ export default function ProjectsPage() {
 // Row
 // ---------------------------------------------------------------------------
 
+/**
+ * The row is a relative container with the primary navigation rendered as a real, stretched
+ * `<Link>` (absolutely positioned, filling the row, `z-0`) instead of a hand-rolled
+ * `role="link"` + `onKeyDown` div — that gives the row native keyboard behavior (Enter
+ * activates it) and lets cmd/ctrl-click open it in a new tab, which the old click-handler
+ * pattern couldn't. The subdomain link and the Deploy button are genuinely independent
+ * interactive elements, so they're lifted above the stretched link with `relative z-10`
+ * instead of the old `stopPropagation` dance.
+ */
 function ProjectRow({
   project,
   baseDomain,
@@ -154,23 +164,17 @@ function ProjectRow({
   deploying: boolean;
   onDeploy: () => void;
 }) {
-  const [, navigate] = useLocation();
   const dotStatus: StatusDotStatus = project.lastDeployment ? DOT_STATUS_BY_DEPLOY[project.lastDeployment.status] : 'idle';
   const href = `/projects/${String(project.id)}`;
 
   return (
-    <div
-      role="link"
-      tabIndex={0}
-      onClick={() => navigate(href)}
-      onKeyDown={(event) => {
-        if (event.key === 'Enter' || event.key === ' ') {
-          event.preventDefault();
-          navigate(href);
-        }
-      }}
-      className="group flex h-14 cursor-pointer items-center gap-4 rounded-xl px-2 transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-    >
+    <div className="group relative flex h-14 items-center gap-4 rounded-xl px-2 transition-colors duration-150 ease-out hover:bg-surface-2">
+      <Link
+        href={href}
+        aria-label={`Open ${project.name}`}
+        className="absolute inset-0 z-0 rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      />
+
       <StatusDot status={dotStatus} />
 
       <div className="min-w-0 flex-1">
@@ -180,8 +184,7 @@ function ProjectRow({
             href={`https://${project.slug}.${baseDomain}`}
             target="_blank"
             rel="noreferrer noopener"
-            onClick={(event) => event.stopPropagation()}
-            className="mt-0.5 inline-flex w-fit items-center gap-1 font-mono text-sm text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+            className="relative z-10 mt-0.5 inline-flex w-fit items-center gap-1 font-mono text-sm text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
           >
             {project.slug}.{baseDomain}
             <ExternalLink size={12} strokeWidth={ICON_STROKE} aria-hidden />
@@ -201,10 +204,8 @@ function ProjectRow({
         variant="secondary"
         size="sm"
         loading={deploying}
-        onClick={(event) => {
-          event.stopPropagation();
-          onDeploy();
-        }}
+        className="relative z-10"
+        onClick={() => onDeploy()}
       >
         Deploy
       </Button>

@@ -68,7 +68,7 @@ function AuthenticatedGate() {
         <Route path="/settings/:section?" component={SettingsPage} />
         <Route path="/audit" component={AuditLogPage} />
         <Route>
-          <Redirect to="/projects" />
+          <Redirect to="/" />
         </Route>
       </Switch>
     </Layout>

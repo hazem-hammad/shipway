@@ -42,11 +42,6 @@
  *
  *   fonts: font-sans = Outfit (UI), font-mono = IBM Plex Mono (data: shas,
  *   env, tokens, cron, terminal).
- *
- * LEGACY ALIASES (v1 vocabulary; do not use in new code — they exist only so
- * not-yet-restyled v1 pages keep rendering, and they are deleted once the
- * last page is restyled): paper→surface, panel→surface-2, ink→text,
- * ink-soft→text-soft, line→border, accent→link blue, go/stop/hold→ok/danger/warn.
  * ===========================================================================
  */
 
@@ -153,16 +148,6 @@
   --color-term-stage: #a5b4fc;
   --color-term-err: #f87171;
 
-  /* ---- legacy v1 aliases (delete after the last page restyle) ---- */
-  --color-paper: var(--surface);
-  --color-panel: var(--surface-2);
-  --color-ink-soft: var(--text-soft);
-  --color-accent: var(--link);
-  --color-accent-soft: var(--surface-3);
-  --color-go: var(--ok);
-  --color-stop: var(--danger);
-  --color-hold: var(--warn);
-
   /* ---- type ---- */
   --font-sans: 'Outfit', ui-sans-serif, system-ui, sans-serif;
   --font-mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
@@ -217,14 +202,8 @@
   animation: dot-pulse 1.6s ease-in-out infinite;
 }
 
-/* Legacy class name kept for not-yet-restyled v1 pages. */
-.berth-pulse {
-  animation: dot-pulse 1.6s ease-in-out infinite;
-}
-
 @media (prefers-reduced-motion: reduce) {
-  .dot-pulse,
-  .berth-pulse {
+  .dot-pulse {
     animation: none;
   }
 }

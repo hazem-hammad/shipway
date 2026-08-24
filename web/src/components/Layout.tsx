@@ -3,7 +3,7 @@
  * wordmark row, MAIN / SETTINGS nav sections, the one loud gradient New Project pill, and the
  * account card with its Sign out menu. Collapses to a 76px icon rail (persisted), with tooltips.
  */
-import { type ComponentType, type ReactNode, useState } from 'react';
+import { type ComponentType, type ReactNode, useEffect, useRef, useState } from 'react';
 import { Link, useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -26,6 +26,9 @@ import { resolvedTheme, setTheme, type ResolvedTheme } from '../lib/theme';
 import { Avatar, ICON_STROKE, SectionLabel } from './ui';
 
 const COLLAPSE_KEY = 'shipway.sidebar';
+/** Below this viewport width the sidebar auto-collapses (DESIGN.md); matches the app shell's own
+ * `min-[900px]` breakpoints elsewhere (e.g. ShellSkeleton, the quick-action tile grid). */
+const AUTO_COLLAPSE_QUERY = '(max-width: 899px)';
 
 interface NavItem {
   href: string;
@@ -120,8 +123,22 @@ export default function Layout({ user, children }: { user: Me; children: ReactNo
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const [theme, setThemeState] = useState<ResolvedTheme>(resolvedTheme);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Once the user manually toggles the sidebar, their choice wins for the rest of this session —
+  // the auto-collapse effect below stops overriding `collapsed` on further resizes.
+  const manualOverride = useRef(false);
+
+  useEffect(() => {
+    const query = window.matchMedia(AUTO_COLLAPSE_QUERY);
+    function applyAuto() {
+      if (!manualOverride.current) setCollapsed(query.matches);
+    }
+    applyAuto();
+    query.addEventListener('change', applyAuto);
+    return () => query.removeEventListener('change', applyAuto);
+  }, []);
 
   function toggleCollapsed() {
+    manualOverride.current = true;
     const next = !collapsed;
     setCollapsed(next);
     try {
