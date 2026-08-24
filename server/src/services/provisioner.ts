@@ -10,12 +10,13 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Config } from '../config.js';
 import type { ShipwayDb } from '../db/index.js';
-import { projects } from '../db/schema.js';
+import { projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import type { SysOps } from '../sysops/types.js';
 import { assertSlug, renderAppUnit, renderNginxVhost, unitNames } from '../system/templates.js';
 import type { DnsClient } from './cloudflare.js';
 import { syncCrontab } from './cron.js';
+import { removeWorker } from './workers.js';
 
 export interface ProvisionDeps {
   db: ShipwayDb;
@@ -286,6 +287,15 @@ export async function deprovisionProject(deps: ProvisionDeps, projectId: number)
     await attempt(() => deps.sysops.unitAction('stop', unit));
     await attempt(() => deps.sysops.unitAction('disable', unit));
     await attempt(() => deps.sysops.removeFile(appUnitPath(project.slug)));
+  }
+
+  // Workers (any project type can have them, not just node/nextjs — see workers.ts) each install
+  // their own template unit + running instances; tear those down too, or they're left running
+  // (restart-looping forever against a `WorkingDirectory` that's about to be deleted) and orphaned
+  // on the host after the project row — and its `workers` rows, which cascade away — are gone.
+  const workerRows = deps.db.select().from(workers).where(eq(workers.projectId, projectId)).all();
+  for (const worker of workerRows) {
+    await attempt(() => removeWorker({ sysops: deps.sysops, cfg: deps.cfg }, project, worker));
   }
 
   await attempt(() => deps.sysops.removeFile(vhostAvailablePath(project.slug)));

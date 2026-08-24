@@ -5,11 +5,12 @@ import * as path from 'node:path';
 import { eq } from 'drizzle-orm';
 import { openDb, type ShipwayDb } from '../src/db/index.js';
 import { setSetting } from '../src/db/settings.js';
-import { cronJobs, projects } from '../src/db/schema.js';
+import { cronJobs, projects, workers } from '../src/db/schema.js';
 import { loadConfig, type Config } from '../src/config.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { FakeDnsClient, type DnsClient } from '../src/services/cloudflare.js';
 import { syncCrontab } from '../src/services/cron.js';
+import { workerInstances } from '../src/services/workers.js';
 import {
   ProvisionError,
   deprovisionProject,
@@ -520,6 +521,35 @@ describe('deprovisionProject', () => {
     const after = await sysops.readCrontab();
     expect(after).not.toContain('shop/current');
     expect(after).not.toContain('artisan schedule:run');
+  });
+
+  it('stops+disables every worker instance and removes its unit file, for every worker the project has', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', publicDir: 'public' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+
+    db.insert(workers).values({ projectId: id, name: 'queue', command: 'php8.3 artisan queue:work', processes: 2 }).run();
+    db.insert(workers).values({ projectId: id, name: 'scheduler', command: 'php8.3 artisan schedule:work', processes: 1 }).run();
+    sysops.calls.length = 0;
+
+    await deprovisionProject({ db, cfg, sysops, dns }, id);
+
+    for (const unit of workerInstances('shop', 'queue', 2)) {
+      expect(sysops.calls).toContain(`unitAction stop ${unit}`);
+      expect(sysops.calls).toContain(`unitAction disable ${unit}`);
+    }
+    for (const unit of workerInstances('shop', 'scheduler', 1)) {
+      expect(sysops.calls).toContain(`unitAction stop ${unit}`);
+      expect(sysops.calls).toContain(`unitAction disable ${unit}`);
+    }
+    expect(sysops.calls).toContain('removeFile /etc/systemd/system/shipway-worker-shop-queue@.service');
+    expect(sysops.calls).toContain('removeFile /etc/systemd/system/shipway-worker-shop-scheduler@.service');
+    expect(fs.existsSync(path.join(sysopsRoot(cfg), 'etc/systemd/system/shipway-worker-shop-queue@.service'))).toBe(false);
+    expect(fs.existsSync(path.join(sysopsRoot(cfg), 'etc/systemd/system/shipway-worker-shop-scheduler@.service'))).toBe(false);
   });
 
   it('validates the stored slug before constructing any path, touching sysops/dns, or deleting the row', async () => {
