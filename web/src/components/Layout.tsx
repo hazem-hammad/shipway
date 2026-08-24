@@ -238,11 +238,18 @@ export default function Layout({ user, children }: { user: Me; children: ReactNo
                 className="fixed inset-0 z-10 cursor-default"
                 tabIndex={-1}
               />
-              <div className="absolute right-3 bottom-full left-3 z-20 mb-1 rounded-xl border border-line bg-surface p-1.5 shadow-sm">
+              {/* Expanded: in-flow above the account button, so the sidebar reflows (the nav
+                  spacer absorbs the height) and the menu can never collide with the New Project
+                  CTA. Collapsed: a flyout to the right of the rail. */}
+              <div
+                className={`z-20 rounded-xl border border-line bg-surface p-1.5 shadow-sm ${
+                  collapsed ? 'absolute bottom-3 left-full ml-2 w-max' : 'relative mb-1.5'
+                }`}
+              >
                 <button
                   type="button"
                   onClick={() => void handleSignOut()}
-                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-base text-ink transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+                  className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left text-base whitespace-nowrap text-ink transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
                 >
                   <LogOut size={18} strokeWidth={ICON_STROKE} className="text-icon" />
                   Sign out
