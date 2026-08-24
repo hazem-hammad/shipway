@@ -7,7 +7,7 @@ import { openDb } from '../src/db/index.js';
 import { settings } from '../src/db/schema.js';
 import { setSetting } from '../src/db/settings.js';
 import { SecretBox } from '../src/lib/secretbox.js';
-import { getMailConfig, isMailConfigured, saveMailConfig, sendMail, type InstanceMailConfig, type MailTransport } from '../src/services/mailer.js';
+import { buildInviteEmail, getMailConfig, isMailConfigured, saveMailConfig, sendMail, type InstanceMailConfig, type MailTransport } from '../src/services/mailer.js';
 
 function tmpDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-mailer-test-'));
@@ -167,5 +167,40 @@ describe('sendMail', () => {
       ok: false,
       error: 'boom',
     });
+  });
+});
+
+describe('buildInviteEmail', () => {
+  it('builds an absolute deploy.<baseDomain> URL, present in both text and html, plus the fixed subject', () => {
+    const content = buildInviteEmail({ token: 'abc123deadbeef', baseDomain: 'intcore.dev' });
+
+    expect(content.subject).toBe("You're invited to Shipway");
+    expect(content.text).toContain('https://deploy.intcore.dev/invite/abc123deadbeef');
+    expect(content.html).toContain('https://deploy.intcore.dev/invite/abc123deadbeef');
+    expect(content.html).toContain('href="https://deploy.intcore.dev/invite/abc123deadbeef"');
+  });
+
+  it('falls back to a relative-path note instead of fabricating a host when base_domain is unset', () => {
+    const content = buildInviteEmail({ token: 'abc123deadbeef', baseDomain: null });
+
+    expect(content.text).toContain('/invite/abc123deadbeef');
+    expect(content.text).not.toMatch(/https?:\/\//);
+    expect(content.html).toContain('/invite/abc123deadbeef');
+    expect(content.html).not.toMatch(/https?:\/\//);
+  });
+
+  it('treats a blank/whitespace-only base_domain the same as unset', () => {
+    const content = buildInviteEmail({ token: 'tok', baseDomain: '   ' });
+
+    expect(content.text).not.toMatch(/https?:\/\//);
+    expect(content.html).not.toMatch(/https?:\/\//);
+  });
+
+  it('the HTML body has no <img> tags and no external stylesheet/script references', () => {
+    const content = buildInviteEmail({ token: 'tok', baseDomain: 'intcore.dev' });
+
+    expect(content.html).not.toContain('<img');
+    expect(content.html).not.toContain('<link');
+    expect(content.html).not.toContain('<script');
   });
 });

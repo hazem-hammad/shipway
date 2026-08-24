@@ -112,7 +112,7 @@ describe('POST /api/users/invite', () => {
     await app.close();
   });
 
-  it('records a user.invite audit row with meta.role', async () => {
+  it('records a user.invite audit row with meta.role (+ meta.emailed — see invite-email.test.ts for the emailed:true case)', async () => {
     const { app, cookie: ownerCookie, userId: ownerId } = await buildOwnerApp();
 
     await invite(app, ownerCookie, { email: 'audited@example.com', role: 'member' });
@@ -120,7 +120,8 @@ describe('POST /api/users/invite', () => {
     const rows = auditRowsFor(app, 'user.invite');
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ actorId: ownerId, targetType: 'user', targetName: 'audited@example.com' });
-    expect(JSON.parse(rows[0]!.meta!)).toEqual({ role: 'member' });
+    // Mail is unconfigured (driver: 'none') by default, so no send is even attempted.
+    expect(JSON.parse(rows[0]!.meta!)).toEqual({ role: 'member', emailed: false });
 
     await app.close();
   });

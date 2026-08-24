@@ -1,11 +1,13 @@
 import { eq } from 'drizzle-orm';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyBaseLogger, FastifyInstance } from 'fastify';
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import { users } from '../db/schema.js';
+import { getSetting } from '../db/settings.js';
 import { requireRole } from '../lib/authz.js';
 import { hashPassword } from '../lib/passwords.js';
 import { getActor, recordAudit } from '../services/audit.js';
+import { buildInviteEmail, getMailConfig, isMailConfigured, sendMail } from '../services/mailer.js';
 
 const createUserSchema = z.object({
   name: z.string().min(1),
@@ -69,9 +71,41 @@ function generateInviteToken(): { token: string; expiresAt: number } {
 }
 
 /**
- * Registers `/api/users` CRUD plus the invite lifecycle (Task 3). Every route here sits under the
- * global session guard in `buildApp` EXCEPT `GET`/`POST /api/invite/:token`, which `buildApp`
- * exempts via `PUBLIC_API_PREFIXES` — the invitee has no session yet, and the token itself is their
+ * Emails the invite link when instance mail is configured (Task 7, spec §3 "What uses instance
+ * mail" (a)). NEVER throws and never blocks the invite/reinvite response: `driver: 'none'` skips
+ * sending entirely (`emailed: false`, no `emailError`), and any other failure (a transport error,
+ * or even a synchronous throw while building the email) is caught, logged server-side, and
+ * reported back as `emailed: false, emailError` instead of failing the request. Callers always
+ * still return `inviteUrl` regardless of this outcome — email is additive, never the only path.
+ */
+async function emailInvite(app: FastifyInstance, log: FastifyBaseLogger, email: string, token: string): Promise<{ emailed: boolean; emailError?: string }> {
+  const cfg = getMailConfig(app.db, app.secretBox);
+  if (!isMailConfigured(cfg)) {
+    return { emailed: false };
+  }
+
+  try {
+    const baseDomain = getSetting<string>(app.db, 'base_domain');
+    const { subject, text, html } = buildInviteEmail({ token, baseDomain });
+    const result = await sendMail(cfg, { to: email, subject, text, html });
+    if (result.ok) {
+      return { emailed: true };
+    }
+    log.error({ email, error: result.error }, 'failed to email invite');
+    return { emailed: false, emailError: result.error };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'failed to email invite';
+    log.error({ email, err }, 'failed to email invite');
+    return { emailed: false, emailError: message };
+  }
+}
+
+/**
+ * Registers `/api/users` CRUD plus the invite lifecycle (Task 3), including Task 7's best-effort
+ * invite email (`emailInvite`, above) on both `POST /api/users/invite` and
+ * `POST /api/users/:id/reinvite`. Every route here sits under the global session guard in
+ * `buildApp` EXCEPT `GET`/`POST /api/invite/:token`, which `buildApp` exempts via
+ * `PUBLIC_API_PREFIXES` — the invitee has no session yet, and the token itself is their
  * credential. Every other handler can assume `request.session.get('userId')` is defined.
  */
 export async function userRoutes(app: FastifyInstance): Promise<void> {
@@ -151,10 +185,20 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'failed to create invite' });
     }
 
-    const actor = getActor(app.db, request.session.get('userId'));
-    recordAudit(app.db, { ...actor, action: 'user.invite', targetType: 'user', targetName: email, meta: { role } });
+    const { emailed, emailError } = await emailInvite(app, request.log, email, token);
 
-    return reply.code(201).send({ id: created.id, email: created.email, role: created.role, inviteUrl: `/invite/${token}`, expiresAt });
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'user.invite', targetType: 'user', targetName: email, meta: { role, emailed } });
+
+    return reply.code(201).send({
+      id: created.id,
+      email: created.email,
+      role: created.role,
+      inviteUrl: `/invite/${token}`,
+      expiresAt,
+      emailed,
+      ...(emailError !== undefined ? { emailError } : {}),
+    });
   });
 
   /**
@@ -184,10 +228,20 @@ export async function userRoutes(app: FastifyInstance): Promise<void> {
     const { token, expiresAt } = generateInviteToken();
     app.db.update(users).set({ inviteToken: token, inviteExpiresAt: expiresAt }).where(eq(users.id, id)).run();
 
-    const actor = getActor(app.db, request.session.get('userId'));
-    recordAudit(app.db, { ...actor, action: 'user.reinvite', targetType: 'user', targetName: target.email, meta: { role: target.role } });
+    const { emailed, emailError } = await emailInvite(app, request.log, target.email, token);
 
-    return reply.code(200).send({ id: target.id, email: target.email, role: target.role, inviteUrl: `/invite/${token}`, expiresAt });
+    const actor = getActor(app.db, request.session.get('userId'));
+    recordAudit(app.db, { ...actor, action: 'user.reinvite', targetType: 'user', targetName: target.email, meta: { role: target.role, emailed } });
+
+    return reply.code(200).send({
+      id: target.id,
+      email: target.email,
+      role: target.role,
+      inviteUrl: `/invite/${token}`,
+      expiresAt,
+      emailed,
+      ...(emailError !== undefined ? { emailError } : {}),
+    });
   });
 
   /**

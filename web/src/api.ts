@@ -687,13 +687,19 @@ export interface InviteUserBody {
 
 /** Shared response shape for both `POST /api/users/invite` and `POST /api/users/:id/reinvite` —
  * `inviteUrl` (`/invite/<token>`) is the only place the token is ever returned; it can't be
- * retrieved again later, only regenerated via reinvite. */
+ * retrieved again later, only regenerated via reinvite. `emailed` (Task 7) reports whether the
+ * invite link was also sent by email through instance mail: `false` with no `emailError` means mail
+ * isn't configured (the link is the only path, as it always was); `false` with `emailError` means a
+ * send was attempted and failed (sanitized message, safe to show). Either way `inviteUrl` is always
+ * present — email is additive, never the only path to the invite. */
 export interface InviteResult {
   id: number;
   email: string;
   role: InvitableRole;
   inviteUrl: string;
   expiresAt: number;
+  emailed: boolean;
+  emailError?: string;
 }
 
 export interface InvitePreview {

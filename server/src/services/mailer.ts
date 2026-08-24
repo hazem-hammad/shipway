@@ -164,3 +164,58 @@ export async function sendMail(
     return { ok: false, error: err instanceof Error ? err.message : 'failed to send mail' };
   }
 }
+
+/**
+ * Team invites (spec §3 "What uses instance mail" (a)): the subject/text/html sent alongside
+ * `POST /api/users/invite` and `POST /api/users/:id/reinvite` in `routes/users.ts`, whenever
+ * instance mail is configured. `Content-Security`-minded on purpose — no images, no external CSS,
+ * only inline styles on the HTML body — since this renders in whatever the invitee's mail client
+ * allows.
+ */
+export interface InviteEmailInput {
+  /** The invite's one-time token (`routes/users.ts`'s `generateInviteToken`). */
+  token: string;
+  /** The `base_domain` setting, or `null`/unset when the instance hasn't configured one yet. */
+  baseDomain: string | null;
+}
+
+export interface InviteEmailContent {
+  subject: string;
+  text: string;
+  html: string;
+}
+
+const INVITE_EMAIL_SUBJECT = "You're invited to Shipway";
+
+/**
+ * Builds the invite email. The link is absolute (`https://deploy.<baseDomain>/invite/<token>`)
+ * when `base_domain` is configured; when it isn't, this never fabricates a host to fill the gap —
+ * it falls back to the bare `/invite/<token>` path plus a note that the reader needs to open it on
+ * their Shipway instance directly. Pure and synchronous: building the email content never touches
+ * the network, so any failure downstream in `routes/users.ts` can only come from the actual send.
+ */
+export function buildInviteEmail({ token, baseDomain }: InviteEmailInput): InviteEmailContent {
+  const invitePath = `/invite/${token}`;
+  const domain = baseDomain && baseDomain.trim() !== '' ? baseDomain.trim() : null;
+  const url = domain ? `https://deploy.${domain}${invitePath}` : null;
+
+  const linkLine = url
+    ? url
+    : `${invitePath} (no base domain is configured yet, so this can't be a full link — open this path on your Shipway instance)`;
+
+  const text = ["You've been invited to join Shipway.", '', `Accept your invite: ${linkLine}`, '', 'This link expires in 7 days.'].join('\n');
+
+  const linkHtml = url
+    ? `<a href="${url}" style="color: #141416; font-weight: 600;">Accept your invite</a>`
+    : `Accept your invite at <code>${invitePath}</code> on your Shipway instance (no base domain is configured yet, so this link can't be made absolute).`;
+
+  const html = [
+    '<div style="font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: #18181B;">',
+    "  <p>You've been invited to join Shipway.</p>",
+    `  <p>${linkHtml}</p>`,
+    '  <p style="color: #8E8E93; font-size: 13px;">This link expires in 7 days.</p>',
+    '</div>',
+  ].join('\n');
+
+  return { subject: INVITE_EMAIL_SUBJECT, text, html };
+}
