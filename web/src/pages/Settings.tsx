@@ -5,9 +5,9 @@
  * `:section` defaults to General without an actual URL redirect, matching how every other optional
  * route param in this app resolves (see ProjectLayout's tabs).
  *
- * Team and Notifications route to `/settings/team` and `/settings/notifications`, built in Task 11;
- * until then those keys (and any unknown section) fall through the switch below to a quiet
- * placeholder rather than an error — the sub-nav row itself is still live and correctly highlighted.
+ * Team and Notifications (Task 11) route to `/settings/team` and `/settings/notifications`; any
+ * unknown section still falls through the switch below to a quiet placeholder rather than an
+ * error — the sub-nav row itself is still live and correctly highlighted.
  */
 import { Link, useParams } from 'wouter';
 import { Bell, Cloud, GitBranch, Server, Settings as SettingsIcon, Users } from 'lucide-react';
@@ -16,6 +16,8 @@ import { Card, CardHeader, EmptyState, ICON_STROKE, PageHeader, PageWithRail } f
 import GeneralSection from './settings/General';
 import GithubSection from './settings/GitHub';
 import CloudflareSection from './settings/Cloudflare';
+import TeamSection from './settings/Team';
+import NotificationsSection from './settings/Notifications';
 import InstanceSection from './settings/Instance';
 
 interface SectionDef {
@@ -92,6 +94,10 @@ function SectionContent({ active }: { active: string }) {
       return <GithubSection />;
     case 'cloudflare':
       return <CloudflareSection />;
+    case 'team':
+      return <TeamSection />;
+    case 'notifications':
+      return <NotificationsSection />;
     case 'instance':
       return <InstanceSection />;
     default:
