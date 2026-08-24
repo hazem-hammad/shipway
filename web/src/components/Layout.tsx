@@ -8,7 +8,6 @@ import { Link, useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   ChevronsUpDown,
-  Circle,
   ClipboardList,
   Database,
   FolderGit2,
@@ -168,7 +167,7 @@ export default function Layout({ user, children }: { user: Me; children: ReactNo
             className="flex items-center gap-2.5 rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
             aria-label="Shipway home"
           >
-            <Circle size={24} strokeWidth={2} className="shrink-0 text-ink" />
+            <img src="/logo-sidebar.png" alt="" className="h-6 w-6 shrink-0" />
             {!collapsed && <span className="text-[17px] font-semibold text-ink">Shipway</span>}
           </Link>
           {!collapsed && <span className="flex-1" />}

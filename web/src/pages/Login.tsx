@@ -1,10 +1,9 @@
 /**
- * Sign-in: a single centered card on the page background — circle logo glyph + wordmark,
+ * Sign-in: a single centered card on the page background — logo + wordmark,
  * "Sign in to your workspace", the two fields, one full-width primary button (DESIGN.md v2).
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Circle } from 'lucide-react';
 import { ApiError, login } from '../api';
 import { Button, Field, Input } from '../components/ui';
 
@@ -44,7 +43,7 @@ export default function Login() {
       <div className="w-full max-w-[400px]">
         <div className="mb-8 flex flex-col items-center gap-3">
           <span className="flex items-center gap-2.5">
-            <Circle size={28} strokeWidth={2} className="text-ink" aria-hidden />
+            <img src="/logo.png" alt="" className="h-7 w-7" aria-hidden />
             <span className="text-2xl font-semibold text-ink">Shipway</span>
           </span>
           <p className="text-lg text-soft">Sign in to your workspace</p>

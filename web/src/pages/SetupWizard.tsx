@@ -35,6 +35,7 @@ export default function SetupWizard() {
 
   return (
     <div className="mx-auto max-w-[640px] px-4 py-12">
+      <img src="/logo.png" alt="" className="mx-auto mb-3 h-10 w-10" />
       <p className="mb-1 text-center text-lg font-semibold text-ink">Shipway</p>
       <p className="mb-8 text-center text-sm text-ink-soft">Let&rsquo;s get your server set up.</p>
 
