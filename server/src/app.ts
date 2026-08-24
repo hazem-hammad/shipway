@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
 import { notificationChannels, notificationSubscriptions } from './db/schema.js';
-import { getSetting } from './db/settings.js';
+import { deleteSetting, getSetting } from './db/settings.js';
 import { DeployQueue, type DeployQueueDeps } from './deploy/queue.js';
 import type { DeployLogger } from './deploy/logger.js';
 import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
@@ -143,10 +143,17 @@ const AUDIT_PURGE_INTERVAL_MS = 60 * 60 * 1000;
 /**
  * One-time migration (Task 4, spec §2's notifybus bullet): if the legacy global
  * `notify_webhook_url` setting is set and no notification channel exists yet, creates a "Default"
- * channel with that URL subscribed to `deploy_failed` — carrying v1's "the configured webhook fires
- * on deploy failure" behavior forward as a Task 4 channel. Naturally idempotent — once ANY channel
- * exists (this migration's own "Default", or one a user created by hand first), it never runs again
- * — so this can just be called unconditionally on every boot.
+ * channel with that URL subscribed to `deploy_failed` (and also `deploy_succeeded` when the legacy
+ * `notify_on_success` setting was `true`) — carrying v1's webhook behavior forward as a Task 4
+ * channel. Then clears the legacy `notify_webhook_url` setting so `deploynotify.ts`'s global
+ * fallback (services/deploynotify.ts:54-63) no longer fires alongside the new channel — otherwise an
+ * upgraded install posts twice per event to the same URL (final-review.md finding I-1). Per-project
+ * `notifyWebhookUrl` overrides are a separate, still-supported feature and are left untouched.
+ *
+ * Naturally idempotent — once ANY channel exists (this migration's own "Default", or one a user
+ * created by hand first), it never runs again, and once `notify_webhook_url` is cleared the `if
+ * (!webhookUrl) return;` guard below makes every later boot a no-op — so this can just be called
+ * unconditionally on every boot.
  */
 function migrateLegacyWebhookChannel(db: ShipwayDb): void {
   const webhookUrl = getSetting<string>(db, 'notify_webhook_url');
@@ -160,6 +167,13 @@ function migrateLegacyWebhookChannel(db: ShipwayDb): void {
   if (!created) return; // unreachable: just inserted this row above
 
   db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: created.id }).run();
+  if (getSetting<boolean>(db, 'notify_on_success') === true) {
+    db.insert(notificationSubscriptions).values({ event: 'deploy_succeeded', channelId: created.id }).run();
+  }
+
+  // Silence the legacy global fallback now that the Default channel covers it — see the doc
+  // comment above (finding I-1). Per-project notifyWebhookUrl overrides are untouched.
+  deleteSetting(db, 'notify_webhook_url');
 
   recordAudit(db, {
     actorId: null,
