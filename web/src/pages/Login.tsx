@@ -1,5 +1,10 @@
+/**
+ * Sign-in: a single centered card on the page background — circle logo glyph + wordmark,
+ * "Sign in to your workspace", the two fields, one full-width primary button (DESIGN.md v2).
+ */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
+import { Circle } from 'lucide-react';
 import { ApiError, login } from '../api';
 import { Button, Field, Input } from '../components/ui';
 
@@ -35,43 +40,52 @@ export default function Login() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-paper px-4">
-      <div className="w-full max-w-[320px]">
-        <p className="mb-8 text-center text-lg font-semibold text-ink">Shipway</p>
+    <div className="flex min-h-screen items-center justify-center bg-page px-4">
+      <div className="w-full max-w-[400px]">
+        <div className="mb-8 flex flex-col items-center gap-3">
+          <span className="flex items-center gap-2.5">
+            <Circle size={28} strokeWidth={2} className="text-ink" aria-hidden />
+            <span className="text-2xl font-semibold text-ink">Shipway</span>
+          </span>
+          <p className="text-lg text-soft">Sign in to your workspace</p>
+        </div>
 
-        <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-4" noValidate>
-          <Field label="Email">
-            <Input
-              type="email"
-              name="email"
-              autoComplete="email"
-              required
-              autoFocus
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-            />
-          </Field>
-          <Field label="Password">
-            <Input
-              type="password"
-              name="password"
-              autoComplete="current-password"
-              required
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-            />
-          </Field>
+        <div className="rounded-2xl border border-line bg-surface p-8">
+          <form onSubmit={(event) => void handleSubmit(event)} className="flex flex-col gap-5" noValidate>
+            <Field label="Email">
+              <Input
+                type="email"
+                name="email"
+                autoComplete="email"
+                placeholder="you@intcore.com"
+                required
+                autoFocus
+                value={email}
+                onChange={(event) => setEmail(event.target.value)}
+              />
+            </Field>
+            <Field label="Password">
+              <Input
+                type="password"
+                name="password"
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+              />
+            </Field>
 
-          {error && (
-            <p role="alert" className="text-sm text-stop">
-              {error}
-            </p>
-          )}
+            {error && (
+              <p role="alert" className="text-sm text-danger">
+                {error}
+              </p>
+            )}
 
-          <Button type="submit" loading={submitting} className="mt-2 w-full">
-            Sign in
-          </Button>
-        </form>
+            <Button type="submit" loading={submitting} className="mt-1 w-full">
+              Sign in
+            </Button>
+          </form>
+        </div>
       </div>
     </div>
   );
