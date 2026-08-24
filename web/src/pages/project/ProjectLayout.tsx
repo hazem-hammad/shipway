@@ -2,8 +2,7 @@
  * Project detail shell (DESIGN.md: "Project detail: name + URL + berth light header, horizontal
  * tabs (Deployments / Settings / Environment / Scripts / Workers / Cron / SMTP / Danger)"). Routed
  * as `/projects/:id` with `nest` (see App.tsx), so every tab below — plus the deployment log page
- * — is addressed by a plain relative path inside this component's own Switch. Workers and Cron
- * render "coming in the next update" placeholders; Task 25 fills them in.
+ * — is addressed by a plain relative path inside this component's own Switch.
  */
 import { Link, Route, Switch, useLocation, useParams } from 'wouter';
 import { useDeployments, useProject, useSettings } from '../../hooks';
@@ -15,6 +14,8 @@ import DeploymentLogPage from './DeploymentLog';
 import SettingsTab from './Settings';
 import EnvEditorTab from './EnvEditor';
 import ScriptsTab from './Scripts';
+import WorkersTab from './Workers';
+import CronTab from './Cron';
 import SmtpTab from './Smtp';
 import DangerTab from './Danger';
 
@@ -116,10 +117,10 @@ export default function ProjectLayout() {
           <ScriptsTab projectId={projectId} />
         </Route>
         <Route path="/workers">
-          <EmptyState message="Workers are coming in the next update." />
+          <WorkersTab projectId={projectId} />
         </Route>
         <Route path="/cron">
-          <EmptyState message="Cron is coming in the next update." />
+          <CronTab projectId={projectId} />
         </Route>
         <Route path="/smtp">
           <SmtpTab projectId={projectId} />

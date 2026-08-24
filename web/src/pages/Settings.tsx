@@ -1,60 +1,68 @@
-import { Link, useParams, useSearch } from 'wouter';
+/**
+ * Settings shell (route `/settings/:section?`, see App.tsx): a side sub-nav over five sections,
+ * each its own component under `./settings/*` (task-25 controller ruling). Unlike ProjectLayout's
+ * horizontal tab bar, this uses a vertical side nav — Settings has more sections and each one's
+ * content runs taller (tables, forms), so a side rail keeps the page title row stable while section
+ * content scrolls.
+ */
+import { Link, useParams } from 'wouter';
 import { EmptyState, PageHeader } from '../components/ui';
+import GeneralSection from './settings/General';
+import UsersSection from './settings/Users';
+import CloudflareSection from './settings/Cloudflare';
+import GithubSection from './settings/GitHub';
+import NotificationsSection from './settings/Notifications';
 
-interface Tab {
+interface SectionDef {
   key: string;
   href: string;
   label: string;
 }
 
-const TABS: Tab[] = [
+const SECTIONS: SectionDef[] = [
   { key: 'general', href: '/settings/general', label: 'General' },
-  { key: 'cloudflare', href: '/settings/cloudflare', label: 'Cloudflare' },
-  { key: 'github', href: '/settings/github', label: 'GitHub App' },
   { key: 'users', href: '/settings/users', label: 'Users' },
+  { key: 'cloudflare', href: '/settings/cloudflare', label: 'Cloudflare' },
+  { key: 'github', href: '/settings/github', label: 'GitHub' },
+  { key: 'notifications', href: '/settings/notifications', label: 'Notifications' },
 ];
 
 export default function SettingsPage() {
   const { section } = useParams<{ section?: string }>();
-  const search = useSearch();
   const active = section ?? 'general';
+  const isKnown = SECTIONS.some((item) => item.key === active);
 
   return (
     <div>
       <PageHeader title="Settings" />
 
-      <nav className="mb-6 flex gap-1 border-b border-line" aria-label="Settings sections">
-        {TABS.map((tab) => {
-          const isActive = tab.key === active;
-          return (
-            <Link
-              key={tab.key}
-              href={tab.href}
-              className={`-mb-px border-b-2 px-3 py-2 text-sm font-medium transition-colors duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
-                isActive ? 'border-accent text-accent' : 'border-transparent text-ink-soft hover:text-ink'
-              }`}
-            >
-              {tab.label}
-            </Link>
-          );
-        })}
-      </nav>
+      <div className="flex flex-col gap-8 sm:flex-row">
+        <nav className="flex shrink-0 flex-row gap-0.5 overflow-x-auto sm:w-44 sm:flex-col sm:overflow-visible" aria-label="Settings sections">
+          {SECTIONS.map((item) => {
+            const isActive = item.key === active;
+            return (
+              <Link
+                key={item.key}
+                href={item.href}
+                className={`whitespace-nowrap rounded-md px-3 py-2 text-sm font-medium transition-colors duration-150 ease-out focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent ${
+                  isActive ? 'bg-accent-soft text-accent' : 'text-ink-soft hover:bg-panel hover:text-ink'
+                }`}
+              >
+                {item.label}
+              </Link>
+            );
+          })}
+        </nav>
 
-      {active === 'general' && <EmptyState message="Server, domain, and ACME email settings will appear here." />}
-      {active === 'cloudflare' && <EmptyState message="Cloudflare DNS credentials will appear here." />}
-      {active === 'github' && <GithubSection search={search} />}
-      {active === 'users' && <EmptyState message="Team members will appear here." />}
-      {!TABS.some((tab) => tab.key === active) && <EmptyState message="Unknown settings section." action={{ label: 'General', href: '/settings/general' }} />}
-    </div>
-  );
-}
-
-function GithubSection({ search }: { search: string }) {
-  const created = new URLSearchParams(search).get('created') === '1';
-  return (
-    <div className="flex flex-col gap-4">
-      {created && <p className="text-sm text-go">GitHub App created. Repository access management will appear here.</p>}
-      <EmptyState message="Connect a GitHub App to deploy from your repositories." />
+        <div className="min-w-0 flex-1">
+          {active === 'general' && <GeneralSection />}
+          {active === 'users' && <UsersSection />}
+          {active === 'cloudflare' && <CloudflareSection />}
+          {active === 'github' && <GithubSection />}
+          {active === 'notifications' && <NotificationsSection />}
+          {!isKnown && <EmptyState message="Unknown settings section." action={{ label: 'General', href: '/settings/general' }} />}
+        </div>
+      </div>
     </div>
   );
 }

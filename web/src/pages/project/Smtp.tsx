@@ -107,7 +107,7 @@ function SmtpForm({ project, baseDomain }: { project: Project; baseDomain: strin
                 setMode(option.value);
                 markDirty();
               }}
-              className="mt-0.5"
+              className="mt-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
               style={{ accentColor: 'var(--color-accent)' }}
             />
             <span>

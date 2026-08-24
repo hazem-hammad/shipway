@@ -2,6 +2,7 @@ import { type FormEvent, useState } from 'react';
 import { useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import { ApiError, fetchGithubManifest, putSettings, setupAdmin, verifyCloudflare, type Me } from '../api';
+import { submitManifestForm } from '../lib/github';
 import { BerthLight, Button, Field, Input, Panel, ProgressRail } from '../components/ui';
 
 const STEP_LABELS = ['Admin', 'Server', 'Cloudflare', 'GitHub'];
@@ -337,21 +338,4 @@ function GithubStep({ onSkip }: { onSkip: () => void }) {
       </div>
     </Panel>
   );
-}
-
-/** Builds and submits a hidden POST form carrying `manifest`, per GitHub's App manifest flow. */
-function submitManifestForm(postUrl: string, manifestJson: string): void {
-  const form = document.createElement('form');
-  form.method = 'POST';
-  form.action = postUrl;
-  form.style.display = 'none';
-
-  const input = document.createElement('input');
-  input.type = 'hidden';
-  input.name = 'manifest';
-  input.value = manifestJson;
-  form.appendChild(input);
-
-  document.body.appendChild(form);
-  form.submit();
 }

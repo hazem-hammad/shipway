@@ -1,6 +1,8 @@
 import { useQuery, type UseQueryResult } from '@tanstack/react-query';
 import {
   apiFetch,
+  fetchCronJobs,
+  fetchDatabases,
   fetchDeployment,
   fetchDeployments,
   fetchGithubBranches,
@@ -11,17 +13,27 @@ import {
   fetchProjectEnv,
   fetchProjectEnvPreview,
   fetchProjects,
+  fetchServerStats,
+  fetchServicesInfo,
   fetchSettings,
   fetchSetupStatus,
+  fetchUsers,
+  fetchWorkers,
   isPendingDeploymentStatus,
+  type CronJob,
+  type DatabaseListItem,
   type Deployment,
   type GithubRepo,
   type GithubStatus,
   type Me,
   type Project,
   type ProjectListItem,
+  type ServerStats,
+  type ServicesInfo,
   type Settings,
   type SetupStatus,
+  type User,
+  type WorkerListItem,
 } from './api';
 
 /**
@@ -119,4 +131,38 @@ export function useDeployment(id: number): UseQueryResult<Deployment> {
     queryFn: () => fetchDeployment(id),
     refetchInterval: (query) => (isPendingDeploymentStatus(query.state.data?.status) ? 3_000 : false),
   });
+}
+
+/** A project's workers, with each row's live systemd instance statuses (Workers tab). */
+export function useWorkers(projectId: number): UseQueryResult<WorkerListItem[]> {
+  return useQuery({ queryKey: ['workers', projectId], queryFn: () => fetchWorkers(projectId) });
+}
+
+/** A project's cron jobs (Cron tab). */
+export function useCronJobs(projectId: number): UseQueryResult<CronJob[]> {
+  return useQuery({ queryKey: ['cron', projectId], queryFn: () => fetchCronJobs(projectId) });
+}
+
+// ---- Databases page ----
+
+export function useDatabases(): UseQueryResult<DatabaseListItem[]> {
+  return useQuery({ queryKey: ['databases'], queryFn: fetchDatabases });
+}
+
+/** Redis/Mailpit connection info for the info panels at the bottom of the Databases page. */
+export function useServicesInfo(): UseQueryResult<ServicesInfo> {
+  return useQuery({ queryKey: ['services-info'], queryFn: fetchServicesInfo });
+}
+
+// ---- Server page ----
+
+/** Host resource usage + shared service status (DESIGN.md/task-25 ruling: polls every 10s). */
+export function useServerStats(): UseQueryResult<ServerStats> {
+  return useQuery({ queryKey: ['server-stats'], queryFn: fetchServerStats, refetchInterval: 10_000 });
+}
+
+// ---- Settings > Users ----
+
+export function useUsers(): UseQueryResult<User[]> {
+  return useQuery({ queryKey: ['users'], queryFn: fetchUsers });
 }

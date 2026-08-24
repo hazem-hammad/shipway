@@ -339,3 +339,228 @@ export function rollbackProject(id: number, releasePath: string): Promise<{ depl
 export function fetchDeploymentLog(id: number): Promise<{ content: string }> {
   return apiFetch<{ content: string }>(`/api/deployments/${String(id)}/log`);
 }
+
+// ---- Workers ----
+
+export interface WorkerInstance {
+  unit: string;
+  status: 'active' | 'inactive' | 'failed' | 'unknown';
+}
+
+export interface Worker {
+  id: number;
+  projectId: number;
+  name: string;
+  command: string;
+  processes: number;
+  statusCached: string | null;
+}
+
+export interface WorkerListItem extends Worker {
+  instances: WorkerInstance[];
+}
+
+export interface CreateWorkerBody {
+  name: string;
+  command: string;
+  processes: number;
+}
+
+export interface PatchWorkerBody {
+  command?: string;
+  processes?: number;
+}
+
+export type WorkerAction = 'start' | 'stop' | 'restart';
+
+export function fetchWorkers(projectId: number): Promise<WorkerListItem[]> {
+  return apiFetch<WorkerListItem[]>(`/api/projects/${String(projectId)}/workers`);
+}
+
+export function createWorker(projectId: number, body: CreateWorkerBody): Promise<Worker> {
+  return apiFetch<Worker>(`/api/projects/${String(projectId)}/workers`, { method: 'POST', body });
+}
+
+export function patchWorker(id: number, body: PatchWorkerBody): Promise<Worker> {
+  return apiFetch<Worker>(`/api/workers/${String(id)}`, { method: 'PATCH', body });
+}
+
+export function deleteWorker(id: number): Promise<void> {
+  return apiFetch<void>(`/api/workers/${String(id)}`, { method: 'DELETE' });
+}
+
+export function runWorkerAction(id: number, action: WorkerAction): Promise<void> {
+  return apiFetch<void>(`/api/workers/${String(id)}/${action}`, { method: 'POST' });
+}
+
+export function fetchWorkerLogs(id: number): Promise<{ content: string }> {
+  return apiFetch<{ content: string }>(`/api/workers/${String(id)}/logs`);
+}
+
+// ---- Cron ----
+
+export interface CronJob {
+  id: number;
+  projectId: number;
+  schedule: string;
+  command: string;
+}
+
+export interface CreateCronBody {
+  schedule: string;
+  command: string;
+}
+
+export interface PatchCronBody {
+  schedule?: string;
+  command?: string;
+}
+
+export function fetchCronJobs(projectId: number): Promise<CronJob[]> {
+  return apiFetch<CronJob[]>(`/api/projects/${String(projectId)}/cron`);
+}
+
+export function createCronJob(projectId: number, body: CreateCronBody): Promise<CronJob> {
+  return apiFetch<CronJob>(`/api/projects/${String(projectId)}/cron`, { method: 'POST', body });
+}
+
+export function patchCronJob(id: number, body: PatchCronBody): Promise<CronJob> {
+  return apiFetch<CronJob>(`/api/cron/${String(id)}`, { method: 'PATCH', body });
+}
+
+export function deleteCronJob(id: number): Promise<void> {
+  return apiFetch<void>(`/api/cron/${String(id)}`, { method: 'DELETE' });
+}
+
+// ---- Databases ----
+
+export type DbEngine = 'mysql' | 'postgres';
+
+export interface DatabaseListItem {
+  id: number;
+  projectId: number | null;
+  engine: DbEngine;
+  name: string;
+  username: string;
+  createdAt: number;
+  projectName: string | null;
+}
+
+export interface CreateDatabaseBody {
+  engine: DbEngine;
+  name: string;
+  projectId?: number;
+}
+
+/** The one-time response from `POST /api/databases` — the only place the plaintext password appears. */
+export interface DatabaseCreated {
+  id: number;
+  engine: DbEngine;
+  name: string;
+  username: string;
+  password: string;
+}
+
+export interface DatabaseCredentials {
+  username: string;
+  password: string;
+  env: Record<string, string>;
+}
+
+export function fetchDatabases(): Promise<DatabaseListItem[]> {
+  return apiFetch<DatabaseListItem[]>('/api/databases');
+}
+
+export function createDatabase(body: CreateDatabaseBody): Promise<DatabaseCreated> {
+  return apiFetch<DatabaseCreated>('/api/databases', { method: 'POST', body });
+}
+
+export function fetchDatabaseCredentials(id: number): Promise<DatabaseCredentials> {
+  return apiFetch<DatabaseCredentials>(`/api/databases/${String(id)}/credentials`);
+}
+
+export function deleteDatabase(id: number, confirmName: string): Promise<void> {
+  return apiFetch<void>(`/api/databases/${String(id)}`, { method: 'DELETE', body: { confirmName } });
+}
+
+export function injectDatabase(id: number, projectId: number): Promise<void> {
+  return apiFetch<void>(`/api/databases/${String(id)}/inject`, { method: 'POST', body: { projectId } });
+}
+
+export interface RedisInfo {
+  host: string;
+  port: number;
+  password?: string;
+}
+
+export interface MailpitInfo {
+  smtpHost: string;
+  smtpPort: number;
+  webUrl: string;
+}
+
+export interface ServicesInfo {
+  redis: RedisInfo | null;
+  mailpit: MailpitInfo | null;
+}
+
+export function fetchServicesInfo(): Promise<ServicesInfo> {
+  return apiFetch<ServicesInfo>('/api/services/info');
+}
+
+// ---- Server ----
+
+export interface ServerStats {
+  cpu: { cores: number; load1: number };
+  mem: { totalMb: number; usedMb: number };
+  disk: { totalGb: number; usedGb: number; mount: string };
+  services: { name: string; unit: string; status: 'active' | 'inactive' | 'failed' | 'unknown' }[];
+  shipwayVersion: string;
+}
+
+export function fetchServerStats(): Promise<ServerStats> {
+  return apiFetch<ServerStats>('/api/server/stats');
+}
+
+// ---- Users ----
+
+export interface User {
+  id: number;
+  name: string;
+  email: string;
+  createdAt: number;
+}
+
+export interface CreateUserBody {
+  name: string;
+  email: string;
+  password: string;
+}
+
+export function fetchUsers(): Promise<User[]> {
+  return apiFetch<User[]>('/api/users');
+}
+
+export function createUser(body: CreateUserBody): Promise<User> {
+  return apiFetch<User>('/api/users', { method: 'POST', body });
+}
+
+export function deleteUser(id: number): Promise<void> {
+  return apiFetch<void>(`/api/users/${String(id)}`, { method: 'DELETE' });
+}
+
+// ---- GitHub App (settings management) ----
+
+export interface ManualGithubAppBody {
+  appId: number;
+  privateKey: string;
+  webhookSecret: string;
+}
+
+export function putGithubApp(body: ManualGithubAppBody): Promise<GithubStatus> {
+  return apiFetch<GithubStatus>('/api/github/app', { method: 'PUT', body });
+}
+
+export function resolveGithubInstallation(): Promise<{ installationId: number }> {
+  return apiFetch<{ installationId: number }>('/api/github/resolve-installation', { method: 'POST' });
+}
