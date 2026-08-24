@@ -169,23 +169,28 @@ export async function notificationRoutes(app: FastifyInstance, opts: { fetchImpl
       }
     }
 
-    // Effective type/url/target after this PATCH: an explicit field in the body wins; otherwise, if
-    // the type ISN'T changing, the existing row's url/target carries over (today's "PATCH just the
-    // name" behavior). If the type IS changing, the old url/target never carries over — an email
-    // channel switching to webhook doesn't silently keep a stale `target`, and vice versa — so the
-    // new type's required field must be supplied in the same request.
-    const effectiveType: ChannelType = parsedBody.data.type ?? (target.type as ChannelType);
-    const typeChanged = parsedBody.data.type !== undefined && parsedBody.data.type !== target.type;
-    const effectiveUrl = parsedBody.data.url ?? (typeChanged ? undefined : (target.url ?? undefined));
-    const effectiveTarget = parsedBody.data.target ?? (typeChanged ? undefined : (target.target ?? undefined));
-
-    const typeError = validateChannelType(app, effectiveType, effectiveUrl, effectiveTarget);
-    if (typeError) {
-      return reply.code(400).send({ error: typeError });
-    }
-
     const patch: Partial<ChannelRow> = { ...parsedBody.data };
+
+    // Only re-validate (and rewrite) the type-specific config when this PATCH actually touches
+    // type/url/target — a plain rename (or any other partial field) must NOT re-run the live
+    // `isMailConfigured` check or the url-shape check against fields nothing in this request is
+    // changing. Otherwise renaming an existing email channel 400s the moment instance mail is later
+    // un-configured, even though the rename itself has nothing to do with mail. Effective
+    // type/url/target: an explicit field in the body wins; otherwise, if the type ISN'T changing, the
+    // existing row's url/target carries over. If the type IS changing, the old url/target never
+    // carries over — an email channel switching to webhook doesn't silently keep a stale `target`,
+    // and vice versa — so the new type's required field must be supplied in the same request.
     if (parsedBody.data.type !== undefined || parsedBody.data.url !== undefined || parsedBody.data.target !== undefined) {
+      const effectiveType: ChannelType = parsedBody.data.type ?? (target.type as ChannelType);
+      const typeChanged = parsedBody.data.type !== undefined && parsedBody.data.type !== target.type;
+      const effectiveUrl = parsedBody.data.url ?? (typeChanged ? undefined : (target.url ?? undefined));
+      const effectiveTarget = parsedBody.data.target ?? (typeChanged ? undefined : (target.target ?? undefined));
+
+      const typeError = validateChannelType(app, effectiveType, effectiveUrl, effectiveTarget);
+      if (typeError) {
+        return reply.code(400).send({ error: typeError });
+      }
+
       patch.type = effectiveType;
       patch.url = effectiveType === 'email' ? null : (effectiveUrl ?? null);
       patch.target = effectiveType === 'email' ? (effectiveTarget ?? null) : null;

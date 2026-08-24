@@ -8,7 +8,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { openDb } from '../src/db/index.js';
-import { auditEvents, notificationChannels, notificationSubscriptions, projects, users } from '../src/db/schema.js';
+import { auditEvents, deployments, notificationChannels, notificationSubscriptions, projects, users } from '../src/db/schema.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_FOLDER = path.resolve(__dirname, '../drizzle');
@@ -87,24 +87,37 @@ describe('migration 0002 — fresh install', () => {
   });
 });
 
+/**
+ * Builds a 0001-state db on disk (0000+0001 applied via drizzle's own migrator, so its
+ * `__drizzle_migrations` bookkeeping matches a real pre-0002 install; 0002 left pending) and returns
+ * the raw better-sqlite3 client, left OPEN, so the caller can seed pre-0002-shape rows with raw SQL
+ * (the typed `schema.ts` already has 0002's columns, so a typed insert here would silently assume
+ * they exist) before closing it and handing off to `openDb`, which applies the pending 0002
+ * migration via the production path.
+ */
+function build0001StateDb(dbPath: string): Database.Database {
+  const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-legacy-0001-migrations-'));
+  fs.mkdirSync(path.join(legacyDir, 'meta'));
+  fs.copyFileSync(path.join(MIGRATIONS_FOLDER, '0000_clever_nick_fury.sql'), path.join(legacyDir, '0000_clever_nick_fury.sql'));
+  fs.copyFileSync(path.join(MIGRATIONS_FOLDER, '0001_overconfident_karen_page.sql'), path.join(legacyDir, '0001_overconfident_karen_page.sql'));
+  fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0000_snapshot.json'), path.join(legacyDir, 'meta/0000_snapshot.json'));
+  fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0001_snapshot.json'), path.join(legacyDir, 'meta/0001_snapshot.json'));
+  const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta/_journal.json'), 'utf8')) as { entries: { tag: string }[] };
+  journal.entries = journal.entries.filter((e) => e.tag !== '0002_notification_channel_type_target');
+  fs.writeFileSync(path.join(legacyDir, 'meta/_journal.json'), JSON.stringify(journal));
+
+  const client = new Database(dbPath);
+  client.pragma('journal_mode = WAL');
+  client.pragma('foreign_keys = ON');
+  const preDb = drizzle({ client });
+  migrate(preDb, { migrationsFolder: legacyDir });
+  return client;
+}
+
 describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
   it('preserves an existing webhook-shaped channel row, backfilling type: webhook and target: null', () => {
     const dbPath = tmpDbPath();
-    const legacyDir = fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-legacy-0001-migrations-'));
-    fs.mkdirSync(path.join(legacyDir, 'meta'));
-    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, '0000_clever_nick_fury.sql'), path.join(legacyDir, '0000_clever_nick_fury.sql'));
-    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, '0001_overconfident_karen_page.sql'), path.join(legacyDir, '0001_overconfident_karen_page.sql'));
-    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0000_snapshot.json'), path.join(legacyDir, 'meta/0000_snapshot.json'));
-    fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0001_snapshot.json'), path.join(legacyDir, 'meta/0001_snapshot.json'));
-    const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta/_journal.json'), 'utf8')) as { entries: { tag: string }[] };
-    journal.entries = journal.entries.filter((e) => e.tag !== '0002_notification_channel_type_target');
-    fs.writeFileSync(path.join(legacyDir, 'meta/_journal.json'), JSON.stringify(journal));
-
-    const client = new Database(dbPath);
-    client.pragma('journal_mode = WAL');
-    client.pragma('foreign_keys = ON');
-    const preDb = drizzle({ client });
-    migrate(preDb, { migrationsFolder: legacyDir });
+    const client = build0001StateDb(dbPath);
 
     // Raw insert against the pre-0002 shape (no type/target columns exist yet on disk).
     client.prepare("INSERT INTO notification_channels (name, url, created_at) VALUES (?, ?, ?)").run('legacy-slack', 'https://hooks.slack.com/services/legacy', Date.now());
@@ -117,6 +130,82 @@ describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
     expect(row?.url).toBe('https://hooks.slack.com/services/legacy');
     expect(row?.type).toBe('webhook');
     expect(row?.target).toBeNull();
+  });
+
+  /**
+   * BLOCKER regression (found in review): drizzle's `migrate()` wraps every pending migration in one
+   * `BEGIN...COMMIT`, and SQLite silently NO-OPS a `PRAGMA foreign_keys=OFF/ON` issued INSIDE an
+   * already-open transaction — so 0002's own `PRAGMA foreign_keys=OFF/ON` lines (around its
+   * `DROP TABLE notification_channels` + recreate/rename table-rebuild) did nothing, FK enforcement
+   * stayed ON for the whole transaction, and the `DROP TABLE` cascade-deleted every
+   * `notification_subscriptions` row (`channel_id ... ON DELETE CASCADE`) before the table was even
+   * recreated. Invisible on a fresh install (nothing to cascade away) and invisible to the test above
+   * (it never seeded a subscription row) — but on any real v2 install with live event routing
+   * configured, upgrading to 0002 silently deleted every subscription. Fixed in `db/index.ts`'s
+   * `openDb` by toggling the pragma OUTSIDE the transaction `migrate()` opens (the only place it
+   * actually takes effect), restored in a `finally`.
+   */
+  it('BLOCKER regression: preserves notification_subscriptions (and other FK-referencing rows) across the 0002 table-rebuild', () => {
+    const dbPath = tmpDbPath();
+    const client = build0001StateDb(dbPath);
+
+    // A project + a deployment referencing it — unrelated to 0002's table-rebuild, but a real
+    // upgrade has plenty of other FK-referencing rows too; proves the FK toggle is scoped to exactly
+    // the migration transaction and doesn't collaterally corrupt anything else.
+    client
+      .prepare("INSERT INTO projects (name, slug, repo, branch, type, shared_paths, smtp_mode, created_at) VALUES (?, ?, ?, ?, ?, '[]', 'mailpit', ?)")
+      .run('Shop', 'shop', 'acme/shop', 'main', 'node', Date.now());
+    const projectId = client.prepare('SELECT id FROM projects WHERE slug = ?').get('shop') as { id: number };
+    client.prepare("INSERT INTO deployments (project_id, status, trigger) VALUES (?, 'success', 'manual')").run(projectId.id);
+
+    // The critical case: a notification channel WITH subscriptions referencing it (0001's schema —
+    // no type/target columns exist on disk yet).
+    client.prepare('INSERT INTO notification_channels (name, url, created_at) VALUES (?, ?, ?)').run('ops', 'https://hooks.slack.com/services/ops', Date.now());
+    const channelId = client.prepare('SELECT id FROM notification_channels WHERE name = ?').get('ops') as { id: number };
+    client.prepare('INSERT INTO notification_subscriptions (event, channel_id) VALUES (?, ?)').run('deploy_failed', channelId.id);
+    client.prepare('INSERT INTO notification_subscriptions (event, channel_id) VALUES (?, ?)').run('deploy_succeeded', channelId.id);
+
+    // A user + an audit row referencing them (ON DELETE SET NULL — a different FK shape than the
+    // subscriptions' CASCADE, seeded for the same "nothing else breaks" reason as the project above).
+    client.prepare('INSERT INTO users (name, email, password_hash, created_at) VALUES (?, ?, ?, ?)').run('Ada', 'ada@example.com', 'hash', Date.now());
+    const userId = client.prepare('SELECT id FROM users WHERE email = ?').get('ada@example.com') as { id: number };
+    client
+      .prepare('INSERT INTO audit_events (actor_id, actor_name, action, target_type, target_name, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(userId.id, 'Ada', 'x', 't', 'n', Date.now());
+
+    client.close();
+
+    // Production path: applies the pending 0002 migration (the table-rebuild that previously
+    // cascade-deleted every notification_subscriptions row).
+    const db = openDb(dbPath);
+
+    const channel = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'ops')).get();
+    expect(channel).toBeDefined();
+
+    const subs = db.select().from(notificationSubscriptions).all();
+    expect(subs).toHaveLength(2);
+    expect(subs.map((s) => ({ event: s.event, channelId: s.channelId })).sort((a, b) => a.event.localeCompare(b.event))).toEqual(
+      [
+        { event: 'deploy_failed', channelId: channel!.id },
+        { event: 'deploy_succeeded', channelId: channel!.id },
+      ].sort((a, b) => a.event.localeCompare(b.event)),
+    );
+
+    // Unrelated rows survived too.
+    expect(db.select().from(projects).where(eq(projects.slug, 'shop')).get()).toBeDefined();
+    expect(db.select().from(deployments).where(eq(deployments.projectId, projectId.id)).all()).toHaveLength(1);
+    const auditRow = db.select().from(auditEvents).where(eq(auditEvents.targetName, 'n')).get();
+    expect(auditRow?.actorId).toBe(userId.id);
+
+    // FK integrity is genuinely intact afterward (not just "no error was thrown" during migration) —
+    // `PRAGMA foreign_key_check` returns one row per violation, so an empty result means clean.
+    const violations = db.all<Record<string, unknown>>(sql`PRAGMA foreign_key_check`);
+    expect(violations).toHaveLength(0);
+
+    // Normal operation resumes with FK enforcement ON — `openDb`'s `finally` must restore it (same
+    // expectation `db.test.ts`'s "runs migrations and applies WAL + foreign_keys pragmas" already has).
+    const fk = db.get<{ foreign_keys: number }>(sql`PRAGMA foreign_keys`);
+    expect(fk?.foreign_keys).toBe(1);
   });
 
   it('running the full migration set fresh matches applying it on top of an existing db (no schema divergence)', () => {

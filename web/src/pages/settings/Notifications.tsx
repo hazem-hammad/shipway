@@ -122,7 +122,7 @@ function DeliveryChannelsCard({ channels, isPending, isError }: { channels: Noti
       <CardHeader
         icon={<Bell size={20} strokeWidth={ICON_STROKE} />}
         title="Delivery channels"
-        description="Webhook targets deploy and service events can be sent to."
+        description="Webhook, Teams, and email targets deploy and service events can be sent to."
         action={
           !adding && (
             <Button variant="outline" onClick={() => setAdding(true)}>
@@ -236,7 +236,7 @@ function AddChannelForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
               ? undefined
               : mailConfigured
                 ? undefined
-                : 'Instance mail is not configured yet — set it up in Settings > Mail first.'
+                : 'Instance mail is not configured yet. Set it up in Settings > Mail first.'
           }
         >
           <Input mono type="email" required placeholder="you@example.com" value={target} onChange={(event) => setTarget(event.target.value)} />
@@ -245,7 +245,7 @@ function AddChannelForm({ onDone, onCancel }: { onDone: () => void; onCancel: ()
 
       {emailBlocked && !mailQuery.isPending && (
         <p className="text-[13px] text-soft">
-          The Add button stays disabled until instance mail is configured — see{' '}
+          The Add button stays disabled until instance mail is configured. See{' '}
           <a href="/settings/mail" className="font-medium text-ink underline underline-offset-2">
             Settings &gt; Mail
           </a>

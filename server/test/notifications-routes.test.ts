@@ -748,6 +748,28 @@ describe('PATCH /api/notifications/channels/:id — changing type', () => {
 
     await app.close();
   });
+
+  it('renaming an existing email channel still works after instance mail is later un-configured (a name-only PATCH must not re-run the live isMailConfigured check)', async () => {
+    const { app, cookie } = await buildOwnerApp();
+    await configureMail(app, cookie);
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/notifications/channels',
+      headers: { cookie },
+      payload: { name: 'ops-email', type: 'email', target: 'ops@example.com' },
+    });
+    const id = (created.json() as PublicChannel).id;
+
+    // Instance mail is un-configured again after the channel already exists (a realistic later
+    // state — see the same scenario in the test-send describe block below).
+    await app.inject({ method: 'PUT', url: '/api/settings/mail', headers: { cookie }, payload: { driver: 'none' } });
+
+    const res = await app.inject({ method: 'PATCH', url: `/api/notifications/channels/${String(id)}`, headers: { cookie }, payload: { name: 'ops-email-renamed' } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ name: 'ops-email-renamed', type: 'email', url: null, target: 'ops@example.com' });
+
+    await app.close();
+  });
 });
 
 describe('POST /api/notifications/channels/:id/test — per-type', () => {
