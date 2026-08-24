@@ -41,8 +41,9 @@ export interface PipelineDeps {
   sysops: SysOps;
   gitOps: GitOps;
   secretBox: SecretBox;
-  /** Resolves a project's `repo` (`"owner/name"`) to an authenticated clone URL. */
-  getCloneUrl: (repo: string) => Promise<string>;
+  /** Resolves a project's clone URL: `repoUrl` (Task 8's Git-URL source) verbatim when set, else
+   * `repo` (`"owner/name"`) to an authenticated GitHub App clone URL. */
+  getCloneUrl: (repo: string, repoUrl: string | null) => Promise<string>;
   runShell: (
     cmd: string,
     opts: { cwd: string; env: Record<string, string>; signal: AbortSignal; onOutput: (s: string) => void },
@@ -464,7 +465,7 @@ async function runBuildPhase(
   try {
     logger.section('resolve');
     checkAborted(signal);
-    const url = await deps.getCloneUrl(project.repo);
+    const url = await deps.getCloneUrl(project.repo, project.repoUrl);
     const { sha, message } = await deps.gitOps.fetchBranchTip(projectDir, url, project.branch);
     patchDeployment(deps.db, deploymentId, { commitSha: sha, commitMessage: message });
 

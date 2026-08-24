@@ -36,7 +36,7 @@ import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
 import { makeGitOps } from './services/git.js';
-import { cloneUrl, GitHubService, type GithubAppConfig } from './services/github.js';
+import { GitHubService, resolveCloneUrl, type GithubAppConfig } from './services/github.js';
 import { startServiceWatch, type ServiceWatchHandle } from './services/servicewatch.js';
 import { makeSysOps, type SysOps } from './sysops/index.js';
 
@@ -259,17 +259,14 @@ export async function buildApp(
 
   const fetchImpl = deps.fetchImpl ?? fetch;
 
-  // Resolves a project's `repo` ("owner/name") to an authenticated HTTPS clone URL via the
-  // configured GitHub App's installation token. Throws a clear error (surfaced in the deploy log,
-  // see pipeline.ts's `handlePreActivateFailure`) if the app isn't configured/installed yet, rather
-  // than letting a confusing git/auth failure be the first sign something's wrong.
-  async function getCloneUrl(repo: string): Promise<string> {
-    const github = app.github();
-    if (!github) {
-      throw new Error('cannot deploy: the GitHub App is not configured');
-    }
-    const token = await github.getInstallationToken();
-    return cloneUrl(repo, token);
+  // Resolves a project's clone URL: `repoUrl` (Task 8's Git-URL source) verbatim when set, else
+  // `repo` ("owner/name") via the configured GitHub App's installation token. Throws a clear error
+  // (surfaced in the deploy log, see pipeline.ts's `handlePreActivateFailure`) if a repo-sourced
+  // project's app isn't configured/installed yet, rather than letting a confusing git/auth failure
+  // be the first sign something's wrong. Thin wrapper over `resolveCloneUrl` — see that function's
+  // doc comment for why the precedence logic itself lives there instead of here.
+  async function getCloneUrl(repo: string, repoUrl: string | null): Promise<string> {
+    return resolveCloneUrl(repo, repoUrl, app.github());
   }
 
   // Wired as `PipelineDeps.notify`: preserves v1's per-project/global webhook override (gated by

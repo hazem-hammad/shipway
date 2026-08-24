@@ -277,6 +277,39 @@ describe('POST /api/webhooks/github', () => {
     await app.close();
   });
 
+  // Task 8: a Git-URL-sourced project stores `repo: ''` (the column is NOT NULL). This confirms it
+  // can never be matched by a push webhook — neither a real GitHub payload (which always carries a
+  // non-empty `full_name`) nor even a malformed/empty one, thanks to the schema's `.min(1)` guard.
+  it('a repoUrl project (repo stored as "") is never matched by a push webhook, even an empty full_name', async () => {
+    const { app, cookie } = await buildWebhookTestApp();
+    const create = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: {
+        name: 'external',
+        slug: 'external',
+        repoUrl: 'https://git.example.com/acme/external.git',
+        branch: 'main',
+        type: 'static',
+        autoDeploy: true,
+      },
+    });
+    const projectId = create.json().id as number;
+
+    // A real GitHub push naming the repoUrl project's actual source never happens (repo is '' —
+    // GitHub doesn't know about it), so the adversarial case worth guarding is a payload that
+    // literally names the empty string.
+    const res = await postWebhook(app, WEBHOOK_SECRET, pushPayload({ repository: { full_name: '' } }));
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: 'invalid push payload' });
+
+    const rows = app.db.select().from(deployments).where(eq(deployments.projectId, projectId)).all();
+    expect(rows).toHaveLength(0);
+
+    await app.close();
+  });
+
   it('does not leak its raw-body content-type parser to other routes — normal JSON routes still parse objects', async () => {
     const { app, cookie } = await buildWebhookTestApp();
 

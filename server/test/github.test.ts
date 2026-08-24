@@ -7,7 +7,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { getSetting, setSetting } from '../src/db/settings.js';
-import { cloneUrl, GitHubService, verifyWebhookSignature } from '../src/services/github.js';
+import { cloneUrl, GitHubService, resolveCloneUrl, verifyWebhookSignature } from '../src/services/github.js';
 
 describe('verifyWebhookSignature', () => {
   const secret = 'top-secret-webhook-key';
@@ -55,6 +55,38 @@ describe('verifyWebhookSignature', () => {
 describe('cloneUrl', () => {
   it('builds an x-access-token clone URL from the repo full name and token', () => {
     expect(cloneUrl('acme/widgets', 'ghs_abc123')).toBe('https://x-access-token:ghs_abc123@github.com/acme/widgets.git');
+  });
+});
+
+// Task 8: unit-level coverage of the app.ts `getCloneUrl` wiring's actual precedence logic, without
+// spinning up a Fastify app or touching real git — see `resolveCloneUrl`'s doc comment.
+describe('resolveCloneUrl', () => {
+  it('returns repoUrl verbatim when set, without ever touching `github` (even when it is null)', async () => {
+    await expect(resolveCloneUrl('acme/ignored', 'https://user:token@example.com/acme/app.git', null)).resolves.toBe(
+      'https://user:token@example.com/acme/app.git',
+    );
+  });
+
+  it('prefers repoUrl over `github` even when a GitHub App is configured', async () => {
+    let called = false;
+    const fakeGithub = { getInstallationToken: async () => ((called = true), 'ghs_should-not-be-used') };
+
+    const url = await resolveCloneUrl('acme/app', 'https://example.com/acme/app.git', fakeGithub);
+
+    expect(url).toBe('https://example.com/acme/app.git');
+    expect(called).toBe(false);
+  });
+
+  it('falls back to the GitHub App token/cloneUrl when repoUrl is null', async () => {
+    const fakeGithub = { getInstallationToken: async () => 'ghs_abc123' };
+
+    const url = await resolveCloneUrl('acme/app', null, fakeGithub);
+
+    expect(url).toBe('https://x-access-token:ghs_abc123@github.com/acme/app.git');
+  });
+
+  it('throws a clear error when repoUrl is null and no GitHub App is configured', async () => {
+    await expect(resolveCloneUrl('acme/app', null, null)).rejects.toThrow('cannot deploy: the GitHub App is not configured');
   });
 });
 

@@ -32,7 +32,11 @@ const DELETED_BRANCH_SHA = '0'.repeat(40);
 const pushPayloadSchema = z.object({
   ref: z.string(),
   after: z.string(),
-  repository: z.object({ full_name: z.string() }),
+  // `.min(1)`: defense in depth for Task 8's Git-URL project source, which stores `repo: ''` (the
+  // `repo` column is NOT NULL). GitHub itself never sends an empty `full_name`, but without this the
+  // match below (`eq(projects.repo, payload.repository.full_name)`) would happily match a repoUrl
+  // project against a malformed/empty payload value.
+  repository: z.object({ full_name: z.string().min(1) }),
   head_commit: z.object({ message: z.string() }).nullable().optional(),
 });
 
