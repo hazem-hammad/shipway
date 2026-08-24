@@ -340,6 +340,29 @@ export function fetchDeploymentLog(id: number): Promise<{ content: string }> {
   return apiFetch<{ content: string }>(`/api/deployments/${String(id)}/log`);
 }
 
+// ---- Overview (Home dashboard) ----
+
+export interface OverviewRecentProject {
+  id: number;
+  name: string;
+  slug: string;
+  type: ProjectType;
+  lastDeployment: { status: DeploymentStatus; finishedAt: number | null } | null;
+}
+
+export interface Overview {
+  user: { name: string };
+  projects: number;
+  deployments: number;
+  /** Human-readable names of any system units currently down (e.g. "Nginx"); `[]` when healthy. */
+  servicesDown: string[];
+  recentProjects: OverviewRecentProject[];
+}
+
+export function fetchOverview(): Promise<Overview> {
+  return apiFetch<Overview>('/api/overview');
+}
+
 // ---- Workers ----
 
 export interface WorkerInstance {

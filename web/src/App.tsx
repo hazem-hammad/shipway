@@ -4,6 +4,7 @@ import { ShellSkeleton } from './components/ui';
 import Layout from './components/Layout';
 import Login from './pages/Login';
 import SetupWizard from './pages/SetupWizard';
+import HomePage from './pages/Home';
 import ProjectsPage from './pages/Projects';
 import ProjectNewPage from './pages/ProjectNew';
 import ProjectLayout from './pages/project/ProjectLayout';
@@ -53,6 +54,7 @@ function AuthenticatedGate() {
   return (
     <Layout user={me.data}>
       <Switch>
+        <Route path="/" component={HomePage} />
         <Route path="/projects/new" component={ProjectNewPage} />
         <Route path="/projects" component={ProjectsPage} />
         <Route path="/projects/:id" nest component={ProjectLayout} />

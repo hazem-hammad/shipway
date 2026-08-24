@@ -9,6 +9,7 @@ import {
   fetchGithubRepos,
   fetchGithubStatus,
   fetchMe,
+  fetchOverview,
   fetchProject,
   fetchProjectEnv,
   fetchProjectEnvPreview,
@@ -26,6 +27,7 @@ import {
   type GithubRepo,
   type GithubStatus,
   type Me,
+  type Overview,
   type Project,
   type ProjectListItem,
   type ServerStats,
@@ -47,6 +49,11 @@ export function useSetupStatus(): UseQueryResult<SetupStatus> {
 /** The current session's user, or an error (typically a 401) when there isn't one. */
 export function useMe(): UseQueryResult<Me> {
   return useQuery({ queryKey: ['me'], queryFn: fetchMe, retry: false });
+}
+
+/** Home dashboard summary (`GET /api/overview`); refreshed every 30s per the task-6 ruling. */
+export function useOverview(): UseQueryResult<Overview> {
+  return useQuery({ queryKey: ['overview'], queryFn: fetchOverview, refetchInterval: 30_000 });
 }
 
 /**
