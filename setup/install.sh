@@ -146,6 +146,21 @@ install_php() {
   apt-get install -y "${php_packages[@]}"
 }
 
+# Creates /opt/php/<version>/bin/php -> /usr/bin/php<version> for every installed PHP version, so a
+# project's install/build/pre-post-deploy scripts and worker commands can put that directory first
+# on PATH (server/src/services/provisioner.ts's phpBinDir) and have a bare `php` invocation resolve
+# to the project's pinned version, instead of whichever version ondrej/php's PPA currently makes the
+# unversioned `/usr/bin/php` default. Idempotent: `install -d` and `ln -sf` both just re-assert the
+# same state on a re-run.
+install_php_bin_shims() {
+  log "creating /opt/php/<version>/bin php shims"
+  local v
+  for v in "${PHP_VERSIONS[@]}"; do
+    install -d -m 0755 "/opt/php/${v}/bin"
+    ln -sf "/usr/bin/php${v}" "/opt/php/${v}/bin/php"
+  done
+}
+
 install_composer() {
   if [[ -x /usr/local/bin/composer ]]; then
     log "composer already installed, skipping"
@@ -308,6 +323,30 @@ EOF
   chmod 0644 /etc/systemd/system/mailpit.service
   systemctl daemon-reload
   systemctl enable --now mailpit
+}
+
+MAILPIT_WEB_PASSWORD=""
+
+# Generates (and caches, like every other secret) a random password for the Mailpit web UI's HTTP
+# basic auth, and writes the htpasswd file the nginx-mailpit.conf vhost's auth_basic_user_file
+# points at. Idempotent: the password is cached via get_or_create_secret, and the htpasswd file
+# itself is only written once (its content is otherwise not deterministic — `openssl passwd -apr1`
+# picks a fresh salt every call — so re-writing it on every run would fail the spirit of "never
+# rotate a credential something may already depend on" even though the password stays the same).
+configure_mailpit_auth() {
+  MAILPIT_WEB_PASSWORD="$(get_or_create_secret MAILPIT_WEB_PASSWORD)"
+
+  local htpasswd_file=/etc/nginx/shipway-mailpit.htpasswd
+  if [[ -f "$htpasswd_file" ]]; then
+    log "mailpit htpasswd already exists, skipping"
+    return
+  fi
+
+  log "writing mailpit htpasswd (user: intcore)"
+  local hash
+  hash="$(openssl passwd -apr1 "$MAILPIT_WEB_PASSWORD")"
+  echo "intcore:${hash}" > "$htpasswd_file"
+  chmod 0644 "$htpasswd_file"
 }
 
 # ---------------------------------------------------------------------------
@@ -498,6 +537,8 @@ write_bootstrap_file() {
     --arg mailpit_smtp_host "127.0.0.1" \
     --argjson mailpit_smtp_port 1025 \
     --arg mailpit_web_url "$mailpit_web_url" \
+    --arg mailpit_username "intcore" \
+    --arg mailpit_web_password "$MAILPIT_WEB_PASSWORD" \
     --arg base_domain "$BASE_DOMAIN" \
     --arg server_ip "$SERVER_IP" \
     --arg acme_email "$ACME_EMAIL" \
@@ -505,7 +546,7 @@ write_bootstrap_file() {
       mysql_admin_url: $mysql_admin_url,
       postgres_admin_url: $postgres_admin_url,
       redis_info: { host: $redis_host, port: $redis_port, password: $redis_password },
-      mailpit_info: { smtpHost: $mailpit_smtp_host, smtpPort: $mailpit_smtp_port, webUrl: $mailpit_web_url },
+      mailpit_info: { smtpHost: $mailpit_smtp_host, smtpPort: $mailpit_smtp_port, webUrl: $mailpit_web_url, username: $mailpit_username, webPassword: $mailpit_web_password },
       base_domain: $base_domain,
       server_ip: $server_ip,
       acme_email: $acme_email
@@ -629,6 +670,7 @@ main() {
 
   install_base_packages
   install_php
+  install_php_bin_shims
   install_composer
 
   install_databases
@@ -638,6 +680,7 @@ main() {
 
   install_mailpit_binary
   install_mailpit_unit
+  configure_mailpit_auth
 
   install_certbot
 

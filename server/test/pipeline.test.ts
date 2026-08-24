@@ -135,6 +135,9 @@ function getDeploymentRow(db: ShipwayDb, id: number): typeof deployments.$inferS
 /** Records every `runShell` invocation; can be told to fail or to abort-and-fail on a cmd substring. */
 class RecordingShell {
   readonly calls: Array<{ cmd: string; cwd: string }> = [];
+  /** Parallel to `calls` — the `env` each invocation ran with (kept separate so existing `{cmd, cwd}`
+   * equality assertions on `calls` don't have to also pin down the full environment). */
+  readonly envs: Array<Record<string, string>> = [];
   failSubstring: string | null = null;
   abortSubstring: string | null = null;
   private abortFn: (() => void) | null = null;
@@ -148,6 +151,7 @@ class RecordingShell {
     opts: { cwd: string; env: Record<string, string>; signal: AbortSignal; onOutput: (s: string) => void },
   ): Promise<{ exitCode: number }> => {
     this.calls.push({ cmd, cwd: opts.cwd });
+    this.envs.push(opts.env);
     opts.onOutput(`running: ${cmd}`);
 
     if (this.abortSubstring && cmd.includes(this.abortSubstring)) {
@@ -362,6 +366,11 @@ describe('runDeploy — happy path (php)', () => {
 
     // install ran in the release dir
     expect(shell.calls).toEqual([{ cmd: 'composer install', cwd: releaseDir }]);
+
+    // B5: the install command's PATH is prefixed with the project's version-pinned php shim dir
+    // (install.sh's /opt/php/<ver>/bin/php -> /usr/bin/php<ver>), so a bare `composer`/`php`
+    // invocation resolves to the project's pinned phpVersion instead of the PPA's current default.
+    expect(shell.envs[0]?.PATH?.startsWith('/opt/php/8.3/bin:')).toBe(true);
 
     // php restart, not systemd
     expect(sysops.calls).toContain('reloadPhpFpm 8.3');

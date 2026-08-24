@@ -44,6 +44,33 @@ function assertPort(port: number, label = 'port'): void {
   }
 }
 
+/**
+ * Release-relative sub-path used as the nginx vhost's web root (appended to
+ * `<appsDir>/<slug>/current/`). `''` means the release root itself (see
+ * {@link releaseRoot}). Must start with an alphanumeric char (so an absolute path or a path made
+ * entirely of `.`/`..` can never match) and must not contain a literal `..` path segment — either
+ * would let the rendered `root` directive escape the release directory.
+ */
+export const PUBLIC_DIR_RE = /^[a-zA-Z0-9][a-zA-Z0-9_./-]*$/;
+
+/** True for `''` or a value matching {@link PUBLIC_DIR_RE} with no `..` path segment. */
+export function isValidPublicDir(value: string): boolean {
+  if (value === '') {
+    return true;
+  }
+  if (!PUBLIC_DIR_RE.test(value)) {
+    return false;
+  }
+  return !value.split('/').some((segment) => segment === '..');
+}
+
+/** Throws if `value` isn't a valid `publicDir` per {@link isValidPublicDir}. */
+export function assertPublicDir(value: string): void {
+  if (!isValidPublicDir(value)) {
+    throw new Error(`Invalid publicDir: "${value}"`);
+  }
+}
+
 const PHP_VERSION_RE = /^8\.[0-9]+$/;
 
 function assertPhpVersion(version: string | undefined): asserts version is string {
@@ -99,10 +126,21 @@ function releaseRoot(appsDir: string, slug: string, publicDir: string): string {
   return publicDir === '' ? current : `${current}/${publicDir}`;
 }
 
+/**
+ * Denies any dotfile request (`.env`, `.git/...`, etc.) except the `/.well-known/` ACME-challenge
+ * path certbot's HTTP-01 flow needs — placed before every other `location` block so it always wins.
+ * Without this, a project's `publicDir` set to `''` (the web root = the release root, where the
+ * pipeline symlinks `.env`) would serve `.env` — SMTP creds and any injected `DB_PASSWORD` included
+ * — straight over HTTP.
+ */
+const DOTFILE_DENY_LOCATION = [`    location ~ /\\.(?!well-known) {`, `        deny all;`, `    }`].join('\n');
+
 function phpBody(root: string, phpVersion: string): string {
   return [
     `    root ${root};`,
     `    index index.php index.html;`,
+    ``,
+    DOTFILE_DENY_LOCATION,
     ``,
     `    try_files $uri $uri/ /index.php?$query_string;`,
     ``,
@@ -136,6 +174,8 @@ function staticBody(root: string): string {
     `    root ${root};`,
     `    index index.html;`,
     ``,
+    DOTFILE_DENY_LOCATION,
+    ``,
     `    location / {`,
     `        try_files $uri $uri/ /index.html;`,
     `    }`,
@@ -164,6 +204,11 @@ export function renderNginxVhost(i: VhostInput): string {
   assertSlug(i.slug);
   assertHostname(i.domain, 'domain');
   assertHostname(i.certName, 'certName');
+  // Defense in depth: the API route schemas already validate `publicDir` (see
+  // routes/projects.ts's `publicDirSchema`), but this renderer asserts it again itself, the same
+  // way it asserts slug/domain/certName, so nothing that reaches this function unvalidated can ever
+  // produce a config-injecting/path-escaping `root` directive.
+  assertPublicDir(i.publicDir);
 
   const root = releaseRoot(i.appsDir, i.slug, i.publicDir);
   const body = vhostBody(i, root);

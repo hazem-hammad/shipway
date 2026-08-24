@@ -256,3 +256,42 @@ describe('login rate limiting', () => {
     await app.close();
   });
 });
+
+describe('trustProxy (B4)', () => {
+  it("request.ip is derived from X-Forwarded-For, not nginx's own loopback remoteAddress", async () => {
+    // In production every request arrives from nginx on 127.0.0.1 (the server only binds loopback —
+    // see docs/server-setup.md), with the real client IP carried in X-Forwarded-For (set by both
+    // setup/templates/nginx-dashboard.conf and nginx-mailpit.conf). `app.inject`'s `remoteAddress`
+    // simulates the TCP peer (nginx); the `x-forwarded-for` header simulates what nginx forwards.
+    // Without `trustProxy: true` in buildApp, `request.ip` would be 127.0.0.1 for every request here,
+    // collapsing the login rate limiter (keyed on `request.ip`, routes/auth.ts) onto one shared
+    // bucket for every real client — this test would then fail identically for both forwarded IPs.
+    const app = await buildTestApp();
+    await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
+
+    const attempt = (password: string, forwardedFor: string) =>
+      app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        remoteAddress: '127.0.0.1',
+        headers: { 'x-forwarded-for': forwardedFor },
+        payload: { email: ADMIN.email, password },
+      });
+
+    const clientA = '198.51.100.7';
+    for (let i = 0; i < 10; i++) {
+      const res = await attempt('nope', clientA);
+      expect(res.statusCode).toBe(401);
+    }
+    const blocked = await attempt(ADMIN.password, clientA);
+    expect(blocked.statusCode).toBe(429);
+
+    // A different forwarded client, arriving over the same nginx-loopback TCP connection shape, is
+    // a fresh bucket — proof the limiter is keyed on the forwarded IP, not the shared remoteAddress.
+    const clientB = '198.51.100.8';
+    const freshClientSucceeds = await attempt(ADMIN.password, clientB);
+    expect(freshClientSucceeds.statusCode).toBe(200);
+
+    await app.close();
+  });
+});

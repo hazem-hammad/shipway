@@ -9,7 +9,7 @@ import { openDb, type ShipwayDb } from '../src/db/index.js';
 import { projects, workers } from '../src/db/schema.js';
 import { loadConfig, type Config } from '../src/config.js';
 import { DevSysOps } from '../src/sysops/dev.js';
-import { nodeBinDir } from '../src/services/provisioner.js';
+import { nodeBinDir, phpBinDir } from '../src/services/provisioner.js';
 import { applyWorker, removeWorker, workerInstances } from '../src/services/workers.js';
 
 // ---------------------------------------------------------------------------
@@ -125,7 +125,11 @@ describe('applyWorker', () => {
     const unitDest = '/etc/systemd/system/shipway-worker-shop-mailer@.service';
     const content = readInstalledUnit(cfg, unitDest);
     expect(content).toContain('php artisan queue:work');
-    expect(content).toContain('PATH=/usr/bin:$PATH');
+    // B5: worker commands get the version-pinned php shim dir on PATH, not the bare /usr/bin —
+    // otherwise a bare `php` in the command resolves to whatever ondrej/php's PPA currently makes
+    // the default, not the project's pinned phpVersion.
+    expect(content).toContain(`PATH=${phpBinDir('8.3')}:$PATH`);
+    expect(content).not.toContain('PATH=/usr/bin:$PATH');
 
     expect(callNames(sysops)).toEqual([
       `installFile ${unitDest}`,
@@ -148,6 +152,19 @@ describe('applyWorker', () => {
 
     const content = readInstalledUnit(cfg, '/etc/systemd/system/shipway-worker-api-consumer@.service');
     expect(content).toContain(`PATH=${nodeBinDir(cfg, '22')}:$PATH`);
+  });
+
+  it('falls back to /usr/bin for static projects (no version-pinned binary to shim)', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const project = insertProject(db, { slug: 'docs', type: 'static' });
+    const worker = makeWorkerRow({ projectId: project.id, name: 'sync', command: 'sync-search-index', processes: 1 });
+
+    await applyWorker({ sysops, cfg }, project, worker);
+
+    const content = readInstalledUnit(cfg, '/etc/systemd/system/shipway-worker-docs-sync@.service');
+    expect(content).toContain('PATH=/usr/bin:$PATH');
   });
 
   it('scaling down (previousProcesses > processes) stops+disables the now-removed instances', async () => {

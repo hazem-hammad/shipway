@@ -87,6 +87,23 @@ export function nodeBinDir(cfg: Config, nodeVersion: string): string {
 }
 
 /**
+ * The directory a php project's install/build/pre-post-deploy scripts and worker commands should
+ * have on `PATH` to find a `php` binary pinned to the project's version. `setup/install.sh` creates
+ * `/opt/php/<version>/bin/php` as a symlink to `/usr/bin/php<version>` for every PHP version it
+ * installs, so a project's `composer install`/`artisan`/etc. that just invokes bare `php` — same as
+ * the spec's Laravel-style commands — resolves to the right version instead of whatever `php`
+ * ondrej's PPA currently makes the default.
+ *
+ * Unlike {@link nodeBinDir}, this does NOT branch on `cfg.devMode`: in dev there's no
+ * `/opt/php/<version>` install tree, but that's fine — prepending a directory that doesn't exist to
+ * `PATH` is a no-op, so lookups simply fall through to whatever `php` is already on the developer's
+ * machine, matching dev's existing "use what's installed" expectations.
+ */
+export function phpBinDir(phpVersion: string): string {
+  return `/opt/php/${phpVersion}/bin`;
+}
+
+/**
  * Reads `base_domain`/`server_ip` from settings, throwing a `ProvisionError` (step `'settings'`) if
  * either is unset — provisioning can't proceed without them.
  */

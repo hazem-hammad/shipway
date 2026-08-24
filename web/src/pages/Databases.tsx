@@ -502,7 +502,15 @@ function ServicesInfoPanels() {
   return (
     <div className="mt-8 grid gap-4 sm:grid-cols-2">
       {redis && <RedisPanel host={redis.host} port={redis.port} password={redis.password} />}
-      {mailpit && <MailpitPanel smtpHost={mailpit.smtpHost} smtpPort={mailpit.smtpPort} webUrl={mailpit.webUrl} />}
+      {mailpit && (
+        <MailpitPanel
+          smtpHost={mailpit.smtpHost}
+          smtpPort={mailpit.smtpPort}
+          webUrl={mailpit.webUrl}
+          username={mailpit.username}
+          webPassword={mailpit.webPassword}
+        />
+      )}
     </div>
   );
 }
@@ -541,7 +549,20 @@ function RedisPanel({ host, port, password }: { host: string; port: number; pass
   );
 }
 
-function MailpitPanel({ smtpHost, smtpPort, webUrl }: { smtpHost: string; smtpPort: number; webUrl: string }) {
+function MailpitPanel({
+  smtpHost,
+  smtpPort,
+  webUrl,
+  username,
+  webPassword,
+}: {
+  smtpHost: string;
+  smtpPort: number;
+  webUrl: string;
+  username?: string;
+  webPassword?: string;
+}) {
+  const [revealed, setRevealed] = useState(false);
   return (
     <Panel>
       <h2 className="mb-3 text-sm font-semibold text-ink">Mailpit</h2>
@@ -554,6 +575,27 @@ function MailpitPanel({ smtpHost, smtpPort, webUrl }: { smtpHost: string; smtpPo
           <dt className="text-ink-soft">SMTP port</dt>
           <dd className="font-mono text-ink">{smtpPort}</dd>
         </div>
+        {username && (
+          <div className="flex items-center justify-between">
+            <dt className="text-ink-soft">Web UI username</dt>
+            <dd className="font-mono text-ink">{username}</dd>
+          </div>
+        )}
+        {webPassword && (
+          <div className="flex items-center justify-between">
+            <dt className="text-ink-soft">Web UI password</dt>
+            <dd className="flex items-center gap-2">
+              <span className="font-mono text-ink">{revealed ? webPassword : '•'.repeat(8)}</span>
+              <button
+                type="button"
+                onClick={() => setRevealed((v) => !v)}
+                className="rounded text-xs font-medium text-accent underline decoration-line underline-offset-2 hover:text-accent/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+              >
+                {revealed ? 'Hide' : 'Reveal'}
+              </button>
+            </dd>
+          </div>
+        )}
       </dl>
       <a
         href={webUrl}

@@ -15,6 +15,7 @@ import {
   ProvisionError,
   deprovisionProject,
   nodeBinDir,
+  phpBinDir,
   provisionProject,
   refreshProjectConfig,
   type ProvisionDeps,
@@ -147,6 +148,17 @@ describe('nodeBinDir', () => {
   it('returns the dirname of process.execPath in dev mode', () => {
     const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: tmpDataDir() });
     expect(nodeBinDir(cfg, '22')).toBe(path.dirname(process.execPath));
+  });
+});
+
+describe('phpBinDir', () => {
+  it('returns /opt/php/<version>/bin', () => {
+    expect(phpBinDir('8.3')).toBe('/opt/php/8.3/bin');
+    expect(phpBinDir('8.1')).toBe('/opt/php/8.1/bin');
+  });
+
+  it('does not branch on devMode — unlike nodeBinDir, the same path is returned either way (the shim dir simply does not exist in dev, so PATH lookup falls through to the system php)', () => {
+    expect(phpBinDir('8.3')).toBe('/opt/php/8.3/bin');
   });
 });
 

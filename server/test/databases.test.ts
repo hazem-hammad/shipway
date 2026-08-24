@@ -414,6 +414,28 @@ describe('GET /api/services/info', () => {
     await app.close();
   });
 
+  it('passes through mailpit web UI username/webPassword when present (B6)', async () => {
+    const { app, cookie } = await buildDatabasesTestApp();
+    setSetting(app.db, 'mailpit_info', {
+      smtpHost: '127.0.0.1',
+      smtpPort: 1025,
+      webUrl: 'https://mail.intcore.dev',
+      username: 'intcore',
+      webPassword: 'a-random-web-password',
+    });
+
+    const res = await app.inject({ method: 'GET', url: '/api/services/info', headers: { cookie } });
+    expect(res.json().mailpit).toEqual({
+      smtpHost: '127.0.0.1',
+      smtpPort: 1025,
+      webUrl: 'https://mail.intcore.dev',
+      username: 'intcore',
+      webPassword: 'a-random-web-password',
+    });
+
+    await app.close();
+  });
+
   it('unauthenticated requests are 401', async () => {
     const { app } = await buildDatabasesTestApp();
 

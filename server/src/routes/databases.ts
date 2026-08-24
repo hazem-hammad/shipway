@@ -243,6 +243,10 @@ interface MailpitInfo {
   smtpHost: string;
   smtpPort: number;
   webUrl: string;
+  /** Basic-auth credentials for the mailpit web UI vhost, when install.sh provisioned them (see
+   * `lib/bootstrap.ts`'s `MailpitInfo`) — surfaced so the dashboard's Mailpit info card can show them. */
+  username?: string;
+  webPassword?: string;
 }
 
 /** Registers `GET /api/services/info` — connection info for the shared redis/mailpit instances. */

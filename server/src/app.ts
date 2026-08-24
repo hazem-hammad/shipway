@@ -143,6 +143,12 @@ export async function buildApp(
 ): Promise<FastifyInstance> {
   const app = Fastify({
     logger: cfg.devMode,
+    // The server process only ever binds 127.0.0.1 (see docs/server-setup.md) — nginx is the sole
+    // caller, and its dashboard/mailpit vhost templates always set X-Forwarded-For (see
+    // setup/templates/nginx-dashboard.conf). Without this, every request's `request.ip` is nginx's
+    // own loopback address in production, so per-IP logic (the login rate limiter in
+    // routes/auth.ts) collapses onto one shared bucket for every real client.
+    trustProxy: true,
   });
 
   app.decorate('cfg', cfg);

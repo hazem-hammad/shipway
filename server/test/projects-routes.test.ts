@@ -7,6 +7,7 @@ import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { deployments, projects } from '../src/db/schema.js';
+import { RESERVED_SLUGS } from '../src/routes/projects.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { FakeDnsClient } from '../src/services/cloudflare.js';
 
@@ -61,10 +62,12 @@ async function buildProjectsTestApp(
   return { app, cookie, sysops, dns, dataDir };
 }
 
+// 'api' itself is a reserved slug (RESERVED_SLUGS, B3) — this fixture uses 'app' instead so the
+// existing node-project tests aren't incidentally exercising the reserved-slug rejection.
 const NODE_PAYLOAD = {
-  name: 'API',
-  slug: 'api',
-  repo: 'acme/api',
+  name: 'App',
+  slug: 'app',
+  repo: 'acme/app',
   branch: 'main',
   type: 'node',
 };
@@ -95,9 +98,9 @@ describe('POST /api/projects', () => {
     expect(res.statusCode).toBe(201);
     const body = res.json();
     expect(body).toMatchObject({
-      name: 'API',
-      slug: 'api',
-      repo: 'acme/api',
+      name: 'App',
+      slug: 'app',
+      repo: 'acme/app',
       branch: 'main',
       type: 'node',
       nodeVersion: '22',
@@ -115,10 +118,10 @@ describe('POST /api/projects', () => {
     expect(body.smtpConfigEncrypted).toBeUndefined();
 
     // DNS + nginx + systemd side effects actually ran.
-    expect(dns.records.get('api.apps.example.com')).toBe('203.0.113.10');
-    expect(sysops.calls.some((c) => c.startsWith('installFile /etc/nginx/sites-available/shipway-api.conf'))).toBe(true);
-    expect(sysops.calls.some((c) => c.startsWith('installFile /etc/systemd/system/shipway-app-api.service'))).toBe(true);
-    expect(sysops.calls).toContain('unitAction enable shipway-app-api.service');
+    expect(dns.records.get('app.apps.example.com')).toBe('203.0.113.10');
+    expect(sysops.calls.some((c) => c.startsWith('installFile /etc/nginx/sites-available/shipway-app.conf'))).toBe(true);
+    expect(sysops.calls.some((c) => c.startsWith('installFile /etc/systemd/system/shipway-app-app.service'))).toBe(true);
+    expect(sysops.calls).toContain('unitAction enable shipway-app-app.service');
 
     await app.close();
   });
@@ -167,7 +170,7 @@ describe('POST /api/projects', () => {
       method: 'POST',
       url: '/api/projects',
       headers: { cookie },
-      payload: { ...NODE_PAYLOAD, slug: 'api2', name: 'API 2' },
+      payload: { ...NODE_PAYLOAD, slug: 'app2', name: 'App 2' },
     });
 
     expect(first.json().port).toBe(3001);
@@ -202,6 +205,43 @@ describe('POST /api/projects', () => {
     });
 
     expect(res.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it.each(['../etc', 'a b', '/etc', 'public/../../etc', 'public;rm -rf /'])(
+    'rejects an unsafe publicDir with 400 (%s) — config injection / path traversal (B1)',
+    async (publicDir) => {
+      const { app, cookie } = await buildProjectsTestApp();
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/projects',
+        headers: { cookie },
+        payload: { ...NODE_PAYLOAD, publicDir },
+      });
+
+      expect(res.statusCode).toBe(400);
+
+      await app.close();
+    },
+  );
+
+  it.each(RESERVED_SLUGS)('rejects the reserved slug "%s" with 409 (B3)', async (slug) => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: { ...NODE_PAYLOAD, slug },
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('this name is reserved');
+
+    const list = await app.inject({ method: 'GET', url: '/api/projects', headers: { cookie } });
+    expect(list.json()).toEqual([]);
 
     await app.close();
   });
@@ -256,10 +296,10 @@ describe('POST /api/projects', () => {
 
     // The DNS record and vhost were created before the app-unit step failed — both must be torn
     // down, not just the DB row deleted out from under live/orphaned host state.
-    expect(dns.records.has('api.apps.example.com')).toBe(false);
-    expect(fs.existsSync(path.join(dataDir, 'system/etc/nginx/sites-available/shipway-api.conf'))).toBe(false);
-    expect(fs.existsSync(path.join(dataDir, 'system/etc/nginx/sites-enabled/shipway-api.conf'))).toBe(false);
-    expect(sysops.calls.some((c) => c.startsWith('removeFile /etc/nginx/sites-available/shipway-api.conf'))).toBe(true);
+    expect(dns.records.has('app.apps.example.com')).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'system/etc/nginx/sites-available/shipway-app.conf'))).toBe(false);
+    expect(fs.existsSync(path.join(dataDir, 'system/etc/nginx/sites-enabled/shipway-app.conf'))).toBe(false);
+    expect(sysops.calls.some((c) => c.startsWith('removeFile /etc/nginx/sites-available/shipway-app.conf'))).toBe(true);
 
     const list = await app.inject({ method: 'GET', url: '/api/projects', headers: { cookie } });
     expect(list.json()).toEqual([]);
@@ -391,6 +431,29 @@ describe('PATCH /api/projects/:id', () => {
 
     await app.close();
   });
+
+  it.each(['../etc', 'a b', '/etc', 'public/../../etc'])(
+    'rejects an unsafe publicDir with 400 (%s) — config injection / path traversal (B1)',
+    async (publicDir) => {
+      const { app, cookie } = await buildProjectsTestApp();
+      const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+      const id = create.json().id as number;
+
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${id}`,
+        headers: { cookie },
+        payload: { publicDir },
+      });
+
+      expect(res.statusCode).toBe(400);
+
+      const check = await app.inject({ method: 'GET', url: `/api/projects/${id}`, headers: { cookie } });
+      expect(check.json().publicDir).toBe('public');
+
+      await app.close();
+    },
+  );
 
   it('re-renders and reinstalls the vhost when phpVersion changes', async () => {
     const { app, cookie, sysops } = await buildProjectsTestApp();

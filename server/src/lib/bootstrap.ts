@@ -33,6 +33,11 @@ interface MailpitInfo {
   smtpHost: string;
   smtpPort: number;
   webUrl: string;
+  /** Basic-auth credentials for the mailpit web UI vhost (`setup/install.sh`'s
+   * `configure_mailpit_auth`/`auth_basic`) — optional so a bootstrap file written by an older
+   * install.sh (or hand-edited) without them still imports cleanly. */
+  username?: string;
+  webPassword?: string;
 }
 
 /**

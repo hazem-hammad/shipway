@@ -6,7 +6,7 @@
  */
 import type { Config } from '../config.js';
 import type { projects, workers } from '../db/schema.js';
-import { nodeBinDir } from './provisioner.js';
+import { nodeBinDir, phpBinDir } from './provisioner.js';
 import type { SysOps } from '../sysops/types.js';
 import { renderWorkerUnit, unitNames } from '../system/templates.js';
 
@@ -22,10 +22,14 @@ function isNodeLike(type: ProjectRow['type']): type is 'node' | 'nextjs' {
   return type === 'node' || type === 'nextjs';
 }
 
-/** `nodeBinDir` for node/nextjs projects; `/usr/bin` for php/static (php finds `php<ver>` there already). */
+/** `nodeBinDir` for node/nextjs projects, `phpBinDir` (the version-pinned `php` shim) for php
+ * projects with a `phpVersion` set, else `/usr/bin` (static projects have no worker binary to pin). */
 function pathPrefixFor(cfg: Config, project: ProjectRow): string {
   if (isNodeLike(project.type)) {
     return nodeBinDir(cfg, project.nodeVersion ?? '22');
+  }
+  if (project.type === 'php' && project.phpVersion) {
+    return phpBinDir(project.phpVersion);
   }
   return '/usr/bin';
 }

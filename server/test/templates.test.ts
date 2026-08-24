@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   SLUG_RE,
   assertSlug,
+  assertPublicDir,
+  isValidPublicDir,
   unitNames,
   renderNginxVhost,
   renderAppUnit,
@@ -59,6 +61,32 @@ describe('unitNames', () => {
   });
 });
 
+describe('isValidPublicDir / assertPublicDir', () => {
+  it.each(['', 'public', 'dist', 'a/b/c', 'a-b_c.d', 'a'.repeat(60)])('accepts %s', (value) => {
+    expect(isValidPublicDir(value)).toBe(true);
+    expect(() => assertPublicDir(value)).not.toThrow();
+  });
+
+  it.each([
+    '../etc',
+    'public/../../etc',
+    '..',
+    '/etc',
+    '/etc/passwd',
+    'a b',
+    'public;\n    location /x { alias /var/lib/shipway/; }',
+    'public;rm -rf /',
+    '.hidden',
+  ])('rejects %s', (value) => {
+    expect(isValidPublicDir(value)).toBe(false);
+    expect(() => assertPublicDir(value)).toThrow();
+  });
+
+  it('throws an Error with the offending value quoted', () => {
+    expect(() => assertPublicDir('../x')).toThrow('"../x"');
+  });
+});
+
 describe('renderNginxVhost — shared across all vhost types', () => {
   const base: VhostInput = {
     slug: 'blog',
@@ -108,6 +136,13 @@ describe('renderNginxVhost — shared across all vhost types', () => {
   it('validates certName', () => {
     expect(() => renderNginxVhost({ ...base, certName: 'not a cert!' })).toThrow();
   });
+
+  it.each(['../etc', '/etc', 'public/../../etc', 'a b', 'public;rm -rf /'])(
+    'validates publicDir — rejects %s (config injection / path traversal)',
+    (publicDir) => {
+      expect(() => renderNginxVhost({ ...base, publicDir })).toThrow();
+    },
+  );
 });
 
 describe('renderNginxVhost — php', () => {
@@ -155,6 +190,13 @@ describe('renderNginxVhost — php', () => {
     expect(() => renderNginxVhost({ ...input, phpVersion: undefined })).toThrow();
     expect(() => renderNginxVhost({ ...input, phpVersion: '' })).toThrow();
     expect(() => renderNginxVhost({ ...input, phpVersion: '8.3; rm -rf /' })).toThrow();
+  });
+
+  it('denies dotfile requests (.env, .git, etc.) except /.well-known/, before the other locations', () => {
+    const out = renderNginxVhost(input);
+    expect(out).toContain('location ~ /\\.(?!well-known) {');
+    expect(out).toContain('deny all;');
+    expect(out.indexOf('location ~ /\\.(?!well-known)')).toBeLessThan(out.indexOf('location ~ \\.php$'));
   });
 });
 
@@ -211,6 +253,13 @@ describe('renderNginxVhost — static', () => {
 
   it('falls back to /index.html for client-side routing', () => {
     expect(renderNginxVhost(input)).toContain('try_files $uri $uri/ /index.html;');
+  });
+
+  it('denies dotfile requests (.env, .git, etc.) except /.well-known/, before the other locations', () => {
+    const out = renderNginxVhost(input);
+    expect(out).toContain('location ~ /\\.(?!well-known) {');
+    expect(out).toContain('deny all;');
+    expect(out.indexOf('location ~ /\\.(?!well-known)')).toBeLessThan(out.indexOf('location / {'));
   });
 });
 

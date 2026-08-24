@@ -497,6 +497,9 @@ export interface MailpitInfo {
   smtpHost: string;
   smtpPort: number;
   webUrl: string;
+  /** Basic-auth credentials for the mailpit web UI, when the server was provisioned with them. */
+  username?: string;
+  webPassword?: string;
 }
 
 export interface ServicesInfo {

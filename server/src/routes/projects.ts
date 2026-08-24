@@ -5,7 +5,7 @@ import { deployments, projects } from '../db/schema.js';
 import { buildEnvFile, buildManagedVars, type SmtpConfig } from '../deploy/envfile.js';
 import { ProvisionError, deprovisionProject, provisionProject, refreshProjectConfig, type ProvisionDeps } from '../services/provisioner.js';
 import { allocatePort } from '../system/ports.js';
-import { SLUG_RE } from '../system/templates.js';
+import { SLUG_RE, isValidPublicDir } from '../system/templates.js';
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectType = ProjectRow['type'];
@@ -18,6 +18,21 @@ const PHP_VERSION_ENUM = z.enum(['8.1', '8.2', '8.3', '8.4']);
 /** Node versions the host has installed (via nvm/system) for `node`/`nextjs` projects. */
 const NODE_VERSION_ENUM = z.enum(['18', '20', '22']);
 
+/**
+ * Slugs Shipway's own vhosts/DNS records occupy (`setup/install.sh`'s `shipway-dashboard`/
+ * `shipway-mailpit` vhosts, and the `deploy.`/`mail.` DNS `A` records it creates) — all of which
+ * pass `SLUG_RE` and would otherwise let a project silently clobber (or, on delete, tear down) part
+ * of the tool itself. `www` and `api` are reserved too since they're the most likely accidental
+ * collisions with a future Shipway-owned subdomain.
+ */
+export const RESERVED_SLUGS = ['dashboard', 'mailpit', 'deploy', 'mail', 'www', 'api'] as const;
+
+/** `publicDir` is a release-relative sub-path interpolated into the nginx vhost's `root` directive
+ * (see `system/templates.ts`'s `renderNginxVhost`) — validated here so a value that could escape the
+ * release directory (`..` segments, a leading `/`, etc.) is rejected with a 400 before it ever
+ * reaches provisioning; `renderNginxVhost` asserts the same rule again itself, as defense in depth. */
+const publicDirSchema = z.string().refine(isValidPublicDir, { message: 'invalid publicDir' });
+
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
 
 const createProjectSchema = z.object({
@@ -28,7 +43,7 @@ const createProjectSchema = z.object({
   type: z.enum(['php', 'node', 'nextjs', 'static']),
   phpVersion: PHP_VERSION_ENUM.optional(),
   nodeVersion: NODE_VERSION_ENUM.optional(),
-  publicDir: z.string().optional(),
+  publicDir: publicDirSchema.optional(),
   installCmd: z.string().optional(),
   buildCmd: z.string().optional(),
   startCmd: z.string().optional(),
@@ -47,7 +62,7 @@ const patchProjectSchema = z
     branch: z.string().min(1),
     phpVersion: PHP_VERSION_ENUM,
     nodeVersion: NODE_VERSION_ENUM,
-    publicDir: z.string(),
+    publicDir: publicDirSchema,
     installCmd: z.string(),
     buildCmd: z.string(),
     startCmd: z.string(),
@@ -171,6 +186,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(400).send({ error: 'invalid request body' });
     }
     const body = parsed.data;
+
+    if ((RESERVED_SLUGS as readonly string[]).includes(body.slug)) {
+      return reply.code(409).send({ error: 'this name is reserved' });
+    }
 
     const existing = app.db.select({ id: projects.id }).from(projects).where(eq(projects.slug, body.slug)).get();
     if (existing) {

@@ -87,7 +87,7 @@ async function buildDeploymentsTestApp(): Promise<TestApp> {
   return { app, cookie, fakeRun, dataDir };
 }
 
-async function createProject(app: FastifyInstance, cookie: string, slug = 'api'): Promise<number> {
+async function createProject(app: FastifyInstance, cookie: string, slug = 'app'): Promise<number> {
   const res = await app.inject({
     method: 'POST',
     url: '/api/projects',
@@ -161,7 +161,7 @@ describe('POST /api/projects/:id/rollback', () => {
 
   it('rejects a releasePath that does not belong to a deployment of this project (400)', async () => {
     const { app, cookie } = await buildDeploymentsTestApp();
-    const projectId = await createProject(app, cookie, 'api');
+    const projectId = await createProject(app, cookie, 'app');
 
     const res = await app.inject({
       method: 'POST',
@@ -197,7 +197,7 @@ describe('POST /api/projects/:id/rollback', () => {
 
   it('enqueues a rollback for a releasePath owned by this project (202)', async () => {
     const { app, cookie, fakeRun } = await buildDeploymentsTestApp();
-    const projectId = await createProject(app, cookie, 'api');
+    const projectId = await createProject(app, cookie, 'app');
     const releasePath = '/deploy/apps/api/releases/20260101_000000';
 
     app.db

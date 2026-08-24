@@ -24,7 +24,7 @@ import { deployments, projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import type { SecretBox } from '../lib/secretbox.js';
 import type { GitOps } from '../services/git.js';
-import { nodeBinDir } from '../services/provisioner.js';
+import { nodeBinDir, phpBinDir } from '../services/provisioner.js';
 import { workerInstances } from '../services/workers.js';
 import type { SysOps } from '../sysops/types.js';
 import { unitNames } from '../system/templates.js';
@@ -208,10 +208,10 @@ function parseEnvContent(content: string): Record<string, string> {
 }
 
 /**
- * Builds the environment for `runShell`: `process.env`, with `PATH` prefixed by the project's
- * node bin dir for node-like projects (php's version-pinned binary is just `php<ver>` on `PATH`,
- * nothing to prefix), then every `KEY=value` pair parsed from the release's final `.env` content,
- * then (node-like only) `PORT` set from the project's assigned port.
+ * Builds the environment for `runShell`: `process.env`, with `PATH` prefixed by the project's node
+ * bin dir for node-like projects or its php version's shim dir for php projects (see
+ * `services/provisioner.ts`'s `nodeBinDir`/`phpBinDir`), then every `KEY=value` pair parsed from the
+ * release's final `.env` content, then (node-like only) `PORT` set from the project's assigned port.
  */
 function buildShellEnv(cfg: Config, project: ProjectRow, envFileContent: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -223,6 +223,9 @@ function buildShellEnv(cfg: Config, project: ProjectRow, envFileContent: string)
 
   if (isNodeLike(project.type)) {
     const prefix = nodeBinDir(cfg, project.nodeVersion ?? '22');
+    env.PATH = env.PATH ? `${prefix}:${env.PATH}` : prefix;
+  } else if (project.type === 'php' && project.phpVersion) {
+    const prefix = phpBinDir(project.phpVersion);
     env.PATH = env.PATH ? `${prefix}:${env.PATH}` : prefix;
   }
 
