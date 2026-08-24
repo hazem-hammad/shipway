@@ -183,6 +183,9 @@ export interface Project {
   name: string;
   slug: string;
   repo: string;
+  /** Task 8's Git-URL project source: any http(s) git URL, set instead of `repo` (which is `''`
+   * for a repoUrl project — the column itself is NOT NULL). Null for GitHub-App-sourced projects. */
+  repoUrl: string | null;
   branch: string;
   type: ProjectType;
   phpVersion: string | null;
@@ -212,10 +215,12 @@ export interface ProjectListItem extends Project {
   lastDeployment: LastDeployment | null;
 }
 
+/** Exactly one of `repo` / `repoUrl` must be set — enforced server-side (400 otherwise). */
 export interface CreateProjectBody {
   name: string;
   slug: string;
-  repo: string;
+  repo?: string;
+  repoUrl?: string;
   branch: string;
   type: ProjectType;
   phpVersion?: string;
