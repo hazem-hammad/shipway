@@ -32,6 +32,15 @@
  * (below) closes this by performing the exact same reparse verification on every write that `isSafeRow`
  * already performed on read, so the write path can no longer produce a value that doesn't round-trip.
  *
+ * Fix wave M13 (same review): extending `parseDoubleQuoted` to recognize `\r`/`\n` let
+ * `formatValueDetailed` PROVE a CR/LF-bearing value round-trips, which promoted lines like a
+ * multi-line PEM key into editable Table rows — but the Table UI is a single-line `<input>` that
+ * silently swallows control characters, so an edit to that specific row could destroy the newline.
+ * `isSafeRow` (below) now refuses to classify any value containing `\r`/`\n` as a row at all; such a
+ * line stays a preserved extra, matching an unrecognized backslash escape's treatment. The write path
+ * (`formatValueDetailed`/`escapeForDoubleQuote`) is unchanged and still emits CR/LF correctly for a
+ * value that arrives some other way (Raw mode, the API) — see `isSafeRow`'s doc comment for detail.
+ *
  * Accepted normalizations (the ONLY byte-level differences `parseEnv`+`serializeEnv` are allowed to
  * introduce for a line that becomes a row, with zero user edits to that row):
  *   - Decorative quotes are dropped: `KEY="plain"` or `KEY='plain'` -> `KEY=plain`. This is safe
@@ -315,8 +324,24 @@ function formatRow(row: EnvRow): string {
  * they were safe (`MY_SECRET="'secret'"`, `KEY="''"`, `TOKEN="'hello"`, `KEY="'a'b'c'"` — see
  * `envparse.test.ts`'s "Round 2" fixtures) now correctly become editable rows: `formatValueDetailed`
  * proves the escalated double-quoted form byte-matches the source exactly, satisfying case 1.
+ *
+ * Fix wave M13 (`.superpowers/sdd/2026-08-25-shipway-v3/final-review.md`): extending `parseDoubleQuoted`
+ * to recognize `\r`/`\n` made `formatValueDetailed` able to PROVE a value containing a literal CR/LF is a
+ * genuine fixed point (case 1 above) — which is correct for round-tripping bytes, but promoted such a
+ * value into an editable ROW. The Table-mode UI is a single-line `<input>`, which cannot display a
+ * control character and silently drops it: a multi-line PEM key or a `\n`-bearing value renders as
+ * mangled single-line text, and typing even one more character into that field rewrites the whole line
+ * WITHOUT the newline — silently destroying it on save. Before this fix such a line was an unrecognized
+ * escape and stayed an opaque, uneditable extra, so this is a data-safety regression specific to the
+ * table, not the parser: the value decodes correctly and the FILE round-trips safely as long as the row
+ * is never edited. Rather than weaken `escapeForDoubleQuote`/`parseDoubleQuoted` (the write path must
+ * still be able to emit CR/LF correctly for values that arrive some other way, e.g. Raw mode or the API),
+ * `isSafeRow` now refuses to classify any CR/LF-bearing value as a row at all — the line is kept as a
+ * verbatim extra instead, restoring the invariant that anything the table CAN edit, the table can
+ * faithfully display.
  */
 function isSafeRow(originalRest: string, key: string, value: string): boolean {
+  if (/[\r\n]/.test(value)) return false;
   const formatted = formatValueDetailed(key, value);
   if (formatted.text === originalRest) return true;
   return !formatted.quoted;

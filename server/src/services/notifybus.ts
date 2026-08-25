@@ -124,6 +124,15 @@ async function dispatchEmailChannel(
  * other subscribed channel still gets its delivery attempt. `secretBox`/`mailTransportFactory` are
  * only needed for `'email'`-typed channels — `secretBox` is what production wiring (`app.ts`)
  * always passes; `mailTransportFactory` is test-only (mirrors `services/mailer.ts`'s `sendMail`).
+ *
+ * Fix wave M14 (`.superpowers/sdd/2026-08-25-shipway-v3/final-review.md`): dispatch to every
+ * subscribed channel CONCURRENTLY (`Promise.allSettled`) rather than one at a time in a sequential
+ * `for...of` loop. Fix wave I2 bounded each channel's own delivery with a timeout, but a sequential
+ * loop still let N stalled channels cost N x that timeout — the reviewer measured a webhook queued
+ * behind one hanging email channel firing 11.78s late even after I2's per-channel cap. Each channel's
+ * error handling/isolation is unchanged (still caught and logged per-channel, inside the same
+ * try/catch this loop always used); only the ordering changes, from "wait for channel 1 to finish
+ * before even starting channel 2" to "start every channel's delivery at once."
  */
 export async function emitEvent(
   db: ShipwayDb,
@@ -147,24 +156,26 @@ export async function emitEvent(
 
   const text = `${payload.title}: ${payload.message}`;
 
-  for (const channel of channels) {
-    try {
-      if (channel.type === 'email') {
-        await dispatchEmailChannel(db, secretBox, channel, payload, mailTransportFactory, mailSendTimeoutMs);
-        continue;
-      }
+  await Promise.allSettled(
+    channels.map(async (channel) => {
+      try {
+        if (channel.type === 'email') {
+          await dispatchEmailChannel(db, secretBox, channel, payload, mailTransportFactory, mailSendTimeoutMs);
+          return;
+        }
 
-      if (!channel.url) {
-        console.error(`shipway: notification channel ${String(channel.id)} (type "${channel.type}") has no url configured — skipping delivery`);
-        continue;
-      }
+        if (!channel.url) {
+          console.error(`shipway: notification channel ${String(channel.id)} (type "${channel.type}") has no url configured — skipping delivery`);
+          return;
+        }
 
-      await sendWebhookText(fetchImpl, channel.url, text, {
-        context: { title: payload.title, severity: EVENT_SEVERITY[event] },
-        forceTeams: channel.type === 'teams',
-      });
-    } catch (err) {
-      console.error(`shipway: notification channel ${String(channel.id)} delivery failed for event "${event}"`, err);
-    }
-  }
+        await sendWebhookText(fetchImpl, channel.url, text, {
+          context: { title: payload.title, severity: EVENT_SEVERITY[event] },
+          forceTeams: channel.type === 'teams',
+        });
+      } catch (err) {
+        console.error(`shipway: notification channel ${String(channel.id)} delivery failed for event "${event}"`, err);
+      }
+    }),
+  );
 }

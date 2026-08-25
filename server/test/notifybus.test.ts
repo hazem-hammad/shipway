@@ -374,4 +374,53 @@ describe('emitEvent — mixed channel types isolate each other’s failures', ()
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toContain('healthy');
   });
+
+  it('the fan-out is concurrent, not just bounded (fix wave M14): a hanging channel does not delay a healthy channel behind it', async () => {
+    // Distinguishes concurrent dispatch from the merely-bounded-per-channel fix of I2. With a
+    // SEQUENTIAL loop, the webhook (subscribed second) cannot even start its delivery attempt until
+    // the email channel's full timeout has elapsed — so its fetch call would land at ~EMAIL_TIMEOUT_MS,
+    // not near time zero. A short per-channel cap alone (as the earlier I2 test used) can't tell the
+    // two implementations apart, since a short-enough cap keeps a sequential run fast too; this test
+    // uses a comparatively generous cap and asserts the webhook's OWN elapsed time, not just the
+    // overall emitEvent() elapsed time, to make the ordering claim unambiguous.
+    const { db, secretBox } = tmpFixtures();
+    saveMailConfig(db, secretBox, { driver: 'mailpit', host: '127.0.0.1', port: 1025, secure: false, fromAddress: 'shipway@localhost' });
+
+    // Email channel subscribed FIRST: a sequential loop would process it, and only it, before ever
+    // reaching the webhook channel.
+    const emailId = insertEmailChannel(db, 'hanging-email', 'ops@example.com');
+    const webhookId = insertChannel(db, 'healthy-webhook', 'https://hooks.slack.com/services/healthy', 'webhook');
+    subscribe(db, 'deploy_failed', emailId);
+    subscribe(db, 'deploy_failed', webhookId);
+
+    const hangingTransport: MailTransport = { sendMail: () => new Promise(() => {}) }; // never settles
+    const EMAIL_TIMEOUT_MS = 250; // injected short cap (7th arg) — still large relative to a fake fetch call
+
+    // A mutable holder object (rather than a plain reassigned `let`) so the "when was the webhook's
+    // fetch actually invoked" timestamp survives being written from inside the nested `timingFetch`
+    // closure without TypeScript's control-flow narrowing treating later reads in this outer scope as
+    // still `null`.
+    const timing: { webhookCalledAtMs: number | null } = { webhookCalledAtMs: null };
+    const { fetchImpl: rawFetchImpl } = fakeFetch();
+    const start = Date.now();
+    const timingFetch = (async (...args: Parameters<typeof fetch>) => {
+      timing.webhookCalledAtMs = Date.now() - start;
+      return rawFetchImpl(...args);
+    }) as typeof fetch;
+
+    await expect(
+      emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: 'oops' }, timingFetch, secretBox, () => hangingTransport, EMAIL_TIMEOUT_MS),
+    ).resolves.toBeUndefined();
+    const totalElapsedMs = Date.now() - start;
+
+    expect(timing.webhookCalledAtMs).not.toBeNull();
+    // Concurrent fan-out starts every channel's delivery at the same time, so the webhook's fetch
+    // fires almost immediately — well under half the email channel's timeout — rather than waiting
+    // for the email channel to finish first.
+    expect(timing.webhookCalledAtMs as number).toBeLessThan(EMAIL_TIMEOUT_MS / 2);
+    // The overall call still waits for the slower (email) channel to settle before emitEvent()
+    // itself resolves — concurrency changes ordering/latency of individual channels, not whether
+    // emitEvent waits for all of them.
+    expect(totalElapsedMs).toBeGreaterThanOrEqual(EMAIL_TIMEOUT_MS);
+  });
 });

@@ -492,6 +492,95 @@ describe('write-path round-trip (fix wave I1: BLOCKER — formatValue never veri
   });
 });
 
+describe('CR/LF-bearing values are kept as extras, never editable rows (fix wave M13)', () => {
+  // The bug: extending parseDoubleQuoted to recognize \r/\n as escapes let formatValueDetailed PROVE
+  // such a value is a fixed point under reparse, which promoted it into an editable Table row — but the
+  // Table UI is a single-line <input> that silently swallows control characters. WINPATH="C:\next"
+  // decodes to `C:` + LF + `ext`, displays as "C:ext", and appending one character used to rewrite the
+  // line as `WINPATH=C:extX`, destroying the newline. The fix: isSafeRow now rejects any decoded value
+  // containing \r or \n, so the line stays a verbatim extra (uneditable, but never mangled) — the same
+  // treatment an unrecognized backslash escape already gets.
+  const fixtures = [
+    { name: 'a value with an embedded \\n escape (WINPATH="C:\\next")', line: 'WINPATH="C:\\next"' },
+    {
+      name: 'a multi-line PEM-style key',
+      line: 'KEY="-----BEGIN PRIVATE KEY-----\\nMIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7\\n-----END PRIVATE KEY-----"',
+    },
+    { name: 'a \\r-bearing value', line: 'FIELD="a\\rb"' },
+  ];
+
+  for (const { name, line } of fixtures) {
+    it(`${name}: classified as an extra, not a row`, () => {
+      const { rows, extras } = parseEnv(line);
+      expect(rows).toEqual([]);
+      expect(extras).toEqual([{ index: 0, line }]);
+    });
+
+    it(`${name}: survives two parse->serialize cycles byte-identically`, () => {
+      const first = parseEnv(line);
+      const serializedOnce = serializeEnv(first.rows, first.extras);
+      expect(serializedOnce).toBe(line);
+
+      const second = parseEnv(serializedOnce);
+      expect(second.rows).toEqual([]);
+      const serializedTwice = serializeEnv(second.rows, second.extras);
+      expect(serializedTwice).toBe(line);
+    });
+
+    it(`${name}: is counted in extras`, () => {
+      const { extras } = parseEnv(line);
+      expect(extras.length).toBe(1);
+    });
+  }
+
+  it('editing an unrelated row in the same file leaves the CR/LF-bearing lines byte-for-byte untouched', () => {
+    const text = [
+      'APP_NAME=demo',
+      'WINPATH="C:\\next"',
+      'PEM_KEY="-----BEGIN KEY-----\\nabc123\\n-----END KEY-----"',
+      'CRFIELD="a\\rb"',
+    ].join('\n');
+    const { rows, extras } = parseEnv(text);
+
+    // Confirm the setup: only APP_NAME became an editable row; the three CR/LF-bearing lines are extras.
+    expect(rows).toEqual([{ key: 'APP_NAME', value: 'demo', quoted: false }]);
+    expect(extras.map((e) => e.line)).toEqual([
+      'WINPATH="C:\\next"',
+      'PEM_KEY="-----BEGIN KEY-----\\nabc123\\n-----END KEY-----"',
+      'CRFIELD="a\\rb"',
+    ]);
+
+    // Edit the one row that IS editable (simulates a user changing APP_NAME then hitting Save).
+    const editedRows = rows.map((r) => (r.key === 'APP_NAME' ? { ...r, value: 'renamed' } : r));
+    const out = serializeEnv(editedRows, extras);
+
+    expect(out).toBe(
+      [
+        'APP_NAME=renamed',
+        'WINPATH="C:\\next"',
+        'PEM_KEY="-----BEGIN KEY-----\\nabc123\\n-----END KEY-----"',
+        'CRFIELD="a\\rb"',
+      ].join('\n'),
+    );
+  });
+
+  it('the write path can still emit a CR/LF-bearing value correctly for a row that arrives by other means (not weakened)', () => {
+    // A value with a real embedded newline, as if it arrived via the API or a programmatic caller
+    // rather than parseEnv (parseEnv itself will never produce such a row per the fixtures above) —
+    // serializeEnv must still be able to escape it correctly, since Raw mode and direct API writes are
+    // both still valid ways for such a value to reach disk.
+    const rows: EnvRow[] = [{ key: 'PRIVATE_KEY', value: '-----BEGIN KEY-----\nabc123\n-----END KEY-----', quoted: false }];
+    const text = serializeEnv(rows, []);
+    expect(text).toBe('PRIVATE_KEY="-----BEGIN KEY-----\\nabc123\\n-----END KEY-----"');
+
+    // And parseEnv correctly refuses to promote what it just wrote back into an editable row (it stays
+    // a safely-preserved extra, per the fixtures above) rather than mangling it on the next load.
+    const reparsed = parseEnv(text);
+    expect(reparsed.rows).toEqual([]);
+    expect(reparsed.extras).toEqual([{ index: 0, line: text }]);
+  });
+});
+
 describe('hasCRLF', () => {
   it('is true when the text contains any \\r\\n line ending', () => {
     expect(hasCRLF('APP_NAME=demo\r\nDEBUG=true\r\n')).toBe(true);
