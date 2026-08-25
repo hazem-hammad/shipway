@@ -257,16 +257,21 @@ export interface InviteEmailContent {
 const INVITE_EMAIL_SUBJECT = "You're invited to Shipway";
 
 /**
- * Builds the invite email. The link is absolute (`https://deploy.<baseDomain>/invite/<token>`)
+ * Builds the invite email. The link is absolute (`https://ship.<baseDomain>/invite/<token>`)
  * when `base_domain` is configured; when it isn't, this never fabricates a host to fill the gap —
  * it falls back to the bare `/invite/<token>` path plus a note that the reader needs to open it on
  * their Shipway instance directly. Pure and synchronous: building the email content never touches
  * the network, so any failure downstream in `routes/users.ts` can only come from the actual send.
+ *
+ * `ship.` is Shipway's own dashboard subdomain, hardcoded here to match `setup/install.sh`'s
+ * `configure_dns`/`install_vhosts` (which always provision the dashboard at `ship.<base_domain>`,
+ * not a configurable one) — see `routes/projects.ts`'s `RESERVED_SLUGS` for the other half of that
+ * convention (a project can never claim the `ship` subdomain out from under the dashboard).
  */
 export function buildInviteEmail({ token, baseDomain }: InviteEmailInput): InviteEmailContent {
   const invitePath = `/invite/${token}`;
   const domain = baseDomain && baseDomain.trim() !== '' ? baseDomain.trim() : null;
-  const url = domain ? `https://deploy.${domain}${invitePath}` : null;
+  const url = domain ? `https://ship.${domain}${invitePath}` : null;
 
   const linkLine = url
     ? url
