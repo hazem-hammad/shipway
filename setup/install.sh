@@ -11,10 +11,18 @@
 # credential a project or the running server may already depend on.
 #
 # Must be run as root (`sudo ./setup/install.sh`) from inside a Shipway
-# checkout, or with SHIPWAY_REPO_URL set. See docs/server-setup.md for the
-# full walkthrough. Non-interactive installs can set SHIPWAY_BASE_DOMAIN,
+# checkout, or with SHIPWAY_REPO_URL set. See DEPLOYMENT.md for the full
+# walkthrough. Non-interactive installs can set SHIPWAY_BASE_DOMAIN,
 # SHIPWAY_SERVER_IP, SHIPWAY_CF_API_TOKEN, SHIPWAY_ACME_EMAIL instead of
-# answering the prompts.
+# answering the prompts, plus SHIPWAY_NONINTERACTIVE=1 to skip the one
+# remaining interactive gate (the DNS-not-pointed-here confirmation in
+# `check_dns_resolution`) and proceed unattended.
+#
+# Runs a preflight check (root, OS, free disk, ports 80/443, outbound
+# connectivity, Cloudflare token/zone access, DNS pointing at this server)
+# before making any change to the system, and a postflight check (service
+# status + a live `/api/health` retry loop) before printing the final
+# summary — see `preflight`/`postflight` in `main` below.
 #
 # --- Deliberate deviations from a literal reading of the spec/task brief,
 #     made for correctness on a real Ubuntu 24.04 box, documented here so
@@ -83,6 +91,99 @@ check_ubuntu() {
   fi
   if [[ "$id" != "ubuntu" || "$version_id" != "24.04" ]]; then
     log "WARNING: this script targets Ubuntu 24.04; detected '${id:-unknown} ${version_id:-unknown}'. Continuing anyway."
+  fi
+}
+
+readonly MIN_FREE_DISK_MB=2048
+
+# Fails loudly if / has less than MIN_FREE_DISK_MB free. PHP 8.1-8.4 (with
+# extensions) + MySQL + PostgreSQL + Node x3 + the Shipway build easily need
+# more than this; better to stop now than fail halfway through apt or npm
+# with a confusing ENOSPC.
+check_disk_space() {
+  local avail_kb avail_mb
+  avail_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+  avail_mb=$((avail_kb / 1024))
+  if ((avail_mb < MIN_FREE_DISK_MB)); then
+    die "only ${avail_mb}MiB free on / — at least ${MIN_FREE_DISK_MB}MiB is required. Free up space (or resize the disk) and re-run."
+  fi
+  log "disk space check passed (${avail_mb}MiB free on /)"
+}
+
+# Fails loudly if port 80 or 443 is already held by something other than
+# nginx (which install_base_packages is about to install and which install_vhosts
+# needs those ports for). A fresh box should have both free; a re-run will
+# see nginx itself holding them, which is fine. Skips gracefully if `ss`
+# isn't on PATH rather than failing preflight over a missing diagnostic tool.
+check_ports() {
+  if ! command -v ss >/dev/null 2>&1; then
+    log "WARNING: 'ss' not found, skipping the port 80/443 preflight check"
+    return
+  fi
+
+  local port line
+  for port in 80 443; do
+    line="$(ss -Htlnp "sport = :${port}" 2>/dev/null || true)"
+    if [[ -z "$line" ]]; then
+      continue
+    fi
+    if [[ "$line" == *'"nginx"'* ]]; then
+      log "port ${port} is already held by nginx, continuing"
+      continue
+    fi
+    die "port ${port} is already in use by something other than nginx: ${line}. Stop that process/service before installing Shipway (nginx needs 80 and 443 free)."
+  done
+  log "port 80/443 check passed"
+}
+
+# Fails loudly if outbound DNS or HTTPS isn't working — every remaining step
+# (apt, the ondrej/php PPA, nodejs.org, GitHub releases for mailpit,
+# Cloudflare, Let's Encrypt) needs both.
+check_outbound_connectivity() {
+  if ! getent hosts api.cloudflare.com >/dev/null 2>&1; then
+    die "outbound DNS resolution isn't working (couldn't resolve api.cloudflare.com). Check /etc/resolv.conf and the network/firewall configuration, then re-run."
+  fi
+  if ! curl -sS --max-time 10 -o /dev/null https://api.cloudflare.com/; then
+    die "outbound HTTPS isn't reachable (couldn't reach https://api.cloudflare.com/). The installer needs outbound internet access for apt, Node, Mailpit, Cloudflare, and Let's Encrypt. Check firewall/proxy settings, then re-run."
+  fi
+  log "outbound DNS/HTTPS connectivity check passed"
+}
+
+# True if `host` has an A record resolving to `ip`.
+dns_resolves_to() {
+  local host="$1" ip="$2"
+  getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | grep -qxF "$ip"
+}
+
+# Warns (rather than fails) if BASE_DOMAIN/*.BASE_DOMAIN don't yet resolve to
+# SERVER_IP: certbot's DNS-01 challenge doesn't need this (it posts a TXT
+# record via the Cloudflare API, not an HTTP/TLS check), but the nginx
+# vhosts install_vhosts renders do — https://deploy.<base-domain> won't be
+# reachable until DNS points here. Requires typed confirmation to proceed
+# unless SHIPWAY_NONINTERACTIVE=1, for a non-interactive/scripted install.
+check_dns_resolution() {
+  local probe_host="shipway-preflight-probe.${BASE_DOMAIN}"
+
+  if dns_resolves_to "$BASE_DOMAIN" "$SERVER_IP" && dns_resolves_to "$probe_host" "$SERVER_IP"; then
+    log "DNS check passed: ${BASE_DOMAIN} and *.${BASE_DOMAIN} both resolve to ${SERVER_IP}"
+    return
+  fi
+
+  log "WARNING: DNS doesn't fully point at this server yet."
+  log "  ${BASE_DOMAIN} A record: $(getent ahostsv4 "$BASE_DOMAIN" 2>/dev/null | awk '{print $1}' | paste -sd, - || true)"
+  log "  *.${BASE_DOMAIN} (wildcard probe) A record: $(getent ahostsv4 "$probe_host" 2>/dev/null | awk '{print $1}' | paste -sd, - || true)"
+  log "  expected: ${SERVER_IP}"
+  log "This usually just means the DNS records haven't propagated yet, or the wildcard A record hasn't been created — see DEPLOYMENT.md's prerequisites. The install can continue (certbot's DNS-01 challenge doesn't need this), but https://deploy.${BASE_DOMAIN} won't be reachable until DNS is correct."
+
+  if [[ "${SHIPWAY_NONINTERACTIVE:-}" == "1" ]]; then
+    log "SHIPWAY_NONINTERACTIVE=1 set, continuing without confirmation"
+    return
+  fi
+
+  local reply=""
+  read -r -p "Continue anyway? [y/N] " reply
+  if [[ ! "$reply" =~ ^[Yy]$ ]]; then
+    die "aborted. Point ${BASE_DOMAIN} and *.${BASE_DOMAIN} at ${SERVER_IP} (A records) and re-run, or re-run with SHIPWAY_NONINTERACTIVE=1 to proceed anyway."
   fi
 }
 
@@ -417,7 +518,7 @@ read_prompts() {
 
   CF_API_TOKEN="${SHIPWAY_CF_API_TOKEN:-}"
   if [[ -z "$CF_API_TOKEN" ]]; then
-    read -r -s -p "Cloudflare API token (Zone.DNS edit): " CF_API_TOKEN
+    read -r -s -p "Cloudflare API token (Zone:Read + DNS:Edit): " CF_API_TOKEN
     echo
   fi
 
@@ -429,6 +530,45 @@ read_prompts() {
   if [[ -z "$BASE_DOMAIN" || -z "$SERVER_IP" || -z "$CF_API_TOKEN" || -z "$ACME_EMAIL" ]]; then
     die "BASE_DOMAIN, SERVER_IP, CF_API_TOKEN and ACME_EMAIL are all required"
   fi
+}
+
+# Thin wrapper: every Cloudflare API call the installer makes (token verify,
+# zone lookup, DNS record create/find) goes through this, authenticated with
+# the operator's CF_API_TOKEN.
+cf_api() {
+  curl -fsSL -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" "$@"
+}
+
+# The zone id for BASE_DOMAIN, resolved once by verify_cloudflare_access and
+# reused by configure_dns later — one lookup instead of two, and one place
+# that can fail with a clear message instead of two.
+ZONE_ID=""
+
+# Fails loudly, before any package is installed, if the Cloudflare token is
+# invalid/expired or can't see a zone named BASE_DOMAIN — the single most
+# common way this installer goes wrong, and worth catching immediately
+# rather than after certbot (or worse, after MySQL/Postgres accounts,
+# bootstrap.json, and the build) fails on it instead.
+verify_cloudflare_access() {
+  log "verifying Cloudflare API token"
+
+  local verify_body verify_ok
+  verify_body="$(cf_api "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null || true)"
+  verify_ok="$(printf '%s' "$verify_body" | jq -r '(.success == true and .result.status == "active")' 2>/dev/null || echo false)"
+  if [[ "$verify_ok" != "true" ]]; then
+    die "the Cloudflare API token is invalid, expired, or unreachable. Create a token with Zone:Read + DNS:Edit permission covering ${BASE_DOMAIN} (Cloudflare dashboard: My Profile > API Tokens > Create Token > \"Edit zone DNS\" template, restricted to that zone), then re-run with the new token."
+  fi
+
+  # `|| true` (matching verify_body above): under `set -o pipefail`, a curl-level failure here
+  # (rare — the token was just confirmed active above; this would mean a transient network/API
+  # error) would otherwise make THIS assignment itself exit nonzero and trip `set -e` immediately,
+  # skipping the die() below in favor of a bare, unhelpful curl error.
+  ZONE_ID="$(cf_api "https://api.cloudflare.com/client/v4/zones?name=${BASE_DOMAIN}" 2>/dev/null | jq -r '.result[0].id // empty' 2>/dev/null || true)"
+  if [[ -z "$ZONE_ID" ]]; then
+    die "no Cloudflare zone named '${BASE_DOMAIN}' is visible to this token (or the lookup itself failed — check connectivity to api.cloudflare.com). Check that ${BASE_DOMAIN} is added to this Cloudflare account as its own zone (not a subdomain of another zone) and that the token's zone resource includes it, then re-run."
+  fi
+
+  log "Cloudflare access verified (zone ${ZONE_ID} for ${BASE_DOMAIN})"
 }
 
 # ---------------------------------------------------------------------------
@@ -448,7 +588,7 @@ EOF
     log "certificate for ${BASE_DOMAIN} already exists, skipping certbot"
   else
     log "requesting wildcard certificate for *.${BASE_DOMAIN} / ${BASE_DOMAIN}"
-    certbot certonly \
+    if ! certbot certonly \
       --dns-cloudflare \
       --dns-cloudflare-credentials "$cf_ini" \
       --dns-cloudflare-propagation-seconds 30 \
@@ -457,7 +597,9 @@ EOF
       --cert-name "${BASE_DOMAIN}" \
       --agree-tos \
       -m "$ACME_EMAIL" \
-      -n
+      -n; then
+      die "certbot failed to issue a certificate for *.${BASE_DOMAIN} / ${BASE_DOMAIN} — see the certbot output above for the exact reason. Common causes: the Cloudflare token lost DNS:Edit access between verify_cloudflare_access and here, or 30s wasn't long enough for the TXT record to propagate (rare). Fix it and re-run install.sh; already-completed steps are skipped, so this is safe to retry."
+    fi
   fi
 
   install -d -m 0755 /etc/letsencrypt/renewal-hooks/deploy
@@ -564,6 +706,12 @@ sync_shipway_source() {
   if [[ -f "${REPO_ROOT}/package.json" && -d "${REPO_ROOT}/server" && -d "${REPO_ROOT}/setup" ]]; then
     log "installing from local checkout at ${REPO_ROOT}"
     mkdir -p "$SHIPWAY_DIR"
+    # `/data` (root-level, anchored — a dev-mode `SHIPWAY_DEV=1` run from the repo root writes its
+    # SQLite db/secret keys there) and `*.log` (unanchored — matches at any depth, e.g.
+    # `server/data/logs/**/*.log` or a stray debug log anywhere in the tree) are excluded so a
+    # developer's local checkout never leaks a dev database or its secrets onto the server. Both are
+    # already .gitignore'd (so a real `git clone` never has them), but this is the local-checkout
+    # branch specifically *for when it isn't* a clean clone — see the header comment.
     rsync -a --delete \
       --exclude '.git' \
       --exclude 'node_modules' \
@@ -571,6 +719,8 @@ sync_shipway_source() {
       --exclude 'server/dist' \
       --exclude 'server/data' \
       --exclude 'web/dist' \
+      --exclude '/data' \
+      --exclude '*.log' \
       "${REPO_ROOT}/" "${SHIPWAY_DIR}/"
   elif [[ -n "${SHIPWAY_REPO_URL:-}" ]]; then
     log "cloning ${SHIPWAY_REPO_URL} into ${SHIPWAY_DIR}"
@@ -625,15 +775,18 @@ install_vhosts() {
 # ---------------------------------------------------------------------------
 # 13. Cloudflare DNS records for deploy.<domain> and mail.<domain>
 # ---------------------------------------------------------------------------
-
-cf_api() {
-  curl -fsSL -H "Authorization: Bearer ${CF_API_TOKEN}" -H "Content-Type: application/json" "$@"
-}
+# cf_api and ZONE_ID come from verify_cloudflare_access (preflight, section
+# 7 above) — resolved once, reused here instead of looking the zone up again.
 
 create_a_record_if_missing() {
   local zone_id="$1" name="$2"
-  local existing
-  existing="$(cf_api "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${name}" | jq -r '.result[0].id // empty')"
+  local response existing
+  # The lookup and the jq parse are two separate steps (not a `cf_api | jq` pipe) so a curl-level
+  # failure here dies with a clear message instead of being silently treated as "record doesn't
+  # exist yet" — which would go on to attempt creating a possibly-duplicate record.
+  response="$(cf_api "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${name}" 2>/dev/null)" \
+    || die "Cloudflare API call failed while checking for an existing DNS record for ${name}. Check connectivity to api.cloudflare.com and that the token still has zone access, then re-run (already-created records are skipped, so this is safe to retry)."
+  existing="$(printf '%s' "$response" | jq -r '.result[0].id // empty')"
   if [[ -n "$existing" ]]; then
     log "DNS A record for ${name} already exists, skipping"
     return
@@ -646,14 +799,90 @@ create_a_record_if_missing() {
 }
 
 configure_dns() {
-  local zone_id
-  zone_id="$(cf_api "https://api.cloudflare.com/client/v4/zones?name=${BASE_DOMAIN}" | jq -r '.result[0].id // empty')"
-  if [[ -z "$zone_id" ]]; then
-    die "could not find a Cloudflare zone named ${BASE_DOMAIN} (check the API token's zone access)"
-  fi
+  create_a_record_if_missing "$ZONE_ID" "deploy.${BASE_DOMAIN}"
+  create_a_record_if_missing "$ZONE_ID" "mail.${BASE_DOMAIN}"
+}
 
-  create_a_record_if_missing "$zone_id" "deploy.${BASE_DOMAIN}"
-  create_a_record_if_missing "$zone_id" "mail.${BASE_DOMAIN}"
+# ---------------------------------------------------------------------------
+# Preflight orchestrator — the first thing `main` calls. Wires together the
+# section-0 checks above with `read_prompts` (section 7) and
+# `verify_cloudflare_access` (also section 7): every check here runs before
+# this script changes anything on the system (beyond reading /etc/os-release
+# and the network probes themselves). Order matters — cheap local checks
+# first, then prompts (needed by the checks after them), then the network/
+# DNS checks that need BASE_DOMAIN/SERVER_IP/CF_API_TOKEN. A Cloudflare
+# failure here means zero packages have been touched yet.
+# ---------------------------------------------------------------------------
+
+preflight() {
+  log "running preflight checks"
+
+  check_ubuntu
+  check_disk_space
+  check_ports
+  check_outbound_connectivity
+
+  read_prompts
+
+  verify_cloudflare_access
+  check_dns_resolution
+
+  log "preflight checks passed"
+}
+
+# ---------------------------------------------------------------------------
+# 14. Postflight — verifies the install actually came up before declaring
+#     success, instead of trusting that every prior step not exiting
+#     nonzero means Shipway is actually reachable.
+# ---------------------------------------------------------------------------
+
+readonly POSTFLIGHT_HEALTH_RETRIES=12
+readonly POSTFLIGHT_HEALTH_DELAY_S=5
+
+postflight() {
+  log "running postflight checks"
+
+  local unit status core_ok=1
+  for unit in shipway nginx mysql postgresql redis-server mailpit; do
+    status="$(systemctl is-active "$unit" 2>/dev/null || true)"
+    log "  ${unit}: ${status:-unknown}"
+    if [[ "$unit" == "shipway" || "$unit" == "nginx" ]] && [[ "$status" != "active" ]]; then
+      core_ok=0
+    fi
+  done
+
+  local health_url="https://deploy.${BASE_DOMAIN}/api/health"
+  local attempt health_ok=0
+  for ((attempt = 1; attempt <= POSTFLIGHT_HEALTH_RETRIES; attempt++)); do
+    if curl -fsS --max-time 5 "$health_url" > /dev/null 2>&1; then
+      health_ok=1
+      break
+    fi
+    sleep "$POSTFLIGHT_HEALTH_DELAY_S"
+  done
+
+  echo
+  echo "==============================================================="
+  echo " Shipway is installed"
+  echo "==============================================================="
+  echo " Dashboard:      https://deploy.${BASE_DOMAIN}"
+  if [[ "$health_ok" == "1" ]]; then
+    echo " Health check:   OK (${health_url})"
+  else
+    echo " Health check:   still failing after $((POSTFLIGHT_HEALTH_RETRIES * POSTFLIGHT_HEALTH_DELAY_S))s (${health_url})"
+    echo "                 Often just DNS propagation. Check: sudo systemctl status shipway nginx"
+  fi
+  echo " Next step:      open the dashboard URL and complete the first-run setup wizard"
+  echo "                 (admin account, server settings, Cloudflare, GitHub App)."
+  echo " Shipway data:   /var/lib/shipway (database, secret.key)"
+  echo " Deployed apps:  /var/deploy/apps/<slug>"
+  echo " Deploy logs:    /var/deploy/logs/<slug>/<deployment-id>.log"
+  echo " Mailpit web UI: https://mail.${BASE_DOMAIN}  (user: intcore, password: ${MAILPIT_WEB_PASSWORD})"
+  echo "==============================================================="
+
+  if [[ "$core_ok" != "1" ]]; then
+    die "shipway and/or nginx are not active — see the systemctl status above. Check 'sudo journalctl -u shipway -n 100' and 'sudo journalctl -u nginx -n 100', fix the problem, then re-run install.sh (it is safe to re-run)."
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -662,7 +891,7 @@ configure_dns() {
 
 main() {
   check_root
-  check_ubuntu
+  preflight
   export DEBIAN_FRONTEND=noninteractive
 
   touch "$SECRETS_FILE"
@@ -687,7 +916,6 @@ main() {
   create_deployer_user
   install_sysops_helper
 
-  read_prompts
   issue_certificate
 
   provision_mysql_admin
@@ -700,6 +928,8 @@ main() {
 
   install_vhosts
   configure_dns
+
+  postflight
 
   log "done. Shipway is live at https://deploy.${BASE_DOMAIN} — open it to run the first-run setup wizard."
 }
