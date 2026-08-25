@@ -125,27 +125,33 @@ function CloudflareForm({ settings }: { settings: Settings }) {
         </p>
       )}
 
-      <div className="flex flex-wrap items-center gap-3">
-        <Button type="submit" loading={saving} disabled={!dirty || saving}>
-          Save
-        </Button>
-        <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!canTest}>
-          Test connection
-        </Button>
-        {/* Three honest states, driven entirely by the last verify result's `reason` — never
-            inferred from credentials merely being present (that was the bug: dev mode used to
-            report "Connected" unconditionally). Cleared to unknown on any field edit above. */}
-        {testResult?.reason === 'ok' && <Badge tone="ok">Connected</Badge>}
-        {testResult?.reason === 'not_configured' && <Badge tone="neutral">Not configured</Badge>}
+      <div className="flex flex-col gap-2">
+        <div className="flex flex-wrap items-center gap-3">
+          <Button type="submit" loading={saving} disabled={!dirty || saving}>
+            Save
+          </Button>
+          <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!canTest}>
+            Test connection
+          </Button>
+          {/* Four honest states, driven entirely by the last verify result's `reason` — never
+              inferred from credentials merely being present (that was the bug: dev mode used to
+              report "Connected" unconditionally). Cleared to unknown on any field edit above.
+              invalid_token/error both render the same danger Badge (matching New Project's Domain
+              card, DESIGN.md's Badges/chips section) with the specific reason as an explanatory
+              line beneath, rather than plain alert text with no badge at all. */}
+          {testResult?.reason === 'ok' && <Badge tone="ok">Connected</Badge>}
+          {testResult?.reason === 'not_configured' && <Badge tone="neutral">Not configured</Badge>}
+          {(testResult?.reason === 'invalid_token' || testResult?.reason === 'error') && <Badge tone="danger">Not connected</Badge>}
+        </div>
         {testResult?.reason === 'invalid_token' && (
-          <span role="alert" className="text-sm text-danger">
+          <p role="alert" className="text-sm text-danger">
             Cloudflare rejected this token. Check it hasn&rsquo;t expired or been revoked.
-          </span>
+          </p>
         )}
         {testResult?.reason === 'error' && (
-          <span role="alert" className="text-sm text-danger">
+          <p role="alert" className="text-sm text-danger">
             {testResult.message ?? 'Could not reach Cloudflare. Try again.'}
-          </span>
+          </p>
         )}
       </div>
     </form>

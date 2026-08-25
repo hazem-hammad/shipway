@@ -140,12 +140,25 @@ function formatFrom(cfg: InstanceMailConfig): string {
   return cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
 }
 
+/** Defensively removes the configured SMTP username from an error message before it's returned to
+ * a caller (`emailError` on the invite response, `POST /api/settings/mail/test`'s result, a
+ * channel's test-send result) — a remote SMTP server can echo the login back in its rejection text
+ * (e.g. `535 authentication failed for user 'shipway@example.com'`), and that value can itself be
+ * worth keeping out of a response even though it isn't a secret in the same class as the password.
+ * Only strips an exact, case-sensitive match of a non-empty, non-whitespace username; anything else
+ * in the message is left alone. */
+function redactUsername(message: string, username: string | undefined): string {
+  if (!username || username.trim() === '') return message;
+  return message.split(username).join('[username]');
+}
+
 /**
  * Sends one email through `cfg`. NEVER throws — a `driver: 'none'` config or any transport/network
  * failure resolves `{ok: false, error}` instead, since a failed test-send or a failed best-effort
  * notification must never turn into an unhandled rejection or a 500. Never logs `cfg.password` or
- * any other credential. `transportFactory` defaults to a real nodemailer SMTP transport; tests
- * inject a fake one.
+ * any other credential; the returned error message also never contains `cfg.username` (see
+ * `redactUsername`). `transportFactory` defaults to a real nodemailer SMTP transport; tests inject
+ * a fake one.
  */
 export async function sendMail(
   cfg: InstanceMailConfig,
@@ -161,7 +174,8 @@ export async function sendMail(
     await transport.sendMail({ from: formatFrom(cfg), to: input.to, subject: input.subject, text: input.text, html: input.html });
     return { ok: true };
   } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : 'failed to send mail' };
+    const message = err instanceof Error ? err.message : 'failed to send mail';
+    return { ok: false, error: redactUsername(message, cfg.username) };
   }
 }
 
@@ -201,7 +215,7 @@ export function buildInviteEmail({ token, baseDomain }: InviteEmailInput): Invit
 
   const linkLine = url
     ? url
-    : `${invitePath} (no base domain is configured yet, so this can't be a full link — open this path on your Shipway instance)`;
+    : `${invitePath} (no base domain is configured yet, so this can't be a full link; open this path on your Shipway instance)`;
 
   const text = ["You've been invited to join Shipway.", '', `Accept your invite: ${linkLine}`, '', 'This link expires in 7 days.'].join('\n');
 

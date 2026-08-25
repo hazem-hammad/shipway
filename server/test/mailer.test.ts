@@ -168,6 +168,26 @@ describe('sendMail', () => {
       error: 'boom',
     });
   });
+
+  it('strips the configured username out of a rejecting transport error message', async () => {
+    const fakeTransport: MailTransport = {
+      sendMail: vi.fn().mockRejectedValue(new Error("535 authentication failed for 'user'")),
+    };
+
+    const result = await sendMail(SMTP_CFG, { to: 'dest@example.com', subject: 's', text: 't' }, () => fakeTransport);
+
+    expect(result).toEqual({ ok: false, error: "535 authentication failed for '[username]'" });
+  });
+
+  it('leaves the error message untouched when no username is configured', async () => {
+    const cfgNoUsername: InstanceMailConfig = { ...SMTP_CFG, username: undefined };
+    const fakeTransport: MailTransport = { sendMail: vi.fn().mockRejectedValue(new Error('connection refused')) };
+
+    await expect(sendMail(cfgNoUsername, { to: 'dest@example.com', subject: 's', text: 't' }, () => fakeTransport)).resolves.toEqual({
+      ok: false,
+      error: 'connection refused',
+    });
+  });
 });
 
 describe('buildInviteEmail', () => {
