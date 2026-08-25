@@ -13,7 +13,7 @@ import { Eye, EyeOff, KeyRound, Plus, Trash2 } from 'lucide-react';
 import { ApiError, putProjectEnv } from '../../api';
 import { useProjectEnv, useProjectEnvPreview } from '../../hooks';
 import { Button, Card, CardHeader, ICON_STROKE, Input, Skeleton, Tabs, Textarea } from '../../components/ui';
-import { findDuplicateKeys, parseEnv, serializeEnv, type EnvExtra, type EnvRow } from '../../../../server/src/deploy/envparse.js';
+import { findDuplicateKeys, hasCRLF, parseEnv, serializeEnv, type EnvExtra, type EnvRow } from '../../../../server/src/deploy/envparse.js';
 
 /** Keys that look like secrets get masked by default with a per-row reveal toggle. */
 const SECRET_KEY_RE = /(SECRET|TOKEN|KEY|PASSWORD|PASS|DSN|CREDENTIAL)/i;
@@ -61,6 +61,11 @@ function EnvEditorForm({ projectId, initialContent }: { projectId: number; initi
   const [error, setError] = useState<string | null>(null);
 
   const duplicateKeys = useMemo(() => findDuplicateKeys(rows), [rows]);
+  // Detected once from the file as loaded: parseEnv splits on `\n` only, so a CRLF file leaves every
+  // line's trailing `\r` in place, which fails every row-shaped pattern in envparse.ts and yields zero
+  // editable rows. Rather than silently normalizing line endings, Table mode shows an honest note and
+  // points at Raw mode instead (see envparse.ts's `hasCRLF` doc comment for why).
+  const fileHasCRLF = useMemo(() => hasCRLF(initialContent), [initialContent]);
 
   function switchMode(next: Mode) {
     if (next === mode) return;
@@ -130,6 +135,11 @@ function EnvEditorForm({ projectId, initialContent }: { projectId: number; initi
 
         {mode === 'table' ? (
           <div className="flex flex-col gap-3">
+            {fileHasCRLF && (
+              <p role="alert" className="text-[13px] text-warn">
+                This file uses Windows line endings (CRLF). Edit it in Raw mode.
+              </p>
+            )}
             {rows.length === 0 ? (
               <p className="text-sm text-soft">No environment variables yet.</p>
             ) : (

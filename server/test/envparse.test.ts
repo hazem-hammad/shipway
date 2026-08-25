@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseEnv, serializeEnv, findDuplicateKeys, type EnvRow } from '../src/deploy/envparse.js';
+import { parseEnv, serializeEnv, findDuplicateKeys, hasCRLF, type EnvRow } from '../src/deploy/envparse.js';
 
 describe('parseEnv', () => {
   it('parses a plain KEY=value line into a row', () => {
@@ -33,9 +33,54 @@ describe('parseEnv', () => {
     expect(rows).toEqual([{ key: 'MAIL_PASSWORD', value: 'p@ss"w\\ord', quoted: true }]);
   });
 
-  it('unwraps a single-quoted value literally (no escapes)', () => {
-    const { rows } = parseEnv("TOKEN='raw value'");
-    expect(rows).toEqual([{ key: 'TOKEN', value: 'raw value', quoted: true }]);
+  it('unwraps a single-quoted value that needs no quoting, dropping the decorative quotes (the one accepted normalization)', () => {
+    const { rows, extras } = parseEnv("TOKEN='plain'");
+    expect(rows).toEqual([{ key: 'TOKEN', value: 'plain', quoted: true }]);
+    expect(extras).toEqual([]);
+  });
+
+  it('treats a single-quoted value that actually needs quoting (has a space) as an extra rather than switching quote style', () => {
+    // Regression guard for the reviewer-flagged critical bug's sibling case: switching a single-quoted
+    // value that needs quoting to formatRow's double-quote form would change the file's bytes on a save
+    // that never touched this row. Since a single-quoted source can never byte-match a double-quoted
+    // `serializeEnv` output, such a line is kept verbatim as an extra instead (see envparse.ts's
+    // "Accepted normalizations" doc comment).
+    const { rows, extras } = parseEnv("TOKEN='raw value'");
+    expect(rows).toEqual([]);
+    expect(extras).toEqual([{ index: 0, line: "TOKEN='raw value'" }]);
+  });
+
+  it('treats a double-quoted value with a lone/unrecognized backslash escape as an extra (CRITICAL regression: Windows DSN)', () => {
+    // The reported bug: `.\SQLEXPRESS` decoded a bare `\` as a literal backslash, but the encoder
+    // unconditionally doubles every backslash, so a save with zero edits to this row silently turned
+    // `.\SQLEXPRESS` into `.\\SQLEXPRESS`. Rejecting the unrecognized escape means this line is never
+    // accepted as a row at all — see the byte-identical round-trip test below.
+    const line = 'DB_DSN="sqlsrv:Server=.\\SQLEXPRESS;Database=app"';
+    const { rows, extras } = parseEnv(line);
+    expect(rows).toEqual([]);
+    expect(extras).toEqual([{ index: 0, line }]);
+  });
+
+  it('treats a double-quoted value with a regex-style backslash escape as an extra (CRITICAL regression: \\d)', () => {
+    const line = 'PATTERN="^\\d+$"';
+    const { rows, extras } = parseEnv(line);
+    expect(rows).toEqual([]);
+    expect(extras).toEqual([{ index: 0, line }]);
+  });
+
+  it('treats a double-quoted Windows path with multiple unrecognized backslashes as an extra', () => {
+    const line = 'PATH="C:\\Program Files\\App"';
+    const { rows, extras } = parseEnv(line);
+    expect(rows).toEqual([]);
+    expect(extras).toEqual([{ index: 0, line }]);
+  });
+
+  it('still accepts a double-quoted value whose only backslash is a properly escaped `\\\\` pair', () => {
+    // Contrast case: this backslash IS one of the two recognized pairs, so it decodes and
+    // re-encodes symmetrically and is safe to accept as an editable row.
+    const { rows, extras } = parseEnv('KEY="a\\\\b"');
+    expect(rows).toEqual([{ key: 'KEY', value: 'a\\b', quoted: true }]);
+    expect(extras).toEqual([]);
   });
 
   it('treats blank lines as extras at their original position', () => {
@@ -135,10 +180,104 @@ describe('serializeEnv', () => {
     expect(serializeEnv(rows, extras)).toBe('KEY=plain');
   });
 
-  it('normalizes single-quote style to the unquoted/double-quote rule, same as formatAssignment', () => {
-    const { rows, extras } = parseEnv("TOKEN='raw value'");
-    // needs quoting (space) -> re-quoted with double quotes per formatAssignment's rule
-    expect(serializeEnv(rows, extras)).toBe('TOKEN="raw value"');
+  it('does NOT switch a single-quoted value that needs quoting to double-quote style (superseded behavior, see the parseEnv test above): it round-trips byte-identically as an extra instead', () => {
+    const text = "TOKEN='raw value'";
+    const { rows, extras } = parseEnv(text);
+    expect(serializeEnv(rows, extras)).toBe(text);
+  });
+
+  it('CRITICAL regression: a DSN with an unescaped Windows-path backslash round-trips byte-identically with zero edits (was silently doubled before the fix)', () => {
+    const text = 'DB_DSN="sqlsrv:Server=.\\SQLEXPRESS;Database=app"';
+    const { rows, extras } = parseEnv(text);
+    expect(serializeEnv(rows, extras)).toBe(text);
+    expect(serializeEnv(rows, extras)).not.toContain('\\\\SQLEXPRESS');
+  });
+
+  it('CRITICAL regression: a regex value with an unescaped backslash round-trips byte-identically with zero edits', () => {
+    const text = 'PATTERN="^\\d+$"';
+    const { rows, extras } = parseEnv(text);
+    expect(serializeEnv(rows, extras)).toBe(text);
+  });
+
+  it('CRITICAL regression: editing an unrelated row and re-serializing leaves backslash-bearing extra lines byte-for-byte untouched', () => {
+    const text = [
+      'APP_NAME=demo',
+      'DB_DSN="sqlsrv:Server=.\\SQLEXPRESS;Database=app"',
+      'PATTERN="^\\d+$"',
+    ].join('\n');
+    const { rows, extras } = parseEnv(text);
+
+    // Confirm the setup: only APP_NAME became an editable row; the two backslash lines are extras.
+    expect(rows).toEqual([{ key: 'APP_NAME', value: 'demo', quoted: false }]);
+    expect(extras.map((e) => e.line)).toEqual([
+      'DB_DSN="sqlsrv:Server=.\\SQLEXPRESS;Database=app"',
+      'PATTERN="^\\d+$"',
+    ]);
+
+    // Edit the one row that IS editable (simulates a user changing APP_NAME then hitting Save).
+    const editedRows = rows.map((r) => (r.key === 'APP_NAME' ? { ...r, value: 'renamed' } : r));
+    const out = serializeEnv(editedRows, extras);
+
+    expect(out).toBe(
+      ['APP_NAME=renamed', 'DB_DSN="sqlsrv:Server=.\\SQLEXPRESS;Database=app"', 'PATTERN="^\\d+$"'].join('\n'),
+    );
+  });
+
+  it('CRITICAL regression: a realistic Laravel-style .env round-trips byte-identically', () => {
+    const text = [
+      'APP_NAME=Laravel',
+      'APP_ENV=local',
+      'APP_KEY=base64:abcd1234',
+      'APP_DEBUG=true',
+      'APP_URL=http://localhost',
+      '',
+      'LOG_CHANNEL=stack',
+      '',
+      'DB_CONNECTION=sqlsrv',
+      'DB_HOST=127.0.0.1',
+      'DB_PORT=1433',
+      'DB_DATABASE=app',
+      'DB_USERNAME=sa',
+      'DB_PASSWORD="p@ss\\"w\\\\ord"',
+      // A hand-authored Windows-style DSN a developer might paste in directly — the exact shape of
+      // bug this fix exists for.
+      'DB_DSN="sqlsrv:Server=.\\SQLEXPRESS;Database=app"',
+      '',
+      '# Regex used by a validation rule',
+      'ZIP_PATTERN="^\\d{5}$"',
+      '',
+      'CACHE_DRIVER=file',
+      'QUEUE_CONNECTION=sync',
+      'SESSION_DRIVER=file',
+      'SESSION_LIFETIME=120',
+    ].join('\n');
+
+    const { rows, extras } = parseEnv(text);
+    expect(serializeEnv(rows, extras)).toBe(text);
+
+    // The two backslash-bearing values did NOT become editable rows (they're extras); every other
+    // assignment DID.
+    const rowKeys = rows.map((r) => r.key);
+    expect(rowKeys).not.toContain('DB_DSN');
+    expect(rowKeys).not.toContain('ZIP_PATTERN');
+    expect(rowKeys).toEqual([
+      'APP_NAME',
+      'APP_ENV',
+      'APP_KEY',
+      'APP_DEBUG',
+      'APP_URL',
+      'LOG_CHANNEL',
+      'DB_CONNECTION',
+      'DB_HOST',
+      'DB_PORT',
+      'DB_DATABASE',
+      'DB_USERNAME',
+      'DB_PASSWORD',
+      'CACHE_DRIVER',
+      'QUEUE_CONNECTION',
+      'SESSION_DRIVER',
+      'SESSION_LIFETIME',
+    ]);
   });
 
   it('matches formatAssignment\'s exact escaping for a password containing a quote and a backslash', () => {
@@ -185,6 +324,29 @@ describe('serializeEnv', () => {
     const serialized = serializeEnv(once.rows, once.extras);
     const twice = parseEnv(serialized);
     expect(serializeEnv(twice.rows, twice.extras)).toBe(serialized);
+  });
+});
+
+describe('hasCRLF', () => {
+  it('is true when the text contains any \\r\\n line ending', () => {
+    expect(hasCRLF('APP_NAME=demo\r\nDEBUG=true\r\n')).toBe(true);
+  });
+
+  it('is false for a normal LF-only file', () => {
+    expect(hasCRLF('APP_NAME=demo\nDEBUG=true\n')).toBe(false);
+  });
+
+  it('is false for an empty file', () => {
+    expect(hasCRLF('')).toBe(false);
+  });
+
+  it('documents the low-priority CRLF limitation: a CRLF file parses to zero rows (every line keeps its trailing \\r as an extra), but still round-trips byte-identically', () => {
+    const text = 'APP_NAME=demo\r\nDEBUG=true\r\n';
+    expect(hasCRLF(text)).toBe(true);
+    const { rows, extras } = parseEnv(text);
+    expect(rows).toEqual([]);
+    expect(extras.length).toBeGreaterThan(0);
+    expect(serializeEnv(rows, extras)).toBe(text);
   });
 });
 
