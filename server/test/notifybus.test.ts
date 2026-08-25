@@ -347,4 +347,31 @@ describe('emitEvent — mixed channel types isolate each other’s failures', ()
     expect(calls).toHaveLength(1);
     expect(calls[0]?.url).toContain('healthy');
   });
+
+  it('a hanging email channel (fix wave I2) does not stall a webhook channel behind it in the fan-out loop', async () => {
+    const { db, secretBox } = tmpFixtures();
+    saveMailConfig(db, secretBox, { driver: 'mailpit', host: '127.0.0.1', port: 1025, secure: false, fromAddress: 'shipway@localhost' });
+
+    // The email channel is subscribed FIRST, so a still-unbounded await would delay the webhook
+    // channel's turn in the sequential fan-out loop (server/src/services/notifybus.ts's `emitEvent`)
+    // by however long the hang lasts.
+    const emailId = insertEmailChannel(db, 'hanging-email', 'ops@example.com');
+    const webhookId = insertChannel(db, 'healthy-webhook', 'https://hooks.slack.com/services/healthy', 'webhook');
+    subscribe(db, 'deploy_failed', emailId);
+    subscribe(db, 'deploy_failed', webhookId);
+
+    const hangingTransport: MailTransport = { sendMail: () => new Promise(() => {}) }; // never settles
+    const { fetchImpl, calls } = fakeFetch();
+    const start = Date.now();
+
+    // Short injected `mailSendTimeoutMs` (7th arg) so this test doesn't wait out the real
+    // `DEFAULT_MAIL_TIMEOUT_MS` cap to prove the loop keeps moving.
+    await expect(
+      emitEvent(db, 'deploy_failed', { title: 'Deploy failed', message: 'oops' }, fetchImpl, secretBox, () => hangingTransport, 30),
+    ).resolves.toBeUndefined();
+
+    expect(Date.now() - start).toBeLessThan(1000);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.url).toContain('healthy');
+  });
 });

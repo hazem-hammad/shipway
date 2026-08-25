@@ -90,6 +90,7 @@ async function dispatchEmailChannel(
   channel: { id: number; target: string | null },
   payload: NotifyPayload,
   mailTransportFactory: TransportFactory | undefined,
+  mailSendTimeoutMs: number | undefined,
 ): Promise<void> {
   if (!channel.target) {
     console.error(`shipway: notification channel ${String(channel.id)} is type "email" but has no target address — skipping delivery`);
@@ -106,7 +107,11 @@ async function dispatchEmailChannel(
     return;
   }
 
-  const result = await sendMail(cfg, { to: channel.target, subject: payload.title, text: payload.message }, mailTransportFactory);
+  // `sendMail` itself is bounded (fix wave I2's `DEFAULT_MAIL_TIMEOUT_MS`/`withTimeout` — `undefined`
+  // here falls through to that default; `mailSendTimeoutMs` overrides it for a fast, deterministic
+  // test, mirroring `mailTransportFactory`), so a hanging SMTP host can no longer stall this
+  // channel's turn in `emitEvent`'s sequential fan-out loop and delay every channel behind it.
+  const result = await sendMail(cfg, { to: channel.target, subject: payload.title, text: payload.message }, mailTransportFactory, mailSendTimeoutMs);
   if (!result.ok) {
     console.error(`shipway: notification channel ${String(channel.id)} (email) delivery failed: ${result.error}`);
   }
@@ -127,6 +132,11 @@ export async function emitEvent(
   fetchImpl: typeof fetch = fetch,
   secretBox?: SecretBox,
   mailTransportFactory?: TransportFactory,
+  /** Test-only override for `sendMail`'s overall await cap (fix wave I2) — production callers never
+   * pass this, so email deliveries use `DEFAULT_MAIL_TIMEOUT_MS` same as every other `sendMail` call
+   * site. Lets a test prove a hanging email channel doesn't stall the rest of the fan-out loop
+   * without actually waiting out the real cap. */
+  mailSendTimeoutMs?: number,
 ): Promise<void> {
   const channels = db
     .select({ id: notificationChannels.id, url: notificationChannels.url, type: notificationChannels.type, target: notificationChannels.target })
@@ -140,7 +150,7 @@ export async function emitEvent(
   for (const channel of channels) {
     try {
       if (channel.type === 'email') {
-        await dispatchEmailChannel(db, secretBox, channel, payload, mailTransportFactory);
+        await dispatchEmailChannel(db, secretBox, channel, payload, mailTransportFactory, mailSendTimeoutMs);
         continue;
       }
 

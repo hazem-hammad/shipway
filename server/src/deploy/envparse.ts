@@ -15,33 +15,39 @@
  * user-env-vs-managed-block merge). This module only turns a whole `.env` text blob into rows a table
  * UI can edit, and back, and is deliberately conservative: a line only becomes a `{key, value}` row
  * when `isSafeRow` (see its doc comment) confirms it — either the source line reproduces byte-for-byte
- * on re-encode, or it's the one documented decorative-quote-drop exception AND that exception is
- * verified as a genuine fixed point under reparse, not just assumed safe by character content. Anything
- * else (comments, blanks, `export FOO=bar` lines, an indented assignment, an unterminated quote, a
- * value containing characters that would force re-quoting on a form the parser isn't sure it can
- * reverse, or a value whose "safe-looking" unquoted form would be misread as quoted on the next parse)
- * is kept as an opaque "extra" line at its original position instead of being reformatted or silently
- * dropped.
+ * through `formatValueDetailed` (the same function that decides what a SAVE writes for any row, not
+ * just ones sourced from parsing text), or it's the one documented decorative-quote-drop exception,
+ * verified as a genuine fixed point under reparse rather than assumed safe by character content.
+ * Anything else (comments, blanks, `export FOO=bar` lines, an indented assignment, or an unterminated
+ * quote) is kept as an opaque "extra" line at its original position instead of being reformatted or
+ * silently dropped.
+ *
+ * Fix wave I1 (`.superpowers/sdd/2026-08-25-shipway-v3/final-review.md`): before this fix, the
+ * write path (`formatRow`/`formatValue`, used by every `serializeEnv` call, including saving a row a
+ * user typed fresh into a brand-new Table row — never parsed from any source text, so `isSafeRow`
+ * never ran on it at all) decided quoting purely by `needsQuoting`'s character-membership test, with
+ * no reparse verification of its own. A value like `'secret'` or `''` has none of `needsQuoting`'s
+ * trigger characters, so it was written UNQUOTED — `MY_SECRET='secret'` — which reads back on the next
+ * parse as a *single-quoted* assignment, silently stripping the apostrophes to `secret`. `formatValueDetailed`
+ * (below) closes this by performing the exact same reparse verification on every write that `isSafeRow`
+ * already performed on read, so the write path can no longer produce a value that doesn't round-trip.
  *
  * Accepted normalizations (the ONLY byte-level differences `parseEnv`+`serializeEnv` are allowed to
  * introduce for a line that becomes a row, with zero user edits to that row):
  *   - Decorative quotes are dropped: `KEY="plain"` or `KEY='plain'` -> `KEY=plain`. This is safe
- *     specifically because it passes `isSafeRow`'s reparse check — not merely because `plain` has none
- *     of `needsQuoting`'s trigger characters. A value can pass that trigger-character test and STILL be
- *     unsafe to unquote (e.g. `MY_SECRET="'secret'"`, whose decoded value `"'secret'"` contains no
- *     space/`#`/`"`/`\` but starts with `'`, so the unquoted form `MY_SECRET='secret'` gets misread as
- *     a *single-quoted* assignment on the next parse and loses its apostrophes) — `isSafeRow` catches
- *     that by actually reparsing, not by checking character membership, so such a line correctly stays
- *     an extra instead.
- *   That's it. In particular: a double-quoted value is only ever accepted as a row when its escaping
- *   already uses exactly the recognized `\\` -> `\` / `\"` -> `"` pairs (anything else — e.g. `\S` in
- *   `.\SQLEXPRESS`, `\d` in `^\d+$` — is a lone/unrecognized backslash and the whole line becomes an
- *   extra instead of being silently re-escaped into something with a different byte count). A
- *   single-quoted value that actually needs quoting (contains a space/`#`/`"`/`\`) also becomes an
- *   extra rather than being switched to double-quote style, since that changes the file's bytes with
- *   no user edit. Every row that IS produced is checked against this contract directly (see
- *   `isSafeRow` below) rather than trusted by construction — a value's decode is never assumed
- *   reversible; it's verified, by actually round-tripping it through the parser again.
+ *     specifically because it passes `formatValueDetailed`'s reparse check — not merely because `plain`
+ *     has none of `needsQuoting`'s trigger characters.
+ *   That's it. In particular: a double-quoted value is only ever accepted as a row UNCHANGED when its
+ *   escaping already uses exactly the recognized `\\`/`\"`/`\r`/`\n` pairs (see `parseDoubleQuoted`) —
+ *   any OTHER backslash usage (e.g. `\S` in `.\SQLEXPRESS`, `\d` in `^\d+$`) is a lone/unrecognized
+ *   escape from a hand-authored file and the whole line becomes an extra rather than being silently
+ *   re-escaped into something with a different byte count. A single-quoted source that actually needs
+ *   quoting (contains a space/`#`/`"`/`\`) similarly becomes an extra rather than being switched to
+ *   double-quote style mid-save, since that changes the file's bytes with no user edit to that row —
+ *   see `isSafeRow`'s doc comment for exactly which of its two cases each shape falls into. Every row
+ *   that IS produced is checked against this contract directly rather than trusted by construction — a
+ *   value's decode is never assumed reversible; it's verified, by actually round-tripping it through
+ *   the parser again, on BOTH the read and write paths.
  */
 
 export interface EnvRow {
@@ -49,19 +55,19 @@ export interface EnvRow {
   value: string;
   /**
    * True when the source line wrapped the value in quotes (single or double). Informational only:
-   * `serializeEnv` decides quoting purely by whether the value needs it (see `needsQuoting` below),
-   * mirroring `envfile.ts`'s (unexported) `formatAssignment` — so a row's quotes are not "sticky". A
-   * value that was quoted but didn't need to be (e.g. `KEY="plain"`) always comes back out unquoted,
-   * but only when doing so is a genuine fixed point under reparse (see `isSafeRow`'s doc comment) —
-   * a value like `"'secret'"` looks unquotable by character content alone but isn't, because the
-   * unquoted form would be misread as single-quoted on the next parse, so it's kept as an extra
-   * instead and never becomes a row with `quoted: true` and no quotes to show for it. A value that
-   * DOES need quoting (space/`#`/`"`/`\`) is only ever represented as a row when its source form
-   * already reproduces byte-for-byte through `serializeEnv` — see the module doc comment's "Accepted
-   * normalizations" — so for such a row `quoted` is always `true` and stays that way; a value needing
-   * quoting whose source form wouldn't round-trip exactly (e.g. a single-quoted value with a space, or
-   * a double-quoted value with an unrecognized backslash escape) never becomes a row at all — it's
-   * kept as an extra instead.
+   * `serializeEnv` decides quoting purely by whether the value needs it (see `formatValueDetailed`
+   * below), mirroring `envfile.ts`'s (unexported) `formatAssignment` — so a row's quotes are not
+   * "sticky". A value that was quoted but didn't need to be (e.g. `KEY="plain"`) always comes back out
+   * unquoted, but only when doing so is a genuine fixed point under reparse (see `formatValueDetailed`'s
+   * doc comment) — a value like `"'secret'"` looks unquotable by character content alone but isn't,
+   * because the unquoted form would be misread as single-quoted on the next parse, so `formatValueDetailed`
+   * escalates it to an explicit double-quoted row (`quoted: true`) instead of silently corrupting it.
+   * A value that DOES need quoting (space/`#`/`"`/`\`) is only ever represented as a row when its
+   * source form already reproduces byte-for-byte through `serializeEnv` — see the module doc comment's
+   * "Accepted normalizations" — so for such a row `quoted` is always `true` and stays that way; a value
+   * needing quoting whose source form wouldn't round-trip exactly (e.g. a single-quoted value with a
+   * space, or a double-quoted value with an unrecognized backslash escape) never becomes a row at all —
+   * it's kept as an extra instead.
    */
   quoted?: boolean;
 }
@@ -87,18 +93,27 @@ const ASSIGNMENT_RE = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/;
  *  match this go to `extras` verbatim instead of being guessed at. */
 const UNQUOTED_VALUE_RE = /^[^\s#"\\]*$/;
 
-/** Unescapes a double-quoted value using the same pairing `formatAssignment` produces (`\\` -> `\`,
- *  `\"` -> `"`), requiring the closing quote to be the last character on the line. Returns `null` for
- *  an unterminated quote, trailing junk after the close, OR a backslash that isn't part of one of
- *  those two recognized pairs (all three go to `extras`).
+/** Unescapes a double-quoted value using the same pairing `escapeForDoubleQuote` produces (`\\` ->
+ *  `\`, `\"` -> `"`, `\r` -> a literal CR, `\n` -> a literal LF), requiring the closing quote to be
+ *  the last character on the line. Returns `null` for an unterminated quote, trailing junk after the
+ *  close, OR a backslash that isn't part of one of those four recognized pairs (all three go to
+ *  `extras`).
  *
- *  That last case is the fix for a critical round-trip bug: a lone backslash not followed by `"` or
- *  `\` (e.g. `.\SQLEXPRESS` in a DSN, `^\d+$` in a regex, `C:\Users` in a Windows path) used to be
- *  decoded as a literal single backslash — a reasonable-looking decode in isolation — but `formatRow`
- *  unconditionally doubles every backslash on re-encode, so ANY save (even one that only edited a
- *  different row, since the whole file is re-serialized) silently turned `.\SQLEXPRESS` into
- *  `.\\SQLEXPRESS`. Rejecting unrecognized escapes here means such a line is never accepted as an
- *  editable row in the first place — it's kept as an extra and can never be mutated by a save. */
+ *  The four recognized pairs are exactly (and only) the ones `escapeForDoubleQuote` can ever produce
+ *  — see its doc comment — which is what lets `isSafeRow` and `formatValueDetailed`'s own internal
+ *  round-trip check treat "this decodes" and "this is safe to accept as a row" as the same question.
+ *  Any OTHER backslash escape (e.g. `\S` in `.\SQLEXPRESS`, `\d` in `^\d+$`) is a lone/unrecognized
+ *  backslash from a hand-authored file, not something this parser's own encoder would ever emit, and
+ *  is rejected rather than guessed at.
+ *
+ *  Rejecting unrecognized escapes here is also the fix for a critical round-trip bug: a lone
+ *  backslash not followed by a recognized escape char (e.g. `.\SQLEXPRESS` in a DSN, `^\d+$` in a
+ *  regex, `C:\Users` in a Windows path) used to be decoded as a literal single backslash — a
+ *  reasonable-looking decode in isolation — but `formatRow` unconditionally doubles every backslash
+ *  on re-encode, so ANY save (even one that only edited a different row, since the whole file is
+ *  re-serialized) silently turned `.\SQLEXPRESS` into `.\\SQLEXPRESS`. Rejecting unrecognized escapes
+ *  here means such a line is never accepted as an editable row in the first place — it's kept as an
+ *  extra and can never be mutated by a save. */
 function parseDoubleQuoted(rest: string): string | null {
   let out = '';
   for (let i = 1; i < rest.length; i++) {
@@ -107,6 +122,16 @@ function parseDoubleQuoted(rest: string): string | null {
       const next = rest[i + 1];
       if (next === '"' || next === '\\') {
         out += next;
+        i++;
+        continue;
+      }
+      if (next === 'r') {
+        out += '\r';
+        i++;
+        continue;
+      }
+      if (next === 'n') {
+        out += '\n';
         i++;
         continue;
       }
@@ -195,66 +220,106 @@ export function hasCRLF(text: string): boolean {
 }
 
 /** Mirrors `formatAssignment` in `server/src/deploy/envfile.ts` (not exported there, so duplicated
- *  here per Ruling 1's guidance — see the module doc comment). Quotes only when the value contains a
- *  space, `#`, `"`, or `\`, escaping `\` then `"` in that order. */
+ *  here per Ruling 1's guidance — see the module doc comment). A first-pass signal only: "definitely
+ *  needs quoting", not "safe to leave unquoted" — see `formatValueDetailed`, which is the actual
+ *  authority on that question (fix wave I1). Quotes only when the value contains a space, `#`, `"`,
+ *  or `\`. */
 function needsQuoting(value: string): boolean {
   return /[ #"\\]/.test(value);
 }
 
-/** The `rest`-of-line text `formatRow` would emit for `value` (everything after `KEY=`), with no
- *  quoting applied when none is needed. Split out from `formatRow` purely to keep the escaping logic
- *  in one place. */
-function formatValue(value: string): string {
+/** Escapes `value` for the inside of a double-quoted assignment, using exactly the four pairs
+ *  `parseDoubleQuoted` recognizes (`\` -> `\\`, `"` -> `\"`, CR -> `\r`, LF -> `\n`), in an order that
+ *  keeps them unambiguous: backslashes first (so the literal backslash characters introduced by every
+ *  later step are never themselves re-escaped), then quotes, then CR/LF. Every other character
+ *  (letters, digits, unicode, tabs, `'`, `#`, spaces, ...) passes through unchanged — `parseDoubleQuoted`
+ *  copies them back verbatim, so this pairing is a true bijection: for ANY string `value` (this is the
+ *  fix-wave I1 property), `parseDoubleQuoted` un-escaping `escapeForDoubleQuote(value)` always yields
+ *  back exactly `value`. That is what makes "escalate to double-quoting" below a real fallback rather
+ *  than just a different guess. */
+function escapeForDoubleQuote(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\r/g, '\\r').replace(/\n/g, '\\n');
+}
+
+interface FormattedValue {
+  /** The `rest`-of-line text `formatRow` emits for this value (everything after `KEY=`). */
+  text: string;
+  /** Whether `text` is the escaped double-quoted form (escalated) vs. the bare value emitted unquoted. */
+  quoted: boolean;
+}
+
+/**
+ * THE single source of truth for how to write `value` safely (fix wave I1 — this used to be a
+ * character-membership guess with no verification; see the module doc comment's "Round 2" history).
+ * Tries the shortest safe representation first, but only ever returns one that's PROVEN — by actually
+ * reparsing it, not by reasoning about which characters make that ambiguous — to read back as exactly
+ * `value`:
+ *
+ *   1. If `value` doesn't need quoting by `needsQuoting`'s character test AND writing it bare and
+ *      decoding that back (via `decodeLine`, the same primitive `parseEnv` itself uses) reproduces
+ *      `value` unquoted — genuinely a fixed point — emit it bare. This is what makes `KEY="plain"`
+ *      correctly drop its decorative quotes on save; it's ALSO what catches the sibling bug a value
+ *      like `'secret'` or `''` used to hit: `needsQuoting` sees no space/#/"/\\ and used to wave it
+ *      through unquoted, but `'secret'` written bare and reparsed comes back as a *single-quoted*
+ *      assignment (value `secret`, apostrophes stripped as delimiters) — not a fixed point — so this
+ *      step correctly declines it.
+ *   2. Otherwise, escalate to `escapeForDoubleQuote` (see its doc comment for why that's ALWAYS a
+ *      fixed point, for literally any string) and emit the double-quoted form.
+ *
+ * The invariant this guarantees, for ANY value a user can type into a Table-mode cell: writing `value`
+ * this way and reparsing it back always yields exactly `value` — `decodeLine(`${key}=${formatValueDetailed(key,
+ * value).text}`)?.value === value`, unconditionally. There is no third "can't be represented" case.
+ */
+function formatValueDetailed(key: string, value: string): FormattedValue {
   if (!needsQuoting(value)) {
-    return value;
+    const reparsed = decodeLine(`${key}=${value}`);
+    if (reparsed !== null && !reparsed.quoted && reparsed.value === value) {
+      return { text: value, quoted: false };
+    }
   }
-  const escaped = value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-  return `"${escaped}"`;
+  return { text: `"${escapeForDoubleQuote(value)}"`, quoted: true };
+}
+
+function formatValue(key: string, value: string): string {
+  return formatValueDetailed(key, value).text;
 }
 
 function formatRow(row: EnvRow): string {
-  return `${row.key}=${formatValue(row.value)}`;
+  return `${row.key}=${formatValue(row.key, row.value)}`;
 }
 
 /**
  * The gate `parseEnv` runs before accepting a candidate `{key, value}` as an editable row.
  * `originalRest` is the exact source text after `KEY=` (before any decoding). A row is safe to accept
- * in exactly two cases:
+ * in exactly two cases, both driven by `formatValueDetailed` — the same function `formatRow` uses to
+ * actually write the value on save, so "safe to show as an editable row" and "safe to write" can never
+ * drift apart the way they did before fix wave I1 (the write path had no reparse check of its own):
  *
- *   1. `serializeEnv` reproduces `originalRest` byte-for-byte (the normal, no-surprises case — covers
- *      plain unquoted values and double-quoted values whose escaping already uses exactly the
- *      recognized `\\`/`\"` pairs).
- *   2. The value needs no quoting at all (`needsQuoting` false) AND — this is the fix for a second,
- *      sibling bug to the backslash one — re-encoding it unquoted and decoding that result AGAIN
- *      (through `decodeLine`, the same primitive `parseEnv` itself uses) comes back to the exact same
- *      value. This is a genuine fixed-point check under reparse, equivalent to the reviewer-prescribed
- *      `parseEnv(formatRow(row)).rows[0]?.value === row.value`, implemented via the lower-level
- *      `decodeLine` instead of a re-entrant `parseEnv` call on a one-line string so it can't recurse.
+ *   1. `formatValueDetailed` reproduces `originalRest` byte-for-byte (the normal, no-surprises case —
+ *      covers plain unquoted values and double-quoted values whose escaping already uses exactly the
+ *      recognized `\\`/`\"`/`\r`/`\n` pairs).
+ *   2. `formatValueDetailed` chose to emit `value` UNQUOTED. That choice is only ever made after
+ *      `formatValueDetailed` has itself verified (case 1 of its own logic) that doing so is a genuine
+ *      fixed point under reparse — so it's always safe to accept even when the SOURCE had (unneeded)
+ *      quotes, changing this row's bytes on save from e.g. `KEY="plain"` to `KEY=plain`. That's the one
+ *      sanctioned normalization (see the module doc comment's "Accepted normalizations"): dropping
+ *      decorative quotes the value never needed.
  *
- * Case 2 used to be just `quoted && !needsQuoting(value)` — "the source had quotes it didn't need, so
- * drop them." That heuristic only checked which characters `value` CONTAINS, never whether the
- * resulting UNQUOTED text is itself ambiguous on the next parse. `MY_SECRET="'secret'"` decodes
- * (correctly) to `value = "'secret'"`, which has none of `needsQuoting`'s trigger characters, so the
- * old heuristic emitted it unquoted as `MY_SECRET='secret'`. That text *starts* with `'`, so
- * `decodeLine` (mode switches and page loads reparse whatever was last SAVED, not the original source
- * text) reads it back as a *single-quoted* assignment and strips the apostrophes as delimiters —
- * `value` silently becomes `"secret"` with zero user edits. Requiring an actual reparse to come back
- * unchanged catches that (and any shape of the same problem not enumerated by name) instead of trying
- * to hand-enumerate "characters that make re-encoding ambiguous".
- *
- * Note case 2 is deliberately gated behind `!needsQuoting(value)` rather than being a blanket "any
- * fixed point is fine" check: a value that DOES need quoting (e.g. a single-quoted source with a
- * space) can ALSO be a fixed point after switching it to double-quote style — `serializeEnv` would
- * happily reparse its own output forever — but that's exactly the byte-changing-with-zero-edits
- * transformation `isSafeRow` exists to prevent (case 1 already declined it; case 2 must not
- * accidentally let it back in through a looser check).
+ * Prior to fix wave I1, case 2 was a second, independently-implemented reparse check living only in
+ * `isSafeRow` — the write path (`formatRow`/`formatValue`) had no equivalent guard at all, so a value
+ * like `'secret'` typed fresh into a NEW row (not sourced from parsing any existing text, so `isSafeRow`
+ * never even ran on it) could be written unquoted, corrupting it on the very next reparse. Now that
+ * `formatValueDetailed` performs that same fixed-point check unconditionally for every write, `isSafeRow`
+ * just asks what `formatValueDetailed` decided rather than re-deriving it — which also means values that
+ * used to be conservatively kept as un-editable extras purely because the write side couldn't yet prove
+ * they were safe (`MY_SECRET="'secret'"`, `KEY="''"`, `TOKEN="'hello"`, `KEY="'a'b'c'"` — see
+ * `envparse.test.ts`'s "Round 2" fixtures) now correctly become editable rows: `formatValueDetailed`
+ * proves the escalated double-quoted form byte-matches the source exactly, satisfying case 1.
  */
 function isSafeRow(originalRest: string, key: string, value: string): boolean {
-  const formatted = formatValue(value);
-  if (formatted === originalRest) return true;
-  if (needsQuoting(value)) return false;
-  const reparsed = decodeLine(`${key}=${formatted}`);
-  return reparsed !== null && reparsed.value === value;
+  const formatted = formatValueDetailed(key, value);
+  if (formatted.text === originalRest) return true;
+  return !formatted.quoted;
 }
 
 /**

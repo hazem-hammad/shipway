@@ -332,36 +332,37 @@ describe('quote-normalization fixed point (Round 2 regression: apostrophe-shaped
   // !needsQuoting(value)`) let a double-quoted value whose CONTENT happens to start/end with `'`
   // through as an unquoted row, even though `needsQuoting` never checks for `'` at all. That unquoted
   // text then gets misread as a *single-quoted* assignment on the very next parse (a Table<->Raw
-  // switch or a page reload, not just a Save), silently stripping or corrupting the apostrophes. The
-  // fix makes the exception a genuine fixed point: `isSafeRow` actually re-decodes the re-encoded line
-  // and requires the value to come back unchanged, rather than reasoning about which characters make
-  // that reparse ambiguous.
+  // switch or a page reload, not just a Save), silently stripping or corrupting the apostrophes.
   //
-  // Each case below is asserted through TWO full parse->serialize cycles (mimicking a mode switch
-  // followed by another mode switch, or two page loads) and must come out completely inert: the line
-  // is byte-identical to the input both times, and — since these are provably not safe to represent as
-  // an editable row — each shows up in `extras` (which is exactly what feeds the UI's "N lines kept as
-  // written" note, so nothing goes missing without that note reflecting it).
+  // Fix wave I1 (final-review.md): the ORIGINAL read-path-only fix made these lines inert by keeping
+  // them as non-editable `extras` forever — safe, but permanently un-editable, since at the time the
+  // WRITE path (`formatRow`/`formatValue`) had no equivalent reparse guard and couldn't be trusted to
+  // write a corrected value back safely either. Now that `formatValueDetailed` performs that same
+  // fixed-point verification on every write (see envparse.ts), these values are PROVABLY safe to
+  // write as an escalated double-quoted row — so they now correctly become editable ROWS with the
+  // exact (uncorrupted) value, not extras. Each case is still asserted through TWO full
+  // parse->serialize cycles (mimicking a mode switch followed by another mode switch, or two page
+  // loads) to prove the value is stable, not just correct once.
   const fixtures = [
-    { name: 'MY_SECRET="\'secret\'"', line: 'MY_SECRET="\'secret\'"' },
-    { name: 'KEY="\'\'"', line: 'KEY="\'\'"' },
-    { name: 'TOKEN="\'hello"', line: 'TOKEN="\'hello"' },
-    { name: 'KEY="\'a\'b\'c\'"', line: 'KEY="\'a\'b\'c\'"' },
+    { name: 'MY_SECRET="\'secret\'"', line: 'MY_SECRET="\'secret\'"', key: 'MY_SECRET', value: "'secret'" },
+    { name: 'KEY="\'\'"', line: 'KEY="\'\'"', key: 'KEY', value: "''" },
+    { name: 'TOKEN="\'hello"', line: 'TOKEN="\'hello"', key: 'TOKEN', value: "'hello" },
+    { name: 'KEY="\'a\'b\'c\'"', line: 'KEY="\'a\'b\'c\'"', key: 'KEY', value: "'a'b'c'" },
   ];
 
-  for (const { name, line } of fixtures) {
-    it(`${name}: survives two full parse->serialize cycles byte-identically and stays a non-editable extra`, () => {
+  for (const { name, line, key, value } of fixtures) {
+    it(`${name}: becomes an editable row with the exact (uncorrupted) value, byte-identical on re-encode, stable across two full parse->serialize cycles`, () => {
       const first = parseEnv(line);
-      expect(first.rows).toEqual([]);
-      expect(first.extras).toEqual([{ index: 0, line }]);
+      expect(first.rows).toEqual([{ key, value, quoted: true }]);
+      expect(first.extras).toEqual([]);
       const serializedOnce = serializeEnv(first.rows, first.extras);
       expect(serializedOnce).toBe(line);
 
       // Second cycle: reparse what was just serialized (simulates a second mode switch / reload) and
-      // confirm it's still exactly the same, not progressively corrupted.
+      // confirm the value is still exactly the same, not progressively corrupted.
       const second = parseEnv(serializedOnce);
-      expect(second.rows).toEqual([]);
-      expect(second.extras).toEqual([{ index: 0, line }]);
+      expect(second.rows).toEqual([{ key, value, quoted: true }]);
+      expect(second.extras).toEqual([]);
       const serializedTwice = serializeEnv(second.rows, second.extras);
       expect(serializedTwice).toBe(line);
     });
@@ -369,19 +370,19 @@ describe('quote-normalization fixed point (Round 2 regression: apostrophe-shaped
 
   it('MY_SECRET="\'secret\'": the specific corruption the reviewer demonstrated (apostrophes silently stripped) does not happen', () => {
     const { rows, extras } = parseEnv('MY_SECRET="\'secret\'"');
-    // Was never a row in the first place, so there is no row.value to have been corrupted to "secret".
-    expect(rows.find((r) => r.key === 'MY_SECRET')).toBeUndefined();
-    expect(extras[0]?.line).toBe('MY_SECRET="\'secret\'"');
+    // Now a row, with the apostrophes intact — never corrupted to the bare "secret" the old
+    // unquoted-write bug produced.
+    expect(rows.find((r) => r.key === 'MY_SECRET')?.value).toBe("'secret'");
+    expect(extras).toEqual([]);
   });
 
   it('KEY="\'\'": does not silently decode to an empty string on any reparse', () => {
     const { rows, extras } = parseEnv('KEY="\'\'"');
-    expect(rows).toEqual([]);
-    expect(extras[0]?.line).toBe('KEY="\'\'"');
+    expect(rows).toEqual([{ key: 'KEY', value: "''", quoted: true }]);
+    expect(extras).toEqual([]);
     // Re-run through serializeEnv+parseEnv once more to be sure nothing collapses to '' downstream.
     const again = parseEnv(serializeEnv(rows, extras));
-    expect(again.rows).toEqual([]);
-    expect(again.extras[0]?.line).toBe('KEY="\'\'"');
+    expect(again.rows).toEqual([{ key: 'KEY', value: "''", quoted: true }]);
   });
 
   it('a double-quoted value that merely CONTAINS an apostrophe (not at either edge) is unaffected and still becomes a row', () => {
@@ -391,6 +392,103 @@ describe('quote-normalization fixed point (Round 2 regression: apostrophe-shaped
     expect(rows).toEqual([{ key: 'MSG', value: "it's fine", quoted: true }]);
     expect(extras).toEqual([]);
     expect(serializeEnv(rows, extras)).toBe('MSG="it\'s fine"');
+  });
+
+  it('a single-quoted SOURCE that needs quoting still stays an extra rather than switching to double-quote style', () => {
+    // Contrast case, unaffected by the fix: `isSafeRow`'s case 2 only ever accepts a row when
+    // `formatValueDetailed` chose the UNQUOTED form. A value needing quoting (here: the space) is
+    // always escalated to double-quoted by `formatValueDetailed`, so a single-quoted source can never
+    // byte-match it — correctly kept as an extra instead of silently switching quote style mid-save.
+    const { rows, extras } = parseEnv("TOKEN='raw value'");
+    expect(rows).toEqual([]);
+    expect(extras).toEqual([{ index: 0, line: "TOKEN='raw value'" }]);
+  });
+});
+
+describe('write-path round-trip (fix wave I1: BLOCKER — formatValue never verified what it wrote)', () => {
+  // The bug, reproduced live against the running app: typing `'secret'` into a Table-mode value cell
+  // (a NEW row, never parsed from any source text) saved as `MY_SECRET='secret'` and read back as
+  // `secret` — formatValue decided quoting by character membership only (`needsQuoting`), with no
+  // verification that the unquoted form it emitted actually meant the same thing on the next parse.
+  // The fix: `formatValueDetailed` (envparse.ts) now reparses its own candidate output before
+  // returning it, escalating to double-quoting whenever the bare form isn't a genuine fixed point.
+  //
+  // Each fixture here simulates the ACTUAL bug path: a fresh row (as if freshly typed into an empty
+  // Table cell, `quoted: false`, never touched `parseEnv`) is written with `serializeEnv` and read
+  // back with `parseEnv` — the invariant is that the row's value survives byte-for-byte.
+  const fixtures: Array<{ name: string; key: string; value: string }> = [
+    { name: "single-quote wrapped: 'secret'", key: 'MY_SECRET', value: "'secret'" },
+    { name: 'bare double apostrophe: empty single-quoted shape', key: 'EMPTY_QUOTES', value: "''" },
+    { name: "leading apostrophe only: 'hello", key: 'TOKEN', value: "'hello" },
+    { name: "interspersed apostrophes: 'a'b'c'", key: 'KEY', value: "'a'b'c'" },
+    { name: 'a backslash-bearing Windows DSN', key: 'DB_DSN', value: 'sqlsrv:Server=.\\SQLEXPRESS;Database=app' },
+    { name: 'a value containing a double quote', key: 'MSG', value: 'she said "hi" to me' },
+    { name: 'a value containing a bare #', key: 'MAIL_ENCRYPTION', value: 'tls#insecure' },
+    { name: 'a value containing spaces', key: 'MAIL_FROM_ADDRESS', value: 'no reply' },
+    { name: 'a value with a trailing backslash', key: 'PATH_LIKE', value: 'C:\\Windows\\System32\\' },
+  ];
+
+  for (const { name, key, value } of fixtures) {
+    it(`${name}: parseEnv(serializeEnv([{key, value}], [])) yields back the exact value`, () => {
+      const rows: EnvRow[] = [{ key, value, quoted: false }];
+      const text = serializeEnv(rows, []);
+
+      const parsed = parseEnv(text);
+      const row = parsed.rows.find((r) => r.key === key);
+      expect(row).toBeDefined();
+      expect(row!.value).toBe(value);
+      expect(parsed.extras).toEqual([]);
+
+      // A second cycle (mode switch / reload) must be equally stable.
+      const again = parseEnv(serializeEnv(parsed.rows, parsed.extras));
+      expect(again.rows.find((r) => r.key === key)?.value).toBe(value);
+    });
+  }
+
+  it('writing several adversarial rows together: every value survives, none bleed into each other', () => {
+    const rows: EnvRow[] = fixtures.map(({ key, value }) => ({ key, value, quoted: false }));
+    const text = serializeEnv(rows, []);
+    const parsed = parseEnv(text);
+
+    expect(parsed.extras).toEqual([]);
+    expect(parsed.rows).toHaveLength(fixtures.length);
+    for (const { key, value } of fixtures) {
+      expect(parsed.rows.find((r) => r.key === key)?.value).toBe(value);
+    }
+  });
+
+  it('property check: a few dozen generated values mixing quotes/backslashes/spaces all round-trip exactly', () => {
+    // Small deterministic PRNG (mulberry32) so failures are reproducible without a fuzzing dependency.
+    function mulberry32(seed: number): () => number {
+      let a = seed;
+      return () => {
+        a |= 0;
+        a = (a + 0x6d2b79f5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    const alphabet = ["'", '"', '\\', ' ', '#', 'a', 'b', '0', '_', '-', '.', ':', ';'];
+    const rand = mulberry32(20260825);
+    const values: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      const len = 1 + Math.floor(rand() * 12);
+      let value = '';
+      for (let j = 0; j < len; j++) {
+        value += alphabet[Math.floor(rand() * alphabet.length)];
+      }
+      values.push(value);
+    }
+
+    for (const value of values) {
+      const rows: EnvRow[] = [{ key: 'GENERATED', value, quoted: false }];
+      const parsed = parseEnv(serializeEnv(rows, []));
+      const row = parsed.rows.find((r) => r.key === 'GENERATED');
+      expect(row, `value ${JSON.stringify(value)} did not round-trip as a row (extras: ${JSON.stringify(parsed.extras)})`).toBeDefined();
+      expect(row!.value, `value ${JSON.stringify(value)} corrupted on round-trip`).toBe(value);
+    }
   });
 });
 

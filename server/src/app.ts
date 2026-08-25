@@ -38,6 +38,7 @@ import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
 import { makeGitOps } from './services/git.js';
 import { GitHubService, resolveCloneUrl, type GithubAppConfig } from './services/github.js';
+import { DEFAULT_MAIL_TIMEOUT_MS } from './services/mailer.js';
 import { startServiceWatch, type ServiceWatchHandle } from './services/servicewatch.js';
 import { makeSysOps, type SysOps } from './sysops/index.js';
 
@@ -65,6 +66,12 @@ declare module 'fastify' {
      * always see the latest stored credentials.
      */
     dns: () => DnsClient | null;
+    /** The overall cap (ms) every route's direct `sendMail(...)` call site (invite, mail test-send,
+     * notification-channel test-send) passes as `sendMail`'s `timeoutMs` (fix wave I2) — defaults to
+     * `services/mailer.ts`'s `DEFAULT_MAIL_TIMEOUT_MS`, overridable per-app via `deps.mailSendTimeoutMs`
+     * so a test can prove a hanging SMTP host doesn't stall a response without waiting out the real
+     * cap. */
+    mailSendTimeoutMs: number;
     /** Schedules and tracks deploy/rollback jobs; wired to `runDeploy` in `buildApp`. */
     queue: DeployQueue;
     /** Provisions/deprovisions MySQL/Postgres databases; backed by `mysql_admin_url`/`postgres_admin_url` settings. */
@@ -198,6 +205,10 @@ export async function buildApp(
     sysops?: SysOps;
     /** Test-only override: skips the default lazy `dns()` in favor of an injected function. */
     dns?: () => DnsClient | null;
+    /** Test-only override for `app.mailSendTimeoutMs` (fix wave I2) — a short cap lets a test prove
+     * an invite/test-send route still answers promptly against a hanging mail transport, instead of
+     * waiting out the real `DEFAULT_MAIL_TIMEOUT_MS`. In production this is never passed. */
+    mailSendTimeoutMs?: number;
     /** Test-only override: replaces the real `runDeploy`-backed queue `run` with a fake. */
     queueRun?: DeployQueueDeps['run'];
     /** Test-only override: replaces the real mysql2/pg-backed `DbAdmin` with a fake (e.g. one that
@@ -252,6 +263,7 @@ export async function buildApp(
   });
   app.decorate('sysops', deps.sysops ?? makeSysOps(cfg));
   app.decorate('secretBox', SecretBox.load(cfg.secretKeyPath));
+  app.decorate('mailSendTimeoutMs', deps.mailSendTimeoutMs ?? DEFAULT_MAIL_TIMEOUT_MS);
   app.decorate(
     'dbAdmin',
     deps.dbAdmin ??
@@ -269,13 +281,22 @@ export async function buildApp(
         const hasCredentials = !isBlankCredential(token) && !isBlankCredential(zoneId);
 
         if (cfg.devMode) {
-          // Record provisioning (create/find/delete) stays fully in-memory/offline unconditionally
-          // (FakeDnsClient's own doc comment) — only its verifyToken() reflects real configured
+          // Record provisioning (create/find/delete) stays fully in-memory/offline once credentials
+          // ARE configured (FakeDnsClient's own doc comment) — verifyToken() reflects real configured
           // state, refreshed here on every call so "Test connection" in dev mode is never a lie
-          // (see routes/cloudflare.ts and the root-cause note in the v3 design spec §2).
+          // (see routes/cloudflare.ts and the root-cause note in the v3 design spec §2). The shared
+          // instance itself is built unconditionally (its in-memory records need to persist across
+          // calls once credentials do show up), but is only ever HANDED to a caller when credentials
+          // are actually configured — fix wave M1: `resolveDnsOutcome`/`provisionProject` previously
+          // always got a non-null client here, so the New Project Domain card could show a green "DNS
+          // record created." for a write to this in-memory map in the very same session where the
+          // card itself said Cloudflare wasn't connected. Gating the return value on `hasCredentials`
+          // (exactly like the production branch below) makes that `attempted: false` here too — the
+          // same honest "No DNS record was created." the UI already renders for that state — without
+          // touching anything about production's own (already-honest) behavior.
           sharedDevDnsClient ??= new FakeDnsClient();
           sharedDevDnsClient.setCredentials(hasCredentials ? { token: token!.trim(), zoneId: zoneId!.trim() } : null);
-          return sharedDevDnsClient;
+          return hasCredentials ? sharedDevDnsClient : null;
         }
 
         if (!hasCredentials) return null;

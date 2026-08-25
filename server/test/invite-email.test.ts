@@ -128,6 +128,31 @@ describe('POST /api/users/invite — email delivery', () => {
     await app.close();
   });
 
+  it('mail-timeout path (fix wave I2): still 201 with emailed:false + the copy link, well inside a short injected cap', async () => {
+    // A short `mailSendTimeoutMs` override (see app.ts's `deps.mailSendTimeoutMs`, threaded to
+    // `sendMail`'s `timeoutMs`) so this test proves the route answers promptly without waiting out
+    // the real ~12s `DEFAULT_MAIL_TIMEOUT_MS` cap — the actual bug (I2) was the invite route hanging
+    // for minutes against an unreachable SMTP host, since the send was awaited inline before
+    // responding with no timeout anywhere in the chain.
+    const { app, cookie } = await buildOwnerApp({ mailSendTimeoutMs: 30 });
+    await configureSmtpMail(app, cookie);
+    sendMailMock.mockImplementation(() => new Promise(() => {})); // never resolves
+
+    const start = Date.now();
+    const res = await app.inject({ method: 'POST', url: '/api/users/invite', headers: { cookie }, payload: { email: 'stalled@example.com', role: 'member' } });
+    expect(Date.now() - start).toBeLessThan(1000);
+
+    expect(res.statusCode).toBe(201);
+    const body = res.json() as InviteEmailResponse;
+    expect(body.emailed).toBe(false);
+    expect(body.emailError).toMatch(/timed out/);
+    // The copy-link fallback the spec promises is reachable: the response carries a valid invite URL
+    // even though the email itself never went out.
+    expect(body.inviteUrl).toBe(`/invite/${tokenFromInviteUrl(body.inviteUrl)}`);
+
+    await app.close();
+  });
+
   it('base_domain unset: still emails, with a relative-path note instead of a fabricated host', async () => {
     const { app, cookie } = await buildOwnerApp();
     await configureSmtpMail(app, cookie);

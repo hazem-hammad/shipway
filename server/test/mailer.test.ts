@@ -188,6 +188,33 @@ describe('sendMail', () => {
       error: 'connection refused',
     });
   });
+
+  describe('timeout (fix wave I2)', () => {
+    it('resolves {ok: false, error} within a short injected cap when the transport never resolves', async () => {
+      const fakeTransport: MailTransport = { sendMail: () => new Promise(() => {}) }; // never settles
+      const start = Date.now();
+
+      const result = await sendMail(SMTP_CFG, { to: 'dest@example.com', subject: 's', text: 't' }, () => fakeTransport, 30);
+
+      expect(Date.now() - start).toBeLessThan(1000);
+      expect(result.ok).toBe(false);
+      expect((result as { ok: false; error: string }).error).toMatch(/timed out/);
+    });
+
+    it('a transport that resolves comfortably inside the cap still succeeds', async () => {
+      const fakeTransport: MailTransport = { sendMail: vi.fn().mockResolvedValue({ messageId: 'abc' }) };
+
+      await expect(sendMail(SMTP_CFG, { to: 'dest@example.com', subject: 's', text: 't' }, () => fakeTransport, 30)).resolves.toEqual({ ok: true });
+    });
+
+    it('redacts the username from a timeout error too, same as any other failure', async () => {
+      const fakeTransport: MailTransport = { sendMail: () => new Promise(() => {}) };
+
+      const result = await sendMail(SMTP_CFG, { to: 'dest@example.com', subject: 's', text: 't' }, () => fakeTransport, 20);
+
+      expect((result as { ok: false; error: string }).error).not.toContain(SMTP_CFG.username);
+    });
+  });
 });
 
 describe('buildInviteEmail', () => {

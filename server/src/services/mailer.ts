@@ -128,13 +128,58 @@ export interface MailTransport {
 
 export type TransportFactory = (cfg: InstanceMailConfig) => MailTransport;
 
+/** Per-stage nodemailer socket timeouts (fix wave I2): with none configured, nodemailer's own
+ * defaults apply — a 2-minute connect timeout and a 10-minute socket timeout — so a send against an
+ * unreachable/blackholed SMTP host (wrong host/port, a firewall) hangs for minutes instead of
+ * failing promptly. 10s is generous for a real SMTP handshake on a reachable host while still
+ * keeping a caller's overall wait bounded (see `DEFAULT_MAIL_TIMEOUT_MS` below, which caps the
+ * total await regardless of what these do). */
+const SMTP_STAGE_TIMEOUT_MS = 10_000;
+
 const defaultTransportFactory: TransportFactory = (cfg) =>
   nodemailer.createTransport({
     host: cfg.host,
     port: cfg.port,
     secure: cfg.secure,
     auth: cfg.username ? { user: cfg.username, pass: cfg.password } : undefined,
+    connectionTimeout: SMTP_STAGE_TIMEOUT_MS,
+    greetingTimeout: SMTP_STAGE_TIMEOUT_MS,
+    socketTimeout: SMTP_STAGE_TIMEOUT_MS,
   });
+
+/** The overall cap `sendMail` bounds one `transport.sendMail(...)` call to (fix wave I2), regardless
+ * of what timeouts the transport itself does or doesn't enforce (a custom/injected `MailTransport`
+ * has no obligation to honor `SMTP_STAGE_TIMEOUT_MS` at all). Slightly above `SMTP_STAGE_TIMEOUT_MS`
+ * so a real nodemailer transport normally times out on its own first, with its own clearer error;
+ * this is the backstop that guarantees every caller (invite, test-send, notifybus) gets an answer
+ * within a bounded time no matter what the transport does. Exported so callers needing a fast,
+ * deterministic test (a transport that never resolves) can inject a much shorter cap instead of
+ * waiting out the real one. */
+export const DEFAULT_MAIL_TIMEOUT_MS = 12_000;
+
+/** Races `promise` against a timer, rejecting with a clear timeout error if `promise` hasn't settled
+ * within `timeoutMs`. The loser's timer/continuation is irrelevant once one side wins — `sendMail`'s
+ * caller (a route) has already moved on — so this makes no attempt to cancel `promise` itself, only
+ * to stop waiting on it. `unref()`s its timer so a still-pending send can never keep the process
+ * alive on its own. */
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`mail send timed out after ${String(timeoutMs)}ms`));
+    }, timeoutMs);
+    timer.unref?.();
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        clearTimeout(timer);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
+}
 
 function formatFrom(cfg: InstanceMailConfig): string {
   return cfg.fromName ? `"${cfg.fromName}" <${cfg.fromAddress}>` : cfg.fromAddress;
@@ -153,9 +198,15 @@ function redactUsername(message: string, username: string | undefined): string {
 }
 
 /**
- * Sends one email through `cfg`. NEVER throws — a `driver: 'none'` config or any transport/network
- * failure resolves `{ok: false, error}` instead, since a failed test-send or a failed best-effort
- * notification must never turn into an unhandled rejection or a 500. Never logs `cfg.password` or
+ * Sends one email through `cfg`. NEVER throws — a `driver: 'none'` config, a transport/network
+ * failure, OR the send simply taking too long all resolve `{ok: false, error}` instead, since a
+ * failed test-send or a failed best-effort notification must never turn into an unhandled rejection,
+ * a 500, or — the fix-wave I2 bug — a caller left hanging for minutes against an unreachable SMTP
+ * host. The overall await is capped at `timeoutMs` (`DEFAULT_MAIL_TIMEOUT_MS` unless a caller
+ * injects a shorter one, e.g. a test exercising the timeout path itself) via `withTimeout`, on top
+ * of whatever socket-level timeouts the transport itself enforces (see `SMTP_STAGE_TIMEOUT_MS` on
+ * `defaultTransportFactory`) — so even a transport that ignores those (any custom `MailTransport`,
+ * including a test double) can never block a caller past `timeoutMs`. Never logs `cfg.password` or
  * any other credential; the returned error message also never contains `cfg.username` (see
  * `redactUsername`). `transportFactory` defaults to a real nodemailer SMTP transport; tests inject
  * a fake one.
@@ -164,6 +215,7 @@ export async function sendMail(
   cfg: InstanceMailConfig,
   input: SendMailInput,
   transportFactory: TransportFactory = defaultTransportFactory,
+  timeoutMs: number = DEFAULT_MAIL_TIMEOUT_MS,
 ): Promise<SendMailResult> {
   if (!isMailConfigured(cfg)) {
     return { ok: false, error: 'instance mail is not configured' };
@@ -171,7 +223,10 @@ export async function sendMail(
 
   try {
     const transport = transportFactory(cfg);
-    await transport.sendMail({ from: formatFrom(cfg), to: input.to, subject: input.subject, text: input.text, html: input.html });
+    await withTimeout(
+      transport.sendMail({ from: formatFrom(cfg), to: input.to, subject: input.subject, text: input.text, html: input.html }),
+      timeoutMs,
+    );
     return { ok: true };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'failed to send mail';

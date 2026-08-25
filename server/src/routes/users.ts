@@ -87,7 +87,10 @@ async function emailInvite(app: FastifyInstance, log: FastifyBaseLogger, email: 
   try {
     const baseDomain = getSetting<string>(app.db, 'base_domain');
     const { subject, text, html } = buildInviteEmail({ token, baseDomain });
-    const result = await sendMail(cfg, { to: email, subject, text, html });
+    // `app.mailSendTimeoutMs` bounds this (fix wave I2), so a hanging SMTP host can never stall this
+    // response — the copy-link fallback the spec promises has to actually be reachable, which it
+    // isn't if the request itself never comes back.
+    const result = await sendMail(cfg, { to: email, subject, text, html }, undefined, app.mailSendTimeoutMs);
     if (result.ok) {
       return { emailed: true };
     }

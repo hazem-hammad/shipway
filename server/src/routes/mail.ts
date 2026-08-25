@@ -134,11 +134,16 @@ export async function mailRoutes(app: FastifyInstance): Promise<void> {
     const { to } = parsed.data;
 
     const cfg = getMailConfig(app.db, app.secretBox);
-    const result = await sendMail(cfg, {
-      to,
-      subject: 'Shipway test email',
-      text: 'This is a test email from Shipway. If you received this, your instance mail configuration is working.',
-    });
+    const result = await sendMail(
+      cfg,
+      {
+        to,
+        subject: 'Shipway test email',
+        text: 'This is a test email from Shipway. If you received this, your instance mail configuration is working.',
+      },
+      undefined,
+      app.mailSendTimeoutMs,
+    );
 
     // meta carries the destination address only (the admin's own test target) — never credentials.
     const actor = getActor(app.db, request.session.get('userId'));

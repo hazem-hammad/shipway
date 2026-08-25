@@ -251,7 +251,7 @@ export async function notificationRoutes(app: FastifyInstance, opts: { fetchImpl
         return { ok: false, error: 'channel has no target address configured' };
       }
       const cfg = getMailConfig(app.db, app.secretBox);
-      return sendMail(cfg, { to: channel.target, subject: 'Shipway test notification', text: 'Test notification from Shipway' });
+      return sendMail(cfg, { to: channel.target, subject: 'Shipway test notification', text: 'Test notification from Shipway' }, undefined, app.mailSendTimeoutMs);
     }
 
     // webhook/teams: unchanged HTTP-post path (Teams formatting is picked up automatically by
