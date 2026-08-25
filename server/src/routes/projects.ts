@@ -36,12 +36,14 @@ const NODE_VERSION_ENUM = z.enum(['18', '20', '22']);
 
 /**
  * Slugs Shipway's own vhosts/DNS records occupy (`setup/install.sh`'s `shipway-dashboard`/
- * `shipway-mailpit` vhosts, and the `deploy.`/`mail.` DNS `A` records it creates) — all of which
+ * `shipway-mailpit` vhosts, and the `ship.`/`mail.` DNS `A` records it creates) — all of which
  * pass `SLUG_RE` and would otherwise let a project silently clobber (or, on delete, tear down) part
- * of the tool itself. `www` and `api` are reserved too since they're the most likely accidental
- * collisions with a future Shipway-owned subdomain.
+ * of the tool itself. `deploy`, `www`, and `api` are reserved too: `deploy` was this same
+ * subdomain's name before the dashboard moved to `ship.<base-domain>`, kept reserved so an existing
+ * install's old bookmarks/links don't get silently repurposed by a new project, and `www`/`api` are
+ * the most likely accidental collisions with a future Shipway-owned subdomain.
  */
-export const RESERVED_SLUGS = ['dashboard', 'mailpit', 'deploy', 'mail', 'www', 'api'] as const;
+export const RESERVED_SLUGS = ['dashboard', 'mailpit', 'ship', 'deploy', 'mail', 'www', 'api'] as const;
 
 /** `publicDir` is a release-relative sub-path interpolated into the nginx vhost's `root` directive
  * (see `system/templates.ts`'s `renderNginxVhost`) — validated here so a value that could escape the

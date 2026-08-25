@@ -34,7 +34,9 @@ Cloudflare's dashboard "Edit zone DNS" template (My Profile > API Tokens > Creat
 
 The wildcard is what makes every future project's `<slug>.<base-domain>` resolve without a manual DNS step per project. The apex record isn't served by anything Shipway installs today, but the installer checks that both resolve correctly before touching the system and will ask you to confirm if they don't, so create both to avoid that prompt. Cloudflare's own DNS propagates in seconds to a couple of minutes; give it a minute after creating these before running the installer.
 
-Shipway creates two more records itself during install, under the same zone: `deploy.<base-domain>` (the dashboard) and `mail.<base-domain>` (the Mailpit web UI). You don't need to create those.
+Shipway creates two more records itself during install, under the same zone: `ship.<base-domain>` (the dashboard) and `mail.<base-domain>` (the Mailpit web UI). You don't need to create those.
+
+For this install specifically: base domain is `intcore.dev`, so the dashboard comes up at `ship.intcore.dev`, matching the subdomain already reserved for it.
 
 **An email address** for Let's Encrypt expiry/renewal notices (the ACME account email). Certbot's own timer renews the certificate automatically; this address only matters if renewal ever fails.
 
@@ -76,14 +78,14 @@ Typically **10 to 20 minutes**, mostly apt package installs and the Shipway buil
 7. Creates a `shipway_admin` MySQL user and Postgres role with random passwords.
 8. Builds Shipway itself into `/opt/shipway` and starts it as `shipway.service`.
 9. Renders the nginx vhosts for the dashboard and Mailpit's web UI, and reloads nginx.
-10. Creates the `deploy.` and `mail.` DNS `A` records at Cloudflare.
-11. Runs a postflight check: confirms shipway, nginx, mysql, postgresql, redis-server, and mailpit are all active, then polls `https://deploy.<base-domain>/api/health` (up to a minute) before printing a final summary with the dashboard URL, the Mailpit credentials, and where everything lives on disk.
+10. Creates the `ship.` and `mail.` DNS `A` records at Cloudflare.
+11. Runs a postflight check: confirms shipway, nginx, mysql, postgresql, redis-server, and mailpit are all active, then polls `https://ship.<base-domain>/api/health` (up to a minute) before printing a final summary with the dashboard URL, the Mailpit credentials, and where everything lives on disk.
 
 Re-running `install.sh` is safe: every step checks whether its work is already done before repeating it, generated passwords are cached in `/root/.shipway-install-secrets` so a re-run never rotates a credential something already depends on, and DNS records are looked up before being created so nothing gets duplicated.
 
 ## First-run setup wizard
 
-Open `https://deploy.<base-domain>`. Shipway walks you through four steps:
+Open `https://ship.<base-domain>`. Shipway walks you through four steps:
 
 **1. Admin account.** Name, email, password. This becomes the account owner. There's no separate registration page after this; the wizard only runs once, before any user exists.
 
@@ -91,7 +93,7 @@ Open `https://deploy.<base-domain>`. Shipway walks you through four steps:
 
 **3. Cloudflare.** Paste the same API token and this zone's ID (Cloudflare dashboard, right sidebar of the zone's overview page). The installer only used the token transiently to create its own two records and the certificate; Shipway needs it again, stored this time, to manage every new project's subdomain going forward. This step tests the connection live before letting you continue.
 
-**4. GitHub App.** Click through GitHub's App Manifest flow, a button here redirects to GitHub with a pre-filled manifest (`contents:read` + `metadata:read` permissions, the `push` webhook event, webhook URL already pointed at `https://deploy.<base-domain>/api/webhooks/github`). GitHub redirects back with a code Shipway exchanges automatically for the app ID, private key, and webhook secret. A manual paste-the-fields fallback is on the same page if you'd rather create the App yourself. This step can be skipped and configured later from Settings if you'd rather deploy your first project from a plain Git URL instead of GitHub.
+**4. GitHub App.** Click through GitHub's App Manifest flow, a button here redirects to GitHub with a pre-filled manifest (`contents:read` + `metadata:read` permissions, the `push` webhook event, webhook URL already pointed at `https://ship.<base-domain>/api/webhooks/github`). GitHub redirects back with a code Shipway exchanges automatically for the app ID, private key, and webhook secret. A manual paste-the-fields fallback is on the same page if you'd rather create the App yourself. This step can be skipped and configured later from Settings if you'd rather deploy your first project from a plain Git URL instead of GitHub.
 
 Once the App is created, go to GitHub and **install it** on your org (or just the specific repos you want Shipway to deploy) from the App's own "Install App" page. Come back to Shipway's GitHub settings and resolve the installation; from then on, **Projects > New** lists that installation's repositories.
 
