@@ -40,6 +40,18 @@ function promoteEarliestUserToOwner(db: ShipwayDb): void {
  * Opens (creating if necessary) the SQLite database at `dbPath`, applies
  * `PRAGMA journal_mode=WAL` and `PRAGMA foreign_keys=ON`, then runs any
  * pending migrations from `server/drizzle` before returning the typed db.
+ *
+ * FK enforcement is toggled OFF for the duration of `migrate()` itself (restored in a `finally`, so
+ * a failed migration can never leave it off for the rest of this process). Reason: drizzle's
+ * `migrate()` wraps every pending migration in one `BEGIN...COMMIT`, and SQLite silently NO-OPS a
+ * `PRAGMA foreign_keys=OFF/ON` issued INSIDE an already-open transaction — so a migration `.sql`
+ * file's own PRAGMA lines (e.g. 0002's table-rebuild dance: `DROP TABLE notification_channels` +
+ * recreate/rename) are purely decorative and do nothing. Without this, FK enforcement stays ON
+ * through the whole transaction, and a table-rebuild's `DROP TABLE` cascade-deletes every
+ * referencing row (`notification_subscriptions.channel_id ON DELETE CASCADE`) before the table is
+ * even recreated — silently destroying live data on any upgrade that hits such a migration. Toggling
+ * the pragma here, OUTSIDE the transaction `migrate()` opens, is the only place it actually takes
+ * effect.
  */
 export function openDb(dbPath: string): ShipwayDb {
   if (dbPath !== ':memory:') {
@@ -48,10 +60,14 @@ export function openDb(dbPath: string): ShipwayDb {
 
   const client = new Database(dbPath);
   client.pragma('journal_mode = WAL');
-  client.pragma('foreign_keys = ON');
 
   const db = drizzle({ client, schema });
-  migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+  client.pragma('foreign_keys = OFF');
+  try {
+    migrate(db, { migrationsFolder: MIGRATIONS_FOLDER });
+  } finally {
+    client.pragma('foreign_keys = ON');
+  }
   promoteEarliestUserToOwner(db);
 
   return db;

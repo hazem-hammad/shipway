@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sendDeployNotification, sendWebhookText } from '../src/services/notify.js';
+import { formatTeamsMessageCard, isTeamsWebhookUrl, sendDeployNotification, sendWebhookText, type TeamsMessageCard } from '../src/services/notify.js';
 
 interface RecordedCall {
   url: string;
@@ -115,5 +115,107 @@ describe('sendWebhookText', () => {
     const { fetchImpl } = fakeFetch(500);
 
     await expect(sendWebhookText(fetchImpl, 'https://hooks.slack.com/services/xxx', 'x')).rejects.toThrow();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Microsoft Teams (plan Task 4 / spec §3 "Delivery channels")
+// ---------------------------------------------------------------------------
+
+describe('isTeamsWebhookUrl', () => {
+  it('detects *.webhook.office.com URLs', () => {
+    expect(isTeamsWebhookUrl('https://acme.webhook.office.com/webhookb2/abc/IncomingWebhook/def')).toBe(true);
+  });
+
+  it('detects *.logic.azure.com URLs (the Power Automate/Logic Apps relay)', () => {
+    expect(isTeamsWebhookUrl('https://prod-01.westus.logic.azure.com:443/workflows/abc/triggers/manual/paths/invoke')).toBe(true);
+  });
+
+  it('does not flag Slack/Discord/Telegram/generic URLs', () => {
+    expect(isTeamsWebhookUrl('https://hooks.slack.com/services/xxx')).toBe(false);
+    expect(isTeamsWebhookUrl('https://discord.com/api/webhooks/123/abc')).toBe(false);
+    expect(isTeamsWebhookUrl('https://api.telegram.org/bot123/sendMessage')).toBe(false);
+    expect(isTeamsWebhookUrl('https://example.com/hook')).toBe(false);
+  });
+});
+
+describe('formatTeamsMessageCard', () => {
+  it('shapes the MessageCard schema with the given title/text and a themeColor by severity', () => {
+    const card = formatTeamsMessageCard({ title: 'Deploy failed', severity: 'failure' }, '[shop] deploy #12 build failed');
+    expect(card).toEqual<TeamsMessageCard>({
+      '@type': 'MessageCard',
+      '@context': 'https://schema.org/extensions',
+      themeColor: 'DC2626',
+      summary: 'Deploy failed',
+      title: 'Deploy failed',
+      text: '[shop] deploy #12 build failed',
+    });
+  });
+
+  it('uses a green themeColor for severity: success', () => {
+    expect(formatTeamsMessageCard({ title: 'Deploy succeeded', severity: 'success' }, 'ok').themeColor).toBe('16A34A');
+  });
+
+  it('uses a gray themeColor for severity: neutral, and defaults to neutral when severity is omitted', () => {
+    expect(formatTeamsMessageCard({ title: 'x', severity: 'neutral' }, 'y').themeColor).toBe('6B7280');
+    expect(formatTeamsMessageCard({ title: 'x' }, 'y').themeColor).toBe('6B7280');
+  });
+});
+
+describe('sendWebhookText — Teams auto-detection and explicit type', () => {
+  it('posts a MessageCard body to a webhook.office.com URL with no explicit opts (auto-detected)', async () => {
+    const { fetchImpl, calls } = fakeFetch();
+
+    await sendWebhookText(fetchImpl, 'https://acme.webhook.office.com/webhookb2/abc/IncomingWebhook/def', 'plain test text');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init?.method).toBe('POST');
+    const body = JSON.parse(calls[0]?.init?.body as string) as TeamsMessageCard;
+    expect(body['@type']).toBe('MessageCard');
+    expect(body['@context']).toBe('https://schema.org/extensions');
+    expect(body.text).toBe('plain test text');
+    expect(body.title).toBe('Shipway notification'); // default title when no context is supplied
+  });
+
+  it('posts a MessageCard body to a logic.azure.com URL, using the supplied context title/severity', async () => {
+    const { fetchImpl, calls } = fakeFetch();
+
+    await sendWebhookText(fetchImpl, 'https://prod.logic.azure.com/workflows/abc/triggers/manual', 'Nginx is failed', {
+      context: { title: 'Service down', severity: 'failure' },
+    });
+
+    const body = JSON.parse(calls[0]?.init?.body as string) as TeamsMessageCard;
+    expect(body).toEqual<TeamsMessageCard>({
+      '@type': 'MessageCard',
+      '@context': 'https://schema.org/extensions',
+      themeColor: 'DC2626',
+      summary: 'Service down',
+      title: 'Service down',
+      text: 'Nginx is failed',
+    });
+  });
+
+  it('forces Teams formatting via opts.forceTeams even when the URL does not match either Teams pattern (explicit type: teams)', async () => {
+    const { fetchImpl, calls } = fakeFetch();
+
+    await sendWebhookText(fetchImpl, 'https://relay.example.com/teams-in', 'hello', { forceTeams: true, context: { title: 'Test', severity: 'neutral' } });
+
+    const body = JSON.parse(calls[0]?.init?.body as string) as TeamsMessageCard;
+    expect(body['@type']).toBe('MessageCard');
+  });
+
+  it('does NOT use Teams formatting for a plain webhook URL even when forceTeams is false/omitted', async () => {
+    const { fetchImpl, calls } = fakeFetch();
+
+    await sendWebhookText(fetchImpl, 'https://hooks.slack.com/services/xxx', 'hello');
+
+    const body = JSON.parse(calls[0]?.init?.body as string) as unknown;
+    expect(body).toEqual({ text: 'hello' });
+  });
+
+  it('a webhook.office.com URL still throws on a non-ok response, same as every other format', async () => {
+    const { fetchImpl } = fakeFetch(500);
+
+    await expect(sendWebhookText(fetchImpl, 'https://acme.webhook.office.com/webhookb2/abc', 'x')).rejects.toThrow();
   });
 });

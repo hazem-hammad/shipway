@@ -253,6 +253,37 @@ class FailingUnitActionSysOps extends DevSysOps {
   }
 }
 
+/**
+ * Simulates a *genuine* restart failure (a broken unit in the new release — nothing to do with
+ * cancellation) that happens to coincide with a user clicking Cancel at that exact moment: the
+ * first `restart` call both aborts `controller` (as if the click landed right then) AND throws an
+ * unrelated error. Every subsequent `restart` call (i.e. the rollback's own restart, back to the
+ * previous — presumably working — release) succeeds normally, so a caller can tell whether the
+ * rollback attempt actually ran to completion.
+ */
+class AbortOnFirstRestartSysOps extends DevSysOps {
+  private restartCalls = 0;
+
+  constructor(
+    root: string,
+    private readonly controller: AbortController,
+  ) {
+    super(root);
+  }
+
+  override async unitAction(action: UnitAction, unit: string, signal?: AbortSignal): Promise<void> {
+    if (action === 'restart') {
+      this.restartCalls += 1;
+      if (this.restartCalls === 1) {
+        this.calls.push(`unitAction ${action} ${unit} (FAILS, coincidental abort)`);
+        this.controller.abort();
+        throw new Error(`systemctl ${action} ${unit}: unit failed to start (Result: exit-code)`);
+      }
+    }
+    return super.unitAction(action, unit, signal);
+  }
+}
+
 function currentPath(cfg: Config, slug: string): string {
   return path.join(cfg.appsDir, slug, 'current');
 }
@@ -580,6 +611,233 @@ describe('runDeploy — cancel', () => {
     // current was never touched — activate never ran
     expect(readCurrentTarget(cfg, 'cancel-before-activate')).toBeNull();
     expect(sysops.calls).toEqual([]);
+    expect(notifications).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 2: cancellation reaches every previously-unabortable await (root cause fix)
+// ---------------------------------------------------------------------------
+
+describe('runDeploy — cancel during git resolve (root cause: GitOps never got the signal)', () => {
+  it('a gitOps.fetchBranchTip that only settles on abort returns canceled promptly, not after a long hang', async () => {
+    const controller = new AbortController();
+    // Simulates a slow/unreachable remote: never settles on its own — only the signal it was given
+    // unsticks it, exactly like the fixed real `GitOps` (see git.ts). If the pipeline still failed
+    // to thread `signal` through to this call, this promise — and the test — would hang forever.
+    const hangingGitOps: GitOps = {
+      fetchBranchTip: (_projectDir, _url, _branch, signal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () => {
+              reject(new Error('git operation canceled'));
+            },
+            { once: true },
+          );
+        }),
+      exportRelease: () => Promise.reject(new Error('exportRelease must not be called — resolve never got past fetchBranchTip')),
+    };
+
+    const { db, notifications, logger, deps } = makeHarness({ gitOps: hangingGitOps });
+    const projectId = insertProject(db, { slug: 'slow-remote', type: 'static' });
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    setTimeout(() => {
+      controller.abort();
+    }, 30);
+
+    const start = Date.now();
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('canceled');
+    expect(elapsed).toBeLessThan(1000);
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
+  });
+});
+
+describe('runDeploy — cancel during the health-check retry sleep', () => {
+  it('returns canceled fast instead of waiting out the 5x3s retry budget', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const controller = new AbortController();
+
+    // A "real" abortable sleep (mirrors app.ts's production `PipelineDeps.sleep` wiring) — the
+    // harness's default `noopSleep` resolves instantly regardless of its signal, which would make
+    // this test pass trivially without actually exercising the new abort-aware sleep behavior.
+    const realishSleep = (ms: number, signal?: AbortSignal): Promise<void> =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+
+    // The health check's first fetch always fails (so the loop is headed into a 3s retry sleep)
+    // and, the instant it's actually called — i.e. once the pipeline has genuinely reached the
+    // health stage, whatever the real timing of resolve/export/activate/restart turned out to be —
+    // schedules the cancel, so the abort lands squarely inside the retry sleep.
+    const failThenCancel = async (): Promise<{ status: number }> => {
+      setTimeout(() => {
+        controller.abort();
+      }, 0);
+      return { status: 500 };
+    };
+
+    const { db, notifications, logger, deps } = makeHarness({ fetchHttp: failThenCancel });
+    deps.sleep = realishSleep;
+
+    const projectId = insertProject(db, { slug: 'health-cancel', type: 'static', healthCheckPath: '/health' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    const start = Date.now();
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('canceled');
+    expect(elapsed).toBeLessThan(2000);
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
+  }, 10000);
+});
+
+describe('runDeploy — waitForPort bails on abort', () => {
+  it('a node project relying on the default TCP-poll waitForPort cancels fast, not after its 15s timeout', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const controller = new AbortController();
+    const { db, notifications, logger, deps } = makeHarness();
+    deps.waitForPort = undefined; // exercise the pipeline's real `defaultWaitForPort`, not the harness stub
+
+    logger.on('line', (l: string) => {
+      if (l.includes('==> health')) {
+        // Deferred a tick so the `checkAborted` right after this section header still sees an
+        // un-aborted signal — the point is to cancel *during* the port poll, not before the
+        // pipeline ever reaches it.
+        setTimeout(() => {
+          controller.abort();
+        }, 0);
+      }
+    });
+
+    const projectId = insertProject(db, { slug: 'wait-for-port-cancel', type: 'node', nodeVersion: '22', port: 58211 });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    const start = Date.now();
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe('canceled');
+    expect(elapsed).toBeLessThan(2000);
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
+    expect(notifications).toHaveLength(0);
+  }, 10000);
+});
+
+describe('runDeploy — cancel-requested log line', () => {
+  it('writes a "==> cancel requested" section to the live log the moment the signal aborts', async () => {
+    const { db, logger, deps } = makeHarness();
+
+    // A rollback deploy whose releasePath doesn't exist on disk fails fast, pre-activate — plenty
+    // for this test, which only cares about the log line a pre-aborted signal produces, not which
+    // stage it lands in.
+    const projectId = insertProject(db, { slug: 'cancel-log', type: 'static' });
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'rollback', releasePath: '/nonexistent' });
+
+    const lines: string[] = [];
+    logger.on('line', (l: string) => lines.push(l));
+
+    const controller = new AbortController();
+    controller.abort();
+
+    await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    expect(lines.some((l) => l.includes('==> cancel requested'))).toBe(true);
+    expect(lines.some((l) => l.includes('stopping after the current step'))).toBe(true);
+  });
+});
+
+describe('runDeploy — post-activate cancel classification is by cause, not coincidence', () => {
+  it('a genuine restart failure that coincides with a cancel click is reported failed (not canceled), notifies deploy_failed, and still rolls back', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const controller = new AbortController();
+
+    const { cfg, db, notifications, logger, deps } = makeHarness({
+      sysopsFactory: (cfg) => new AbortOnFirstRestartSysOps(sysopsRoot(cfg), controller),
+    });
+
+    const projectId = insertProject(db, { slug: 'coincidental-cancel', type: 'node', nodeVersion: '22', port: 3098 });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+
+    const prevReleaseDir = path.join(cfg.appsDir, 'coincidental-cancel', 'releases', 'prev-release');
+    fs.mkdirSync(prevReleaseDir, { recursive: true });
+    fs.mkdirSync(path.dirname(currentPath(cfg, 'coincidental-cancel')), { recursive: true });
+    fs.symlinkSync(prevReleaseDir, currentPath(cfg, 'coincidental-cancel'));
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    // The restart's own failure is unrelated to the cancel — must be `failed`, never `canceled`,
+    // even though `signal.aborted` is `true` by the time the outer catch runs.
+    expect(result).toBe('failed');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('failed');
+
+    // Rolled back to the previous release — the rollback's own restart call (the SECOND `restart`,
+    // which the stub lets succeed) actually ran, proving cancellation didn't short-circuit it.
+    expect(readCurrentTarget(cfg, 'coincidental-cancel')).toBe(prevReleaseDir);
+
+    // The real (non-cancellation) failure path: notified as `failed` with `rolledBack: true`, not
+    // silently swallowed the way every other cancellation path swallows notify entirely.
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.status).toBe('failed');
+    expect(notifications[0]?.rolledBack).toBe(true);
+    expect(notifications[0]?.message).toContain('unit failed to start');
+  });
+
+  it('an abort that genuinely interrupts the restart (no independent failure) is still reported canceled', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, notifications, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'genuine-restart-cancel', type: 'static' });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'push' });
+
+    // static projects skip restartRuntime entirely, so drive the abort at the 'restart' stage
+    // boundary itself (checkAborted) — still exercises the same `err instanceof AbortedError`
+    // classification path in runPostActivate's catch, just via the stage-boundary check rather
+    // than a genuinely-interrupted sysops call.
+    const controller = new AbortController();
+    logger.on('line', (l: string) => {
+      if (l.includes('==> restart')) {
+        controller.abort();
+      }
+    });
+
+    const result = await runDeploy(deps, deploymentId, logger, controller.signal);
+
+    expect(result).toBe('canceled');
+    const row = getDeploymentRow(db, deploymentId);
+    expect(row.status).toBe('canceled');
     expect(notifications).toHaveLength(0);
   });
 });

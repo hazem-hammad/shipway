@@ -22,6 +22,16 @@ export interface DnsClient {
 
 const CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4';
 
+/**
+ * True when a stored Cloudflare credential (`cloudflare_token`/`cloudflare_zone_id`) is missing,
+ * empty, or whitespace-only. Shared by `app.ts`'s `dns()` getter and `routes/cloudflare.ts`'s
+ * verify route so "is Cloudflare configured" is judged identically everywhere instead of two
+ * truthiness checks silently drifting apart (plan Task 1 / spec §3 "Cloudflare verify").
+ */
+export function isBlankCredential(value: string | null | undefined): boolean {
+  return value == null || value.trim() === '';
+}
+
 interface CloudflareError {
   code: number;
   message: string;
@@ -119,15 +129,39 @@ export function makeCloudflareClient(token: string, zoneId: string, fetchImpl: t
  * In-memory `DnsClient` double for tests and dev mode. `records` (fqdn ->
  * ip) is public so tests can assert on it directly; ids are deterministic
  * (`fake-<n>`), assigned in creation order and never reused.
+ *
+ * `createARecord`/`findARecord`/`deleteARecord` stay fully in-memory unconditionally, so dev-mode
+ * project provisioning keeps working fully offline regardless of whether real Cloudflare
+ * credentials are configured. `verifyToken()` is the one exception (plan Task 1 / spec §3
+ * "Cloudflare verify"): dev mode must not fake success just because it's dev mode. It reads
+ * whatever credentials `setCredentials()` was last called with (the `dns()` getter in `app.ts`
+ * calls it fresh on every request from the current stored settings) — with none set it resolves
+ * `false`, and with credentials set it delegates to a REAL `CloudflareDnsClient` for an honest
+ * network round-trip, so a wrong/placeholder token pasted in dev mode fails exactly like it would
+ * in production instead of always reporting "Connected".
  */
 export class FakeDnsClient implements DnsClient {
   readonly records = new Map<string, string>();
 
   private readonly ids = new Map<string, string>();
   private nextId = 1;
+  private credentials: { token: string; zoneId: string } | null = null;
+
+  /**
+   * `fetchImpl` is an injection point for tests (mirrors `makeCloudflareClient`'s own parameter),
+   * so `verifyToken()`'s real API call can be exercised with a stub instead of the network.
+   * Production (dev-mode `app.ts`) omits it and gets the real global `fetch`.
+   */
+  constructor(private readonly fetchImpl: typeof fetch = fetch) {}
+
+  /** Sets (or clears, via `null`) the credentials `verifyToken()` uses — see the class doc comment. */
+  setCredentials(credentials: { token: string; zoneId: string } | null): void {
+    this.credentials = credentials;
+  }
 
   async verifyToken(): Promise<boolean> {
-    return true;
+    if (!this.credentials) return false;
+    return makeCloudflareClient(this.credentials.token, this.credentials.zoneId, this.fetchImpl).verifyToken();
   }
 
   async createARecord(fqdn: string, ip: string): Promise<string> {

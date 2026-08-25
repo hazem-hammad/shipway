@@ -119,11 +119,14 @@ function InviteCard() {
       <div className="mt-5">
         {result ? (
           <div className="max-w-[560px]">
-            <p className="text-sm text-ink">Invite sent to {result.email}.</p>
+            <p className="text-sm text-ink">{result.emailed ? `Invite emailed to ${result.email}.` : `Invite sent to ${result.email}.`}</p>
             <div className="mt-2">
               <CopyLinkRow inviteUrl={result.inviteUrl} />
             </div>
             <p className="mt-2 text-[13px] text-soft">Share this link. It expires in 7 days.</p>
+            <div className="mt-2">
+              <InviteEmailHint result={result} />
+            </div>
             <div className="mt-4">
               <Button variant="outline" onClick={reset}>
                 Invite another
@@ -243,6 +246,36 @@ function CopyLinkRow({ inviteUrl }: { inviteUrl: string }) {
   );
 }
 
+/**
+ * Task 7's second line under an invite/reinvite result: nothing when the email actually went out
+ * (the headline above already says "Invite emailed to <address>"), a subtle hint pointing at
+ * Settings > Mail when instance mail simply isn't configured (`emailed: false` with no
+ * `emailError`), or the sanitized failure in a danger-toned line when a send was attempted and
+ * failed (`emailError` present). The copy-link panel above this is unaffected either way — email is
+ * additive, never the only path to the invite.
+ */
+function InviteEmailHint({ result }: { result: InviteResult }) {
+  if (result.emailed) return null;
+
+  if (result.emailError) {
+    return (
+      <p role="alert" className="text-sm text-danger">
+        Could not email the invite: {result.emailError}
+      </p>
+    );
+  }
+
+  return (
+    <p className="text-[13px] text-soft">
+      Set up mail to send invites automatically. See{' '}
+      <a href="/settings/mail" className="font-medium text-ink underline underline-offset-2">
+        Settings &gt; Mail
+      </a>
+      .
+    </p>
+  );
+}
+
 function PendingInviteRow({ user, canManage }: { user: User; canManage: boolean }) {
   const queryClient = useQueryClient();
   const [regenerated, setRegenerated] = useState<InviteResult | null>(null);
@@ -305,8 +338,12 @@ function PendingInviteRow({ user, canManage }: { user: User; canManage: boolean 
 
       {regenerated && (
         <div className="mb-3 max-w-[560px] rounded-xl bg-surface-2 p-3">
+          {regenerated.emailed && <p className="mb-2 text-sm text-ink">Invite emailed to {regenerated.email}.</p>}
           <CopyLinkRow inviteUrl={regenerated.inviteUrl} />
           <p className="mt-2 text-[13px] text-soft">Share this link. It expires in 7 days.</p>
+          <div className="mt-2">
+            <InviteEmailHint result={regenerated} />
+          </div>
         </div>
       )}
 

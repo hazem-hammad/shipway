@@ -23,6 +23,7 @@ import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
 import { deploymentRoutes } from './routes/deployments.js';
 import { githubRoutes } from './routes/github.js';
+import { mailRoutes } from './routes/mail.js';
 import { notificationRoutes } from './routes/notifications.js';
 import { overviewRoutes } from './routes/overview.js';
 import { projectRoutes } from './routes/projects.js';
@@ -32,11 +33,12 @@ import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { workerRoutes } from './routes/workers.js';
 import { recordAudit, runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle } from './services/audit.js';
-import { FakeDnsClient, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
+import { FakeDnsClient, isBlankCredential, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
 import { makeGitOps } from './services/git.js';
 import { GitHubService, resolveCloneUrl, type GithubAppConfig } from './services/github.js';
+import { DEFAULT_MAIL_TIMEOUT_MS } from './services/mailer.js';
 import { startServiceWatch, type ServiceWatchHandle } from './services/servicewatch.js';
 import { makeSysOps, type SysOps } from './sysops/index.js';
 
@@ -57,10 +59,19 @@ declare module 'fastify' {
     /**
      * Lazily builds a `DnsClient` from the current `cloudflare_token`/`cloudflare_zone_id`
      * settings, or `null` when unconfigured. In dev mode, always returns a shared in-process
-     * `FakeDnsClient` so provisioning works offline. Called fresh per use so routes always see the
-     * latest stored credentials.
+     * `FakeDnsClient` (never `null`) so record provisioning works offline regardless of whether
+     * real credentials are configured — but its `setCredentials()` is refreshed from the current
+     * settings on every call, so its `verifyToken()` stays honest (plan Task 1 / spec §3
+     * "Cloudflare verify") rather than always reporting success. Called fresh per use so routes
+     * always see the latest stored credentials.
      */
     dns: () => DnsClient | null;
+    /** The overall cap (ms) every route's direct `sendMail(...)` call site (invite, mail test-send,
+     * notification-channel test-send) passes as `sendMail`'s `timeoutMs` (fix wave I2) — defaults to
+     * `services/mailer.ts`'s `DEFAULT_MAIL_TIMEOUT_MS`, overridable per-app via `deps.mailSendTimeoutMs`
+     * so a test can prove a hanging SMTP host doesn't stall a response without waiting out the real
+     * cap. */
+    mailSendTimeoutMs: number;
     /** Schedules and tracks deploy/rollback jobs; wired to `runDeploy` in `buildApp`. */
     queue: DeployQueue;
     /** Provisions/deprovisions MySQL/Postgres databases; backed by `mysql_admin_url`/`postgres_admin_url` settings. */
@@ -194,6 +205,10 @@ export async function buildApp(
     sysops?: SysOps;
     /** Test-only override: skips the default lazy `dns()` in favor of an injected function. */
     dns?: () => DnsClient | null;
+    /** Test-only override for `app.mailSendTimeoutMs` (fix wave I2) — a short cap lets a test prove
+     * an invite/test-send route still answers promptly against a hanging mail transport, instead of
+     * waiting out the real `DEFAULT_MAIL_TIMEOUT_MS`. In production this is never passed. */
+    mailSendTimeoutMs?: number;
     /** Test-only override: replaces the real `runDeploy`-backed queue `run` with a fake. */
     queueRun?: DeployQueueDeps['run'];
     /** Test-only override: replaces the real mysql2/pg-backed `DbAdmin` with a fake (e.g. one that
@@ -248,6 +263,7 @@ export async function buildApp(
   });
   app.decorate('sysops', deps.sysops ?? makeSysOps(cfg));
   app.decorate('secretBox', SecretBox.load(cfg.secretKeyPath));
+  app.decorate('mailSendTimeoutMs', deps.mailSendTimeoutMs ?? DEFAULT_MAIL_TIMEOUT_MS);
   app.decorate(
     'dbAdmin',
     deps.dbAdmin ??
@@ -260,14 +276,31 @@ export async function buildApp(
     'dns',
     deps.dns ??
       ((): DnsClient | null => {
-        if (cfg.devMode) {
-          sharedDevDnsClient ??= new FakeDnsClient();
-          return sharedDevDnsClient;
-        }
         const token = getSetting<string>(app.db, 'cloudflare_token');
         const zoneId = getSetting<string>(app.db, 'cloudflare_zone_id');
-        if (!token || !zoneId) return null;
-        return makeCloudflareClient(token, zoneId);
+        const hasCredentials = !isBlankCredential(token) && !isBlankCredential(zoneId);
+
+        if (cfg.devMode) {
+          // Record provisioning (create/find/delete) stays fully in-memory/offline once credentials
+          // ARE configured (FakeDnsClient's own doc comment) — verifyToken() reflects real configured
+          // state, refreshed here on every call so "Test connection" in dev mode is never a lie
+          // (see routes/cloudflare.ts and the root-cause note in the v3 design spec §2). The shared
+          // instance itself is built unconditionally (its in-memory records need to persist across
+          // calls once credentials do show up), but is only ever HANDED to a caller when credentials
+          // are actually configured — fix wave M1: `resolveDnsOutcome`/`provisionProject` previously
+          // always got a non-null client here, so the New Project Domain card could show a green "DNS
+          // record created." for a write to this in-memory map in the very same session where the
+          // card itself said Cloudflare wasn't connected. Gating the return value on `hasCredentials`
+          // (exactly like the production branch below) makes that `attempted: false` here too — the
+          // same honest "No DNS record was created." the UI already renders for that state — without
+          // touching anything about production's own (already-honest) behavior.
+          sharedDevDnsClient ??= new FakeDnsClient();
+          sharedDevDnsClient.setCredentials(hasCredentials ? { token: token!.trim(), zoneId: zoneId!.trim() } : null);
+          return hasCredentials ? sharedDevDnsClient : null;
+        }
+
+        if (!hasCredentials) return null;
+        return makeCloudflareClient(token!.trim(), zoneId!.trim());
       }),
   );
 
@@ -293,7 +326,7 @@ export async function buildApp(
     message: string;
     rolledBack?: boolean;
   }): Promise<void> {
-    await notifyDeployTerminal(app.db, fetchImpl, p);
+    await notifyDeployTerminal(app.db, fetchImpl, p, app.secretBox);
   }
 
   const pipelineDeps: PipelineDeps = {
@@ -304,9 +337,24 @@ export async function buildApp(
     secretBox: app.secretBox,
     getCloneUrl,
     runShell: makeRunShell(),
-    fetchHttp: async (url) => ({ status: (await fetchImpl(url)).status }),
+    fetchHttp: async (url, signal) => ({ status: (await fetchImpl(url, { signal })).status }),
     notify,
-    sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    sleep: (ms, signal) =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve();
+          return;
+        }
+        const timer = setTimeout(resolve, ms);
+        signal?.addEventListener(
+          'abort',
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      }),
   };
 
   app.decorate(
@@ -324,7 +372,7 @@ export async function buildApp(
           // bus needs a separate emission for, driven off `runDeploy`'s own return value instead.
           if (result === 'canceled') {
             try {
-              await notifyDeployCanceled(app.db, fetchImpl, deploymentId);
+              await notifyDeployCanceled(app.db, fetchImpl, deploymentId, app.secretBox);
             } catch (err) {
               app.log.error({ err }, 'notifyDeployCanceled failed');
             }
@@ -383,6 +431,7 @@ export async function buildApp(
   await app.register(userRoutes);
   await app.register(settingsRoutes);
   await app.register(cloudflareRoutes);
+  await app.register(mailRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);
@@ -443,6 +492,7 @@ export async function buildApp(
           sysops: app.sysops,
           intervalMs: deps.serviceWatch?.intervalMs ?? SERVICE_WATCH_INTERVAL_MS,
           fetchImpl: deps.serviceWatch?.fetchImpl ?? fetchImpl,
+          secretBox: app.secretBox,
         })
       : undefined,
   );

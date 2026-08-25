@@ -5,7 +5,14 @@ import { deployments, projects } from '../db/schema.js';
 import { buildEnvFile, buildManagedVars, type SmtpConfig } from '../deploy/envfile.js';
 import { requireRole } from '../lib/authz.js';
 import { getActor, recordAudit } from '../services/audit.js';
-import { ProvisionError, deprovisionProject, provisionProject, refreshProjectConfig, type ProvisionDeps } from '../services/provisioner.js';
+import {
+  ProvisionError,
+  deprovisionProject,
+  provisionProject,
+  refreshProjectConfig,
+  type DnsOutcome,
+  type ProvisionDeps,
+} from '../services/provisioner.js';
 import { allocatePort } from '../system/ports.js';
 import { SLUG_RE, isValidPublicDir } from '../system/templates.js';
 
@@ -279,8 +286,9 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(500).send({ error: 'failed to create project' });
     }
 
+    let dnsOutcome: DnsOutcome;
     try {
-      await provisionProject(deps(), created.id);
+      dnsOutcome = await provisionProject(deps(), created.id);
     } catch (err) {
       // Provisioning can fail partway through (e.g. after the DNS record and vhost are already
       // live, but before the app unit installs) — deprovisionProject tears down whatever got as far
@@ -294,7 +302,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const actor = getActor(app.db, request.session.get('userId'));
     recordAudit(app.db, { ...actor, action: 'project.create', targetType: 'project', targetName: created.slug, meta: { type: created.type } });
 
-    return reply.code(201).send(toPublicProject(created));
+    // `dns` surfaces the DNS-step outcome (plan Task 5 / spec §3 "New Project DNS") so the UI can
+    // show whether a record was created, already existed, or was skipped entirely — a DNS failure
+    // still throws above (502) exactly as before, so this field is only ever present on a 201.
+    return reply.code(201).send({ ...toPublicProject(created), dns: dnsOutcome });
   });
 
   app.get('/api/projects/:id', async (request, reply) => {

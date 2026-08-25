@@ -8,9 +8,11 @@
  * on cancellation via `opts.signal` (wired to execa's `cancelSignal`, which sends `SIGTERM`).
  * `killDescendants: true` spawns the process in its own process group and kills the whole group on
  * termination, so an aborted `bash -c "some && pipeline"` can't leave orphaned children running.
- * Since a signal-killed process reports `exitCode: undefined` (no numeric exit code — see execa's
- * `ExecaResult` type), that case is mapped to a synthetic non-zero code so callers always get a
- * number, matching `PipelineDeps['runShell']`'s `{exitCode: number}` return type.
+ * `forceKillAfterDelay: 5000` escalates to `SIGKILL` if the group hasn't exited 5s after that
+ * `SIGTERM` — a script that traps/ignores `SIGTERM` (or a wedged child) no longer hangs a cancel
+ * indefinitely. Since a signal-killed process reports `exitCode: undefined` (no numeric exit code —
+ * see execa's `ExecaResult` type), that case is mapped to a synthetic non-zero code so callers
+ * always get a number, matching `PipelineDeps['runShell']`'s `{exitCode: number}` return type.
  */
 import { execa } from 'execa';
 
@@ -42,6 +44,7 @@ export function makeRunShell(): RunShell {
       all: true,
       reject: false,
       killDescendants: true,
+      forceKillAfterDelay: 5000,
     });
 
     subprocess.all?.on('data', onChunk);

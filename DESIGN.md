@@ -81,7 +81,7 @@ Label 13.5px/500 above; input 44px, `rounded-xl`, border `--border`, bg `--surfa
 Prefer borderless rows separated by `--border` hairlines inside a card; row hover `--surface-2`; 56px row height; first cell often icon chip + name; right-aligned meta (relative time, chevron `ArrowRight` ghosted).
 
 ### Badges/chips
-Pill `rounded-full`, 12.5px/500: neutral (`--surface-2` + `--text-soft`, e.g. "Private", "Org"), success tint (`--ok-tint`, e.g. "Connected", "Used for deploys"). Language dots: 8px colored dot + label (`TypeScript` #3178C6, `PHP` #777BB4, `Dart` #0175C2, `JavaScript` #F1E05A, `Nunjucks`/other #8E8E93).
+Pill `rounded-full`, 12.5px/500: neutral (`--surface-2` + `--text-soft`, e.g. "Private", "Org"), success tint (`--ok-tint`, e.g. "Connected", "Used for deploys"), danger tint (`--danger` at 10% opacity bg + `--danger` text, e.g. "Cloudflare error" on New Project's Domain card, or Cloudflare settings' "Cloudflare rejected this token" state) for a failed/error status that deserves the same pill treatment as a success one rather than falling back to plain alert text. Language dots: 8px colored dot + label (`TypeScript` #3178C6, `PHP` #777BB4, `Dart` #0175C2, `JavaScript` #F1E05A, `Nunjucks`/other #8E8E93).
 
 ### Status dots
 Plain 8px dots (no glow): ok `--ok`, running/queued `--warn` (subtle 1.6s opacity pulse, reduced-motion respected), failed `--danger`, idle `--border`-gray. "Operational"/"Degraded" text in matching color.

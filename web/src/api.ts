@@ -96,8 +96,18 @@ export interface SettingsUpdate {
   notify_on_success?: boolean;
 }
 
+/**
+ * `GET /api/cloudflare/verify`'s response shape (plan Task 1 / spec §3 "Cloudflare verify"). `ok`
+ * is `true` only after a real, successful Cloudflare API round-trip — never inferred from
+ * credentials merely being present. `reason` always says why: `'not_configured'` when no usable
+ * token/zone id is stored, `'invalid_token'` when Cloudflare rejected the token,
+ * `'error'` for anything else (with a sanitized `message`, never the token itself), and `'ok'` on
+ * success.
+ */
 export interface CloudflareVerifyResult {
   ok: boolean;
+  reason: 'ok' | 'not_configured' | 'invalid_token' | 'error';
+  message?: string;
 }
 
 export interface GithubManifest {
@@ -145,6 +155,51 @@ export function putSettings(body: SettingsUpdate): Promise<Settings> {
 
 export function verifyCloudflare(): Promise<CloudflareVerifyResult> {
   return apiFetch<CloudflareVerifyResult>('/api/cloudflare/verify');
+}
+
+// ---- Instance mail ----
+
+/** The SMTP settings Shipway itself uses for invites/notifications (`server/src/services/mailer.ts`,
+ * plan Task 3) — entirely separate from a project's own SMTP tab (`putProjectSmtp` below). */
+export type MailDriver = 'none' | 'mailpit' | 'smtp';
+
+export interface MailConfig {
+  driver: MailDriver;
+  host: string;
+  port: number;
+  secure: boolean;
+  /** Masked as "•••1234" when a password is set, `null` otherwise — same convention as
+   * `Settings.cloudflare_token`. */
+  username: string | null;
+  password: string | null;
+  fromAddress: string;
+  fromName: string | null;
+  /** `false` only for `driver: 'none'`. */
+  configured: boolean;
+}
+
+export interface MailConfigUpdate {
+  driver: MailDriver;
+  host?: string;
+  port?: number;
+  secure?: boolean;
+  username?: string;
+  /** Omit to keep the current password; a masked echo also keeps it; `''` clears it. */
+  password?: string;
+  fromAddress?: string;
+  fromName?: string;
+}
+
+export function fetchMailConfig(): Promise<MailConfig> {
+  return apiFetch<MailConfig>('/api/settings/mail');
+}
+
+export function putMailConfig(body: MailConfigUpdate): Promise<MailConfig> {
+  return apiFetch<MailConfig>('/api/settings/mail', { method: 'PUT', body });
+}
+
+export function testMailConfig(to: string): Promise<{ ok: boolean; error?: string }> {
+  return apiFetch<{ ok: boolean; error?: string }>('/api/settings/mail/test', { method: 'POST', body: { to } });
 }
 
 // ---- GitHub App ----
@@ -237,12 +292,30 @@ export interface CreateProjectBody {
   autoDeploy?: boolean;
 }
 
+/**
+ * What happened during a project's DNS step (`server/src/services/provisioner.ts`'s
+ * `resolveDnsOutcome`, plan Task 5 / spec §3 "New Project DNS"): `attempted` is `false` only when
+ * no DNS client was configured at all (the step was skipped entirely); otherwise exactly one of
+ * `created`/`existed` is `true`. A DNS failure never reaches this shape — it fails project creation
+ * outright (502) instead, so `dns` is only ever present on a successful 201.
+ */
+export interface DnsOutcome {
+  attempted: boolean;
+  created: boolean;
+  existed: boolean;
+  error?: string;
+}
+
+export interface CreateProjectResponse extends Project {
+  dns: DnsOutcome;
+}
+
 export function fetchProjects(): Promise<ProjectListItem[]> {
   return apiFetch<ProjectListItem[]>('/api/projects');
 }
 
-export function createProject(body: CreateProjectBody): Promise<Project> {
-  return apiFetch<Project>('/api/projects', { method: 'POST', body });
+export function createProject(body: CreateProjectBody): Promise<CreateProjectResponse> {
+  return apiFetch<CreateProjectResponse>('/api/projects', { method: 'POST', body });
 }
 
 export function fetchProject(id: number): Promise<Project> {
@@ -323,6 +396,10 @@ export interface Deployment {
   logPath: string | null;
   startedAt: number | null;
   finishedAt: number | null;
+  /** `true` only while the deploy is actually running and a cancel has already been requested for
+   * it but hasn't taken effect yet (in-memory queue state) — always `false` once terminal. Drives
+   * the "Canceling…" hint alongside the optimistic local state set the moment Cancel is clicked. */
+  cancelRequested: boolean;
 }
 
 /** `GET /api/projects/:id/deployments` — newest first, capped at 50 server-side. */
@@ -610,13 +687,19 @@ export interface InviteUserBody {
 
 /** Shared response shape for both `POST /api/users/invite` and `POST /api/users/:id/reinvite` —
  * `inviteUrl` (`/invite/<token>`) is the only place the token is ever returned; it can't be
- * retrieved again later, only regenerated via reinvite. */
+ * retrieved again later, only regenerated via reinvite. `emailed` (Task 7) reports whether the
+ * invite link was also sent by email through instance mail: `false` with no `emailError` means mail
+ * isn't configured (the link is the only path, as it always was); `false` with `emailError` means a
+ * send was attempted and failed (sanitized message, safe to show). Either way `inviteUrl` is always
+ * present — email is additive, never the only path to the invite. */
 export interface InviteResult {
   id: number;
   email: string;
   role: InvitableRole;
   inviteUrl: string;
   expiresAt: number;
+  emailed: boolean;
+  emailError?: string;
 }
 
 export interface InvitePreview {
@@ -666,10 +749,20 @@ export function deleteUser(id: number): Promise<void> {
 export type NotifyEvent = 'deploy_failed' | 'deploy_succeeded' | 'deploy_canceled' | 'deploy_rolled_back' | 'service_down' | 'service_recovered';
 export type NotifyEventCategory = 'deployment' | 'services';
 
+/** `'webhook'` (Slack-compatible/Discord/Telegram, auto-detected server-side by URL) | `'teams'`
+ * (Microsoft Teams MessageCard; also auto-detected from a webhook.office.com/logic.azure.com `url`)
+ * | `'email'` (routes through instance mail to `target` instead of `url`) — plan Task 4 / spec §3
+ * "Delivery channels". */
+export type NotificationChannelType = 'webhook' | 'teams' | 'email';
+
 export interface NotificationChannel {
   id: number;
   name: string;
-  url: string;
+  type: NotificationChannelType;
+  /** Set for `type: 'webhook'`/`'teams'`, `null` for `'email'`. */
+  url: string | null;
+  /** The destination email address for `type: 'email'`, `null` otherwise. */
+  target: string | null;
 }
 
 export interface NotificationEventMeta {
@@ -692,7 +785,11 @@ export interface NotificationsMatrix {
 
 export interface CreateChannelBody {
   name: string;
-  url: string;
+  type?: NotificationChannelType;
+  /** Required for `type: 'webhook'`/`'teams'`. */
+  url?: string;
+  /** Required for `type: 'email'`. */
+  target?: string;
 }
 
 export function fetchNotifications(): Promise<NotificationsMatrix> {
@@ -707,8 +804,10 @@ export function deleteChannel(id: number): Promise<void> {
   return apiFetch<void>(`/api/notifications/channels/${String(id)}`, { method: 'DELETE' });
 }
 
-export function testChannel(id: number): Promise<{ ok: boolean }> {
-  return apiFetch<{ ok: boolean }>(`/api/notifications/channels/${String(id)}/test`, { method: 'POST' });
+/** `error` is only ever set for a failed `type: 'email'` test-send (the mailer's own error message);
+ * webhook/teams failures stay a bare `{ok: false}`. */
+export function testChannel(id: number): Promise<{ ok: boolean; error?: string }> {
+  return apiFetch<{ ok: boolean; error?: string }>(`/api/notifications/channels/${String(id)}/test`, { method: 'POST' });
 }
 
 export interface PutSubscriptionBody {

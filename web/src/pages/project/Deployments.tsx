@@ -106,19 +106,29 @@ function DeploymentRow({
   const queryClient = useQueryClient();
   const [busy, setBusy] = useState(false);
   const [rowError, setRowError] = useState<string | null>(null);
+  // Optimistic: flips true the instant Cancel is clicked, before the request even lands, so the
+  // button/hint never sit idle waiting on the network. Stays true until either the server confirms
+  // it (deployment.cancelRequested) or the row goes terminal (pending becomes false, hiding this
+  // whole block) — reset only on a failed request, so the user can retry.
+  const [cancelClicked, setCancelClicked] = useState(false);
 
   const pending = isPendingDeploymentStatus(deployment.status);
+  // Gated on `pending` too: once the row goes terminal, `cancelClicked` may not have been reset yet
+  // (nothing resets it on success) — without this it would show a stuck "canceling…" hint forever.
+  const canceling = pending && (cancelClicked || deployment.cancelRequested);
   const canRollback = deployment.status === 'success' && deployment.releasePath !== null;
   const dotStatus = DOT_STATUS_BY_DEPLOY[deployment.status];
 
   async function handleCancel() {
     setRowError(null);
+    setCancelClicked(true);
     setBusy(true);
     try {
       await cancelDeployment(deployment.id);
       await queryClient.invalidateQueries({ queryKey: ['deployments', projectId] });
     } catch (err) {
       setRowError(err instanceof ApiError ? err.message : 'Could not cancel the deploy.');
+      setCancelClicked(false);
     } finally {
       setBusy(false);
     }
@@ -142,11 +152,14 @@ function DeploymentRow({
   return (
     <div className="flex flex-col">
       <div className="flex flex-wrap items-center gap-4 px-2 py-3">
-        <div className="flex w-28 shrink-0 items-center gap-2">
-          <StatusDot status={dotStatus} />
-          <span className={`text-sm font-medium ${DEPLOY_STATUS_TEXT_CLASS[deployment.status]}`}>
-            {DEPLOY_STATUS_LABEL[deployment.status]}
-          </span>
+        <div className="flex w-28 shrink-0 flex-col justify-center gap-0.5">
+          <div className="flex items-center gap-2">
+            <StatusDot status={dotStatus} />
+            <span className={`text-sm font-medium ${DEPLOY_STATUS_TEXT_CLASS[deployment.status]}`}>
+              {DEPLOY_STATUS_LABEL[deployment.status]}
+            </span>
+          </div>
+          {canceling && <span className="pl-4 text-xs text-soft">canceling…</span>}
         </div>
 
         <Chip>{TRIGGER_LABEL[deployment.trigger]}</Chip>
@@ -175,8 +188,8 @@ function DeploymentRow({
             <ArrowRight size={14} strokeWidth={ICON_STROKE} aria-hidden />
           </Link>
           {pending && (
-            <Button variant="danger" size="sm" loading={busy} onClick={() => void handleCancel()}>
-              Cancel
+            <Button variant="danger" size="sm" loading={canceling} disabled={canceling} onClick={() => void handleCancel()}>
+              {canceling ? 'Canceling…' : 'Cancel'}
             </Button>
           )}
           {canRollback && (

@@ -15,6 +15,13 @@
       "when": 1787561379671,
       "tag": "0001_overconfident_karen_page",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1787612302806,
+      "tag": "0002_notification_channel_type_target",
+      "breakpoints": true
     }
   ]
 }

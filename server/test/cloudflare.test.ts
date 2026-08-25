@@ -1,12 +1,64 @@
 import { describe, expect, it } from 'vitest';
-import { FakeDnsClient, makeCloudflareClient } from '../src/services/cloudflare.js';
+import { FakeDnsClient, isBlankCredential, makeCloudflareClient } from '../src/services/cloudflare.js';
 
 const CLOUDFLARE_API_BASE = 'https://api.cloudflare.com/client/v4';
 
+describe('isBlankCredential', () => {
+  it('is true for null, undefined, empty, and whitespace-only values', () => {
+    expect(isBlankCredential(null)).toBe(true);
+    expect(isBlankCredential(undefined)).toBe(true);
+    expect(isBlankCredential('')).toBe(true);
+    expect(isBlankCredential('   ')).toBe(true);
+    expect(isBlankCredential('\t\n')).toBe(true);
+  });
+
+  it('is false for a non-blank value, including one with surrounding whitespace', () => {
+    expect(isBlankCredential('tok')).toBe(false);
+    expect(isBlankCredential('  tok  ')).toBe(false);
+  });
+});
+
 describe('FakeDnsClient', () => {
-  it('verifyToken always resolves true', async () => {
+  it('verifyToken resolves false when no credentials have been set (honest dev-mode default)', async () => {
     const client = new FakeDnsClient();
+    await expect(client.verifyToken()).resolves.toBe(false);
+  });
+
+  it('verifyToken resolves false after credentials are cleared with setCredentials(null)', async () => {
+    const { fetch: stub } = makeStubFetch([{ body: { success: true, result: { id: 'tok', status: 'active' }, errors: [] } }]);
+    const client = new FakeDnsClient(stub);
+    client.setCredentials({ token: 'tok', zoneId: 'zone-1' });
+    client.setCredentials(null);
+
+    await expect(client.verifyToken()).resolves.toBe(false);
+  });
+
+  it('verifyToken makes a real (injected-fetch) API call once credentials are set, and resolves true for an active token', async () => {
+    const { fetch: stub, calls } = makeStubFetch([{ body: { success: true, result: { id: 'tok', status: 'active' }, errors: [] } }]);
+    const client = new FakeDnsClient(stub);
+    client.setCredentials({ token: 'real-token', zoneId: 'zone-1' });
+
     await expect(client.verifyToken()).resolves.toBe(true);
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.headers.authorization).toBe('Bearer real-token');
+  });
+
+  it('verifyToken honestly resolves false for a wrong token, even with credentials set (does not fake success)', async () => {
+    const { fetch: stub } = makeStubFetch([{ body: { success: false, result: null, errors: [{ code: 1000, message: 'Invalid API Token' }] } }]);
+    const client = new FakeDnsClient(stub);
+    client.setCredentials({ token: 'wrong-token', zoneId: 'zone-1' });
+
+    await expect(client.verifyToken()).resolves.toBe(false);
+  });
+
+  it('createARecord/findARecord/deleteARecord stay fully in-memory regardless of credentials state', async () => {
+    const client = new FakeDnsClient();
+    client.setCredentials(null);
+
+    const id = await client.createARecord('foo.apps.example.com', '10.0.0.1');
+
+    expect(id).toBe('fake-1');
+    await expect(client.findARecord('foo.apps.example.com')).resolves.toBe('fake-1');
   });
 
   it('createARecord stores the fqdn -> ip mapping in the public records map', async () => {

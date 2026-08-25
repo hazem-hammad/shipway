@@ -331,6 +331,35 @@ describe('POST /api/deployments/:id/cancel', () => {
     await app.close();
   });
 
+  it('cancelRequested is false before cancel, true on the running row after cancel, and reflected on both the detail and list routes', async () => {
+    const { app, cookie, fakeRun } = await buildDeploymentsTestApp();
+    const projectId = await createProject(app, cookie);
+
+    const deployRes = await app.inject({ method: 'POST', url: `/api/projects/${projectId}/deploy`, headers: { cookie } });
+    const { deploymentId } = deployRes.json() as { deploymentId: number };
+    await flush();
+
+    const beforeDetail = await app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}`, headers: { cookie } });
+    expect((beforeDetail.json() as { cancelRequested: boolean }).cancelRequested).toBe(false);
+
+    await app.inject({ method: 'POST', url: `/api/deployments/${deploymentId}/cancel`, headers: { cookie } });
+
+    const afterDetail = await app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}`, headers: { cookie } });
+    expect((afterDetail.json() as { cancelRequested: boolean }).cancelRequested).toBe(true);
+
+    const listRes = await app.inject({ method: 'GET', url: `/api/projects/${projectId}/deployments`, headers: { cookie } });
+    const listRow = (listRes.json() as Array<{ id: number; cancelRequested: boolean }>).find((r) => r.id === deploymentId);
+    expect(listRow?.cancelRequested).toBe(true);
+
+    // Settling the run clears it — a terminal row is never reported as still canceling.
+    fakeRun.resolve(deploymentId);
+    await flush();
+    const afterSettle = await app.inject({ method: 'GET', url: `/api/deployments/${deploymentId}`, headers: { cookie } });
+    expect((afterSettle.json() as { cancelRequested: boolean }).cancelRequested).toBe(false);
+
+    await app.close();
+  });
+
   it('marks a still-queued deployment canceled and it never starts', async () => {
     const { app, cookie, fakeRun } = await buildDeploymentsTestApp();
     const projectId = await createProject(app, cookie);

@@ -11,6 +11,7 @@ import {
   fetchGithubStatus,
   fetchGlobalDeployments,
   fetchInvite,
+  fetchMailConfig,
   fetchMe,
   fetchNotifications,
   fetchOverview,
@@ -25,7 +26,9 @@ import {
   fetchUsers,
   fetchWorkers,
   isPendingDeploymentStatus,
+  verifyCloudflare,
   type AuditConfig,
+  type CloudflareVerifyResult,
   type CronJob,
   type DatabaseListItem,
   type Deployment,
@@ -33,6 +36,7 @@ import {
   type GithubStatus,
   type GlobalDeployment,
   type InvitePreview,
+  type MailConfig,
   type Me,
   type NotificationsMatrix,
   type Overview,
@@ -138,6 +142,16 @@ export function useGithubStatus(): UseQueryResult<GithubStatus> {
   return useQuery({ queryKey: ['github-status'], queryFn: fetchGithubStatus });
 }
 
+/**
+ * Live Cloudflare connection status (`GET /api/cloudflare/verify`) — used by New Project's Domain
+ * card (plan Task 5) to show whether the DNS record it describes will actually be created, and by
+ * Settings > Cloudflare's own "Test connection" flow. No `refetchInterval`: a stale answer isn't
+ * dangerous (the create route still enforces reality), and re-checking is cheap via `refetch()`.
+ */
+export function useCloudflareVerify(): UseQueryResult<CloudflareVerifyResult> {
+  return useQuery({ queryKey: ['cloudflare-verify'], queryFn: verifyCloudflare });
+}
+
 /** Repos accessible to the installed GitHub App. Only meaningful once the app is installed. */
 export function useGithubRepos(enabled: boolean): UseQueryResult<GithubRepo[]> {
   return useQuery({ queryKey: ['github-repos'], queryFn: fetchGithubRepos, enabled });
@@ -213,6 +227,13 @@ export function useServicesInfo(): UseQueryResult<ServicesInfo> {
 /** Host resource usage + shared service status (DESIGN.md/task-25 ruling: polls every 10s). */
 export function useServerStats(): UseQueryResult<ServerStats> {
   return useQuery({ queryKey: ['server-stats'], queryFn: fetchServerStats, refetchInterval: 10_000 });
+}
+
+// ---- Settings > Mail ----
+
+/** Instance mail config (`server/src/routes/mail.ts`); member-readable, same as `useSettings`. */
+export function useMailConfig(): UseQueryResult<MailConfig> {
+  return useQuery({ queryKey: ['mail-config'], queryFn: fetchMailConfig });
 }
 
 // ---- Settings > Team ----
