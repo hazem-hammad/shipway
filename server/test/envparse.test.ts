@@ -327,6 +327,73 @@ describe('serializeEnv', () => {
   });
 });
 
+describe('quote-normalization fixed point (Round 2 regression: apostrophe-shaped values)', () => {
+  // Reviewer-caught sibling bug: the Round 1 "drop decorative quotes" exception (`quoted &&
+  // !needsQuoting(value)`) let a double-quoted value whose CONTENT happens to start/end with `'`
+  // through as an unquoted row, even though `needsQuoting` never checks for `'` at all. That unquoted
+  // text then gets misread as a *single-quoted* assignment on the very next parse (a Table<->Raw
+  // switch or a page reload, not just a Save), silently stripping or corrupting the apostrophes. The
+  // fix makes the exception a genuine fixed point: `isSafeRow` actually re-decodes the re-encoded line
+  // and requires the value to come back unchanged, rather than reasoning about which characters make
+  // that reparse ambiguous.
+  //
+  // Each case below is asserted through TWO full parse->serialize cycles (mimicking a mode switch
+  // followed by another mode switch, or two page loads) and must come out completely inert: the line
+  // is byte-identical to the input both times, and — since these are provably not safe to represent as
+  // an editable row — each shows up in `extras` (which is exactly what feeds the UI's "N lines kept as
+  // written" note, so nothing goes missing without that note reflecting it).
+  const fixtures = [
+    { name: 'MY_SECRET="\'secret\'"', line: 'MY_SECRET="\'secret\'"' },
+    { name: 'KEY="\'\'"', line: 'KEY="\'\'"' },
+    { name: 'TOKEN="\'hello"', line: 'TOKEN="\'hello"' },
+    { name: 'KEY="\'a\'b\'c\'"', line: 'KEY="\'a\'b\'c\'"' },
+  ];
+
+  for (const { name, line } of fixtures) {
+    it(`${name}: survives two full parse->serialize cycles byte-identically and stays a non-editable extra`, () => {
+      const first = parseEnv(line);
+      expect(first.rows).toEqual([]);
+      expect(first.extras).toEqual([{ index: 0, line }]);
+      const serializedOnce = serializeEnv(first.rows, first.extras);
+      expect(serializedOnce).toBe(line);
+
+      // Second cycle: reparse what was just serialized (simulates a second mode switch / reload) and
+      // confirm it's still exactly the same, not progressively corrupted.
+      const second = parseEnv(serializedOnce);
+      expect(second.rows).toEqual([]);
+      expect(second.extras).toEqual([{ index: 0, line }]);
+      const serializedTwice = serializeEnv(second.rows, second.extras);
+      expect(serializedTwice).toBe(line);
+    });
+  }
+
+  it('MY_SECRET="\'secret\'": the specific corruption the reviewer demonstrated (apostrophes silently stripped) does not happen', () => {
+    const { rows, extras } = parseEnv('MY_SECRET="\'secret\'"');
+    // Was never a row in the first place, so there is no row.value to have been corrupted to "secret".
+    expect(rows.find((r) => r.key === 'MY_SECRET')).toBeUndefined();
+    expect(extras[0]?.line).toBe('MY_SECRET="\'secret\'"');
+  });
+
+  it('KEY="\'\'": does not silently decode to an empty string on any reparse', () => {
+    const { rows, extras } = parseEnv('KEY="\'\'"');
+    expect(rows).toEqual([]);
+    expect(extras[0]?.line).toBe('KEY="\'\'"');
+    // Re-run through serializeEnv+parseEnv once more to be sure nothing collapses to '' downstream.
+    const again = parseEnv(serializeEnv(rows, extras));
+    expect(again.rows).toEqual([]);
+    expect(again.extras[0]?.line).toBe('KEY="\'\'"');
+  });
+
+  it('a double-quoted value that merely CONTAINS an apostrophe (not at either edge) is unaffected and still becomes a row', () => {
+    // Sanity check that the fix isn't overly broad: "it's fine" has an apostrophe in the middle, does
+    // not start or end with one, and needs quoting anyway (the space), so it round-trips normally.
+    const { rows, extras } = parseEnv('MSG="it\'s fine"');
+    expect(rows).toEqual([{ key: 'MSG', value: "it's fine", quoted: true }]);
+    expect(extras).toEqual([]);
+    expect(serializeEnv(rows, extras)).toBe('MSG="it\'s fine"');
+  });
+});
+
 describe('hasCRLF', () => {
   it('is true when the text contains any \\r\\n line ending', () => {
     expect(hasCRLF('APP_NAME=demo\r\nDEBUG=true\r\n')).toBe(true);

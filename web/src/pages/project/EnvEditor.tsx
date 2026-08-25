@@ -137,7 +137,9 @@ function EnvEditorForm({ projectId, initialContent }: { projectId: number; initi
           <div className="flex flex-col gap-3">
             {fileHasCRLF && (
               <p role="alert" className="text-[13px] text-warn">
-                This file uses Windows line endings (CRLF). Edit it in Raw mode.
+                This file uses Windows line endings (CRLF), so Table mode has nothing to show as rows.
+                Switch to Raw mode to edit it — typing there converts the whole file to Unix-style line
+                endings (LF) when you save.
               </p>
             )}
             {rows.length === 0 ? (
