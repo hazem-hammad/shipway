@@ -158,7 +158,7 @@ dns_resolves_to() {
 # Warns (rather than fails) if BASE_DOMAIN/*.BASE_DOMAIN don't yet resolve to
 # SERVER_IP: certbot's DNS-01 challenge doesn't need this (it posts a TXT
 # record via the Cloudflare API, not an HTTP/TLS check), but the nginx
-# vhosts install_vhosts renders do — https://ship.<base-domain> won't be
+# vhosts install_vhosts renders do — https://deploy.<base-domain> won't be
 # reachable until DNS points here. Requires typed confirmation to proceed
 # unless SHIPWAY_NONINTERACTIVE=1, for a non-interactive/scripted install.
 check_dns_resolution() {
@@ -173,7 +173,7 @@ check_dns_resolution() {
   log "  ${BASE_DOMAIN} A record: $(getent ahostsv4 "$BASE_DOMAIN" 2>/dev/null | awk '{print $1}' | paste -sd, - || true)"
   log "  *.${BASE_DOMAIN} (wildcard probe) A record: $(getent ahostsv4 "$probe_host" 2>/dev/null | awk '{print $1}' | paste -sd, - || true)"
   log "  expected: ${SERVER_IP}"
-  log "This usually just means the DNS records haven't propagated yet, or the wildcard A record hasn't been created — see DEPLOYMENT.md's prerequisites. The install can continue (certbot's DNS-01 challenge doesn't need this), but https://ship.${BASE_DOMAIN} won't be reachable until DNS is correct."
+  log "This usually just means the DNS records haven't propagated yet, or the wildcard A record hasn't been created — see DEPLOYMENT.md's prerequisites. The install can continue (certbot's DNS-01 challenge doesn't need this), but https://deploy.${BASE_DOMAIN} won't be reachable until DNS is correct."
 
   if [[ "${SHIPWAY_NONINTERACTIVE:-}" == "1" ]]; then
     log "SHIPWAY_NONINTERACTIVE=1 set, continuing without confirmation"
@@ -773,7 +773,7 @@ install_vhosts() {
 }
 
 # ---------------------------------------------------------------------------
-# 13. Cloudflare DNS records for ship.<domain> and mail.<domain>
+# 13. Cloudflare DNS records for deploy.<domain> and mail.<domain>
 # ---------------------------------------------------------------------------
 # cf_api and ZONE_ID come from verify_cloudflare_access (preflight, section
 # 7 above) — resolved once, reused here instead of looking the zone up again.
@@ -799,7 +799,7 @@ create_a_record_if_missing() {
 }
 
 configure_dns() {
-  create_a_record_if_missing "$ZONE_ID" "ship.${BASE_DOMAIN}"
+  create_a_record_if_missing "$ZONE_ID" "deploy.${BASE_DOMAIN}"
   create_a_record_if_missing "$ZONE_ID" "mail.${BASE_DOMAIN}"
 }
 
@@ -851,7 +851,7 @@ postflight() {
     fi
   done
 
-  local health_url="https://ship.${BASE_DOMAIN}/api/health"
+  local health_url="https://deploy.${BASE_DOMAIN}/api/health"
   local attempt health_ok=0
   for ((attempt = 1; attempt <= POSTFLIGHT_HEALTH_RETRIES; attempt++)); do
     if curl -fsS --max-time 5 "$health_url" > /dev/null 2>&1; then
@@ -865,7 +865,7 @@ postflight() {
   echo "==============================================================="
   echo " Shipway is installed"
   echo "==============================================================="
-  echo " Dashboard:      https://ship.${BASE_DOMAIN}"
+  echo " Dashboard:      https://deploy.${BASE_DOMAIN}"
   if [[ "$health_ok" == "1" ]]; then
     echo " Health check:   OK (${health_url})"
   else
@@ -931,7 +931,7 @@ main() {
 
   postflight
 
-  log "done. Shipway is live at https://ship.${BASE_DOMAIN} — open it to run the first-run setup wizard."
+  log "done. Shipway is live at https://deploy.${BASE_DOMAIN} — open it to run the first-run setup wizard."
 }
 
 main "$@"

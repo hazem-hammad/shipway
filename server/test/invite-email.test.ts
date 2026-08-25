@@ -80,7 +80,7 @@ describe('POST /api/users/invite — email delivery', () => {
     expect(sent.to).toBe('newbie@example.com');
     expect(sent.subject).toBe("You're invited to Shipway");
 
-    const expectedUrl = `https://ship.intcore.dev/invite/${token}`;
+    const expectedUrl = `https://deploy.intcore.dev/invite/${token}`;
     expect(sent.text).toContain(expectedUrl);
     expect(sent.html).toContain(expectedUrl);
     expect(sent.text).toContain(token);
@@ -216,7 +216,7 @@ describe('POST /api/users/:id/reinvite — email delivery', () => {
     expect(sendMailMock).toHaveBeenCalledTimes(1);
     const sent = sendMailMock.mock.calls[0]![0] as { to: string; text: string };
     expect(sent.to).toBe('reinvite-email@example.com');
-    expect(sent.text).toContain(`https://ship.intcore.dev/invite/${newToken}`);
+    expect(sent.text).toContain(`https://deploy.intcore.dev/invite/${newToken}`);
     expect(sent.text).not.toContain(originalToken);
 
     await app.close();

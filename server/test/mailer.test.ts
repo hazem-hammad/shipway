@@ -218,13 +218,13 @@ describe('sendMail', () => {
 });
 
 describe('buildInviteEmail', () => {
-  it('builds an absolute ship.<baseDomain> URL, present in both text and html, plus the fixed subject', () => {
+  it('builds an absolute deploy.<baseDomain> URL, present in both text and html, plus the fixed subject', () => {
     const content = buildInviteEmail({ token: 'abc123deadbeef', baseDomain: 'intcore.dev' });
 
     expect(content.subject).toBe("You're invited to Shipway");
-    expect(content.text).toContain('https://ship.intcore.dev/invite/abc123deadbeef');
-    expect(content.html).toContain('https://ship.intcore.dev/invite/abc123deadbeef');
-    expect(content.html).toContain('href="https://ship.intcore.dev/invite/abc123deadbeef"');
+    expect(content.text).toContain('https://deploy.intcore.dev/invite/abc123deadbeef');
+    expect(content.html).toContain('https://deploy.intcore.dev/invite/abc123deadbeef');
+    expect(content.html).toContain('href="https://deploy.intcore.dev/invite/abc123deadbeef"');
   });
 
   it('falls back to a relative-path note instead of fabricating a host when base_domain is unset', () => {
