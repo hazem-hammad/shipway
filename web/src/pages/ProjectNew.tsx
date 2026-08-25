@@ -7,7 +7,7 @@
  * carried over from the v1 page) is to also set the env (if any was pasted) and kick off the first
  * deploy, then land the user on that deployment's live log.
  */
-import { type FormEvent, useMemo, useState } from 'react';
+import { type FormEvent, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -183,6 +183,21 @@ function dnsResultLine(outcome: DnsOutcome): string {
   return 'No DNS record was created.';
 }
 
+/** Tone for the post-create result row: red for an error, green for an actual record
+ * (created/existed), neutral for the "nothing happened" case (`attempted: false` — no DNS client
+ * configured, or the user created anyway) which is neither good nor bad news. */
+function dnsResultTone(outcome: DnsOutcome): 'danger' | 'ok' | 'neutral' {
+  if (outcome.error) return 'danger';
+  if (outcome.created || outcome.existed) return 'ok';
+  return 'neutral';
+}
+
+const DNS_RESULT_TONE_CLASSES: Record<'danger' | 'ok' | 'neutral', string> = {
+  danger: 'bg-danger/10 text-danger',
+  ok: 'bg-ok-tint text-ok-tint-fg',
+  neutral: 'bg-surface-2 text-soft',
+};
+
 // ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
@@ -216,12 +231,17 @@ export default function ProjectNewPage() {
   const [provisionError, setProvisionError] = useState<ProvisionError | null>(null);
 
   // "Create anyway without a DNS record" — required only while dnsReady is false (spec §3 "New
-  // Project DNS"); cleared to false whenever the underlying gap changes so a stale ack from a
-  // previous, different reason can never silently carry over.
+  // Project DNS"); reset to false below whenever the underlying gap reason changes, so a stale ack
+  // from a previous, different reason (e.g. Cloudflare reconnects, then later disconnects again)
+  // can never silently carry over as a pre-checked box for a gap the user never actually saw.
   const [createAnyway, setCreateAnyway] = useState(false);
   // Set right after a successful create, briefly, so the Domain card can show what actually
   // happened to DNS before this page navigates to the deployment log (see handleDeploy).
   const [dnsResult, setDnsResult] = useState<DnsOutcome | null>(null);
+  // Scrolled into view the instant a create succeeds (see handleDeploy) — the right rail isn't
+  // sticky, so a user who scrolled down to the Project name/slug fields before hitting Deploy would
+  // otherwise never see the DNS result before this page navigates away.
+  const domainCardRef = useRef<HTMLDivElement>(null);
 
   const isNodeLike = type === 'node' || type === 'nextjs';
   const baseDomain = settingsQuery.data?.base_domain ?? 'your-domain';
@@ -230,6 +250,14 @@ export default function ProjectNewPage() {
   const serverIpMissing = settingsSettled && serverIp === null;
   const cfStatus = cloudflareStatus(cloudflareQuery.data, cloudflareQuery.isPending, cloudflareQuery.isError);
   const dnsReady = settingsSettled && !serverIpMissing && cfStatus.ready;
+  // Identifies WHY dns isn't ready (or that it is) — 'pending' while still loading, so the effect
+  // below never fires on the initial settle. Distinct string per reason means a gap that changes
+  // reason (not just resolves and reappears identically) also clears a stale acknowledgment.
+  const dnsGapReason = !settingsSettled ? 'pending' : serverIpMissing ? 'server-ip' : !cfStatus.ready ? 'cloudflare' : 'ready';
+
+  useEffect(() => {
+    setCreateAnyway(false);
+  }, [dnsGapReason]);
 
   function handleTypeChange(next: ProjectType) {
     setType(next);
@@ -316,7 +344,16 @@ export default function ProjectNewPage() {
       // location state, and coupling the deployment log — a surface other work on this project
       // owns — to a one-time "how did project creation's DNS step go" payload would outlive its
       // usefulness the moment the user leaves this page anyway).
+      //
+      // The right rail isn't sticky (DESIGN.md doesn't call for that), so a user who scrolled down
+      // to the Project name/slug fields at the bottom of the LEFT column before hitting Deploy
+      // would otherwise have the Domain card scrolled off-screen above the viewport the entire
+      // time — the result would exist but never actually be seen. `scrollIntoView` fixes that
+      // deterministically (no animation to race against the fixed-length delay below): 'nearest'
+      // means it's a no-op when the card is already visible, so this never yanks the page around
+      // for someone who submitted from the top.
       setDnsResult(project.dns);
+      domainCardRef.current?.scrollIntoView({ block: 'nearest' });
       await sleep(DNS_RESULT_DISPLAY_MS);
 
       // Env is set post-create (PUT), before the first deploy, only when something was pasted.
@@ -380,6 +417,7 @@ export default function ProjectNewPage() {
               createAnyway={createAnyway}
               onCreateAnywayChange={setCreateAnyway}
               dnsResult={dnsResult}
+              domainCardRef={domainCardRef}
               type={type}
               buildCmd={buildCmd}
               submitting={submitting}
@@ -859,6 +897,7 @@ function ConfigureRail({
   createAnyway,
   onCreateAnywayChange,
   dnsResult,
+  domainCardRef,
   type,
   buildCmd,
   submitting,
@@ -878,6 +917,7 @@ function ConfigureRail({
   createAnyway: boolean;
   onCreateAnywayChange: (checked: boolean) => void;
   dnsResult: DnsOutcome | null;
+  domainCardRef: RefObject<HTMLDivElement | null>;
   type: ProjectType;
   buildCmd: string;
   submitting: boolean;
@@ -912,6 +952,7 @@ function ConfigureRail({
         createAnyway={createAnyway}
         onCreateAnywayChange={onCreateAnywayChange}
         dnsResult={dnsResult}
+        domainCardRef={domainCardRef}
       />
 
       <Card>
@@ -948,6 +989,11 @@ function ConfigureRail({
  * created (missing server IP, or Cloudflare not connected) — a calm explanation plus the "create
  * anyway" acknowledgment that gates Deploy. After a successful create, `dnsResult` replaces the
  * live-status section with what actually happened, briefly, before the page navigates away.
+ *
+ * `domainCardRef` is attached to the outer wrapper (not `Card` itself, which doesn't forward refs)
+ * so `handleDeploy` can `scrollIntoView` it the instant a result lands — the right rail scrolls
+ * with the page (it isn't sticky), so without this a user who submitted from further down the form
+ * would never actually see the result before navigating away.
  */
 function DomainCard({
   domain,
@@ -959,6 +1005,7 @@ function DomainCard({
   createAnyway,
   onCreateAnywayChange,
   dnsResult,
+  domainCardRef,
 }: {
   domain: string;
   serverIp: string | null;
@@ -969,64 +1016,65 @@ function DomainCard({
   createAnyway: boolean;
   onCreateAnywayChange: (checked: boolean) => void;
   dnsResult: DnsOutcome | null;
+  domainCardRef: RefObject<HTMLDivElement | null>;
 }) {
   return (
-    <Card>
-      <CardHeader icon={<Globe size={20} strokeWidth={ICON_STROKE} />} title="Domain" />
+    <div ref={domainCardRef}>
+      <Card>
+        <CardHeader icon={<Globe size={20} strokeWidth={ICON_STROKE} />} title="Domain" />
 
-      <div className="mt-3 flex flex-col gap-3">
-        {!settingsSettled ? (
-          <Skeleton className="h-10 w-full" />
-        ) : serverIpMissing ? (
-          <p className="text-sm text-soft">
-            Set the server IP in{' '}
-            <Link href="/settings/general" className="font-medium text-link hover:underline">
-              Settings &gt; General
-            </Link>{' '}
-            before Shipway can create a DNS record for this project.
-          </p>
-        ) : (
-          <p className="rounded-xl bg-surface-2 px-3.5 py-2.5 font-mono text-sm text-ink">
-            A &nbsp;&nbsp; {domain} &nbsp;&nbsp; &rarr; &nbsp;&nbsp; {serverIp}
-          </p>
-        )}
+        <div className="mt-3 flex flex-col gap-3">
+          {!settingsSettled ? (
+            <Skeleton className="h-10 w-full" />
+          ) : serverIpMissing ? (
+            <p className="text-sm text-soft">
+              Set the server IP in{' '}
+              <Link href="/settings/general" className="font-medium text-link hover:underline">
+                Settings &gt; General
+              </Link>{' '}
+              before Shipway can create a DNS record for this project.
+            </p>
+          ) : (
+            <p className="rounded-xl bg-surface-2 px-3.5 py-2.5 font-mono text-sm text-ink">
+              A &nbsp;&nbsp; {domain} &nbsp;&nbsp; &rarr; &nbsp;&nbsp; {serverIp}
+            </p>
+          )}
 
-        {dnsResult ? (
-          <div className={`rounded-xl px-4 py-3 text-sm ${dnsResult.error ? 'bg-danger/10 text-danger' : 'bg-ok-tint text-ok-tint-fg'}`}>
-            {dnsResultLine(dnsResult)}
-          </div>
-        ) : (
-          <>
-            <div>
-              <Badge tone={cloudflare.tone}>{cloudflare.label}</Badge>
-            </div>
-
-            {settingsSettled && !cloudflare.pending && !dnsReady && (
-              <div className="rounded-xl border border-line bg-surface-2 px-4 py-3">
-                <p className="text-sm text-soft">
-                  {serverIpMissing ? (
-                    'No DNS record will be created until the server IP is set.'
-                  ) : (
-                    <>
-                      Cloudflare isn&rsquo;t connected, so no DNS record will be created for this project.{' '}
-                      <Link href="/settings/cloudflare" className="font-medium text-link hover:underline">
-                        Connect Cloudflare &rarr;
-                      </Link>
-                    </>
-                  )}
-                </p>
-                <Checkbox
-                  className="mt-3"
-                  checked={createAnyway}
-                  onChange={onCreateAnywayChange}
-                  label="Create anyway without a DNS record"
-                />
+          {dnsResult ? (
+            <div className={`rounded-xl px-4 py-3 text-sm ${DNS_RESULT_TONE_CLASSES[dnsResultTone(dnsResult)]}`}>{dnsResultLine(dnsResult)}</div>
+          ) : (
+            <>
+              <div>
+                <Badge tone={cloudflare.tone}>{cloudflare.label}</Badge>
               </div>
-            )}
-          </>
-        )}
-      </div>
-    </Card>
+
+              {settingsSettled && !cloudflare.pending && !dnsReady && (
+                <div className="rounded-xl border border-line bg-surface-2 px-4 py-3">
+                  <p className="text-sm text-soft">
+                    {serverIpMissing ? (
+                      'No DNS record will be created until the server IP is set.'
+                    ) : (
+                      <>
+                        Cloudflare isn&rsquo;t connected, so no DNS record will be created for this project.{' '}
+                        <Link href="/settings/cloudflare" className="font-medium text-link hover:underline">
+                          Connect Cloudflare &rarr;
+                        </Link>
+                      </>
+                    )}
+                  </p>
+                  <Checkbox
+                    className="mt-3"
+                    checked={createAnyway}
+                    onChange={onCreateAnywayChange}
+                    label="Create anyway without a DNS record"
+                  />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      </Card>
+    </div>
   );
 }
 
