@@ -116,6 +116,51 @@ describe('importBootstrap', () => {
     expect(getSetting(db, 'redis_info')).toBeNull();
   });
 
+  it('force_admin_urls: true overwrites mysql_admin_url and postgres_admin_url even when already set, but leaves every other already-set key alone', () => {
+    const dataDir = tmpDataDir();
+    writeBootstrapFile(dataDir, { ...FULL_BOOTSTRAP, force_admin_urls: true });
+    const cfg = makeCfg(dataDir);
+    const db = makeDb();
+    setSetting(db, 'mysql_admin_url', 'mysql://shipway_admin:STALE-PASSWORD@127.0.0.1:3306');
+    setSetting(db, 'postgres_admin_url', 'postgres://shipway_admin:STALE-PASSWORD@127.0.0.1:5432/postgres');
+    setSetting(db, 'base_domain', 'operator-edited.example.com');
+
+    importBootstrap(db, cfg);
+
+    // The two admin URLs are force-overwritten with the rotated credential from bootstrap.json...
+    expect(getSetting(db, 'mysql_admin_url')).toBe(FULL_BOOTSTRAP.mysql_admin_url);
+    expect(getSetting(db, 'postgres_admin_url')).toBe(FULL_BOOTSTRAP.postgres_admin_url);
+    // ...but every other already-set key is untouched, even though force_admin_urls is true.
+    expect(getSetting(db, 'base_domain')).toBe('operator-edited.example.com');
+  });
+
+  it('without force_admin_urls, an already-set mysql_admin_url/postgres_admin_url is left alone (the default, safe behavior)', () => {
+    const dataDir = tmpDataDir();
+    writeBootstrapFile(dataDir, FULL_BOOTSTRAP);
+    const cfg = makeCfg(dataDir);
+    const db = makeDb();
+    setSetting(db, 'mysql_admin_url', 'mysql://shipway_admin:REAL-LIVE-PASSWORD@127.0.0.1:3306');
+    setSetting(db, 'postgres_admin_url', 'postgres://shipway_admin:REAL-LIVE-PASSWORD@127.0.0.1:5432/postgres');
+
+    importBootstrap(db, cfg);
+
+    expect(getSetting(db, 'mysql_admin_url')).toBe('mysql://shipway_admin:REAL-LIVE-PASSWORD@127.0.0.1:3306');
+    expect(getSetting(db, 'postgres_admin_url')).toBe('postgres://shipway_admin:REAL-LIVE-PASSWORD@127.0.0.1:5432/postgres');
+  });
+
+  it('force_admin_urls: true still only populates unset keys other than the two admin URLs (no blanket force)', () => {
+    const dataDir = tmpDataDir();
+    writeBootstrapFile(dataDir, { ...FULL_BOOTSTRAP, force_admin_urls: true });
+    const cfg = makeCfg(dataDir);
+    const db = makeDb();
+    setSetting(db, 'server_ip', 'operator-edited-ip');
+
+    importBootstrap(db, cfg);
+
+    expect(getSetting(db, 'server_ip')).toBe('operator-edited-ip');
+    expect(getSetting(db, 'mysql_admin_url')).toBe(FULL_BOOTSTRAP.mysql_admin_url);
+  });
+
   it('logs a warning and leaves the file in place (no throw, db untouched) when bootstrap.json is malformed JSON', () => {
     const dataDir = tmpDataDir();
     const bootstrapPath = path.join(dataDir, 'bootstrap.json');
