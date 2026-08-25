@@ -52,7 +52,7 @@ Useful root-level scripts: `npm test` (server test suite), `npm run typecheck` (
 
 Shipway is meant to run on its own dedicated Ubuntu 24.04 box. Installation is one script, `setup/install.sh`, run as root; it provisions nginx, PHP 8.1-8.4, MySQL, PostgreSQL, Redis, Node, Mailpit, and a wildcard SSL certificate, then builds and starts Shipway itself.
 
-See **[docs/server-setup.md](docs/server-setup.md)** for the full walkthrough, including prerequisites, the GitHub App setup, and where everything lives on disk.
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full walkthrough: prerequisites, the exact commands, the first-run wizard, updating, backups, troubleshooting, and where everything lives on disk.
 
 ## Updating
 
@@ -60,4 +60,4 @@ See **[docs/server-setup.md](docs/server-setup.md)** for the full walkthrough, i
 sudo /opt/shipway/setup/update.sh
 ```
 
-Pulls the latest commit, rebuilds, and restarts the `shipway` service. Database migrations run automatically on startup, so there is no separate migrate step.
+Pulls the latest commit, rebuilds, and restarts the `shipway` service. Database migrations run automatically on startup, so there is no separate migrate step. See [DEPLOYMENT.md](DEPLOYMENT.md#updating) for details.
