@@ -221,7 +221,7 @@ export function renderNginxVhost(i: VhostInput): string {
     `}`,
     ``,
     `server {`,
-    `    listen 443 ssl; http2 on;`,
+    `    listen 443 ssl http2;`,
     `    server_name ${i.domain};`,
     ``,
     `    ssl_certificate /etc/letsencrypt/live/${i.certName}/fullchain.pem;`,

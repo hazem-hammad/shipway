@@ -99,7 +99,7 @@ describe('renderNginxVhost — shared across all vhost types', () => {
 
   it('emits the https server block with ssl + http2', () => {
     const out = renderNginxVhost(base);
-    expect(out).toContain('listen 443 ssl; http2 on;');
+    expect(out).toContain('listen 443 ssl http2;');
     expect(out).toContain('server_name blog.intcore.dev;');
   });
 

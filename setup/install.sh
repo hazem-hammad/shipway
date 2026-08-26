@@ -226,7 +226,7 @@ install_base_packages() {
 
   log "installing base packages"
   apt-get install -y \
-    nginx git curl acl unzip \
+    nginx git curl acl unzip build-essential \
     software-properties-common rsync jq ca-certificates
 }
 
