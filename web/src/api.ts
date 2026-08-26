@@ -204,8 +204,26 @@ export function testMailConfig(to: string): Promise<{ ok: boolean; error?: strin
 
 // ---- GitHub App ----
 
-export function fetchGithubManifest(baseUrl: string): Promise<GithubManifest> {
-  return apiFetch<GithubManifest>(`/api/github/manifest?baseUrl=${encodeURIComponent(baseUrl)}`);
+/**
+ * `org` is optional: omitting it creates a GitHub App owned by the signed-in *user*, which (because
+ * the manifest is private) can then only be installed on that user account. Passing an org login
+ * creates the app under the organization instead, so it can be installed on the org's repos.
+ */
+export function fetchGithubManifest(baseUrl: string, org?: string): Promise<GithubManifest> {
+  const params = new URLSearchParams({ baseUrl });
+  if (org) params.set('org', org);
+  return apiFetch<GithubManifest>(`/api/github/manifest?${params.toString()}`);
+}
+
+export interface GithubInstallation {
+  id: number;
+  account: string | null;
+  accountType: string | null;
+  repositorySelection: string | null;
+}
+
+export function fetchGithubInstallations(): Promise<{ installations: GithubInstallation[] }> {
+  return apiFetch<{ installations: GithubInstallation[] }>('/api/github/installations');
 }
 
 export function fetchGithubStatus(): Promise<GithubStatus> {
@@ -224,6 +242,27 @@ export function fetchGithubRepos(): Promise<GithubRepo[]> {
 
 export function fetchGithubBranches(repo: string): Promise<string[]> {
   return apiFetch<string[]>(`/api/github/branches?repo=${encodeURIComponent(repo)}`);
+}
+
+/**
+ * Top-level directories committed to `repo` at `branch` — suggestions for a project's public
+ * directory. Only reflects what is in git, so a build-generated web root won't be listed.
+ */
+export function fetchGithubDirs(repo: string, branch: string): Promise<string[]> {
+  return apiFetch<string[]>(`/api/github/dirs?repo=${encodeURIComponent(repo)}&branch=${encodeURIComponent(branch)}`);
+}
+
+// ---- Git URL (non-GitHub sources) ----
+
+export interface GitRemoteBranches {
+  branches: string[];
+  /** The branch the remote's HEAD points at, when it reported one — the one to preselect. */
+  defaultBranch: string | null;
+}
+
+/** Branches of any http(s) git URL, via `git ls-remote` server-side (nothing is cloned). */
+export function fetchGitBranches(url: string): Promise<GitRemoteBranches> {
+  return apiFetch<GitRemoteBranches>(`/api/git/branches?url=${encodeURIComponent(url)}`);
 }
 
 // ---- Projects ----
@@ -261,6 +300,11 @@ export interface Project {
   autoDeploy: boolean;
   smtpMode: 'mailpit' | 'custom' | 'none';
   notifyWebhookUrl: string | null;
+  /** HTTP basic auth on the public site. The password hash is never sent to the client —
+   * `authPasswordSet` reports only whether one is stored. */
+  authEnabled: boolean;
+  authUser: string | null;
+  authPasswordSet: boolean;
   createdAt: number;
 }
 
@@ -288,6 +332,9 @@ export interface CreateProjectBody {
   installCmd?: string;
   buildCmd?: string;
   startCmd?: string;
+  /** Omitted entirely to accept the server's per-type default (Laravel's, for php). */
+  preDeployScript?: string;
+  postDeployScript?: string;
   healthCheckPath?: string | null;
   autoDeploy?: boolean;
 }
@@ -338,6 +385,10 @@ export interface PatchProjectBody {
   healthCheckPath?: string | null;
   autoDeploy?: boolean;
   notifyWebhookUrl?: string | null;
+  authEnabled?: boolean;
+  authUser?: string;
+  /** Write-only. Omit to leave an already-stored password unchanged. */
+  authPassword?: string;
 }
 
 export function patchProject(id: number, body: PatchProjectBody): Promise<Project> {
@@ -563,22 +614,88 @@ export function deleteCronJob(id: number): Promise<void> {
   return apiFetch<void>(`/api/cron/${String(id)}`, { method: 'DELETE' });
 }
 
-// ---- Databases ----
+// ---- Database connections ----
 
 export type DbEngine = 'mysql' | 'postgres';
+
+/**
+ * A database server a database can live on: one of the engines running on the Shipway host
+ * (`kind: 'local'`, no credentials of its own — the installer's) or a registered external one
+ * (`kind: 'external'`, an RDS instance and friends). `key` is what every other call identifies a
+ * connection by.
+ */
+export interface DbConnection {
+  key: string;
+  kind: 'local' | 'external';
+  /** `db_connections.id`; null for one of the host's own engines. */
+  id: number | null;
+  name: string;
+  engine: DbEngine;
+  host: string;
+  port: number;
+  tls: boolean;
+  /** The admin user Shipway provisions as. Null for a host engine, whose credentials came from the installer. */
+  adminUsername: string | null;
+  createdAt: number | null;
+  databaseCount: number;
+}
+
+export interface DbConnectionBody {
+  name: string;
+  engine: DbEngine;
+  host: string;
+  port?: number;
+  adminUsername: string;
+  adminPassword: string;
+  tls?: boolean;
+}
+
+export function fetchDbConnections(): Promise<DbConnection[]> {
+  return apiFetch<DbConnection[]>('/api/db-connections');
+}
+
+export function createDbConnection(body: DbConnectionBody): Promise<DbConnection> {
+  return apiFetch<DbConnection>('/api/db-connections', { method: 'POST', body });
+}
+
+export function updateDbConnection(id: number, body: Partial<DbConnectionBody>): Promise<void> {
+  return apiFetch<void>(`/api/db-connections/${String(id)}`, { method: 'PATCH', body });
+}
+
+export function deleteDbConnection(id: number): Promise<void> {
+  return apiFetch<void>(`/api/db-connections/${String(id)}`, { method: 'DELETE' });
+}
+
+/** Tries credentials without storing them. Resolves either way — `ok: false` is a server that
+ * answered and refused, which is a successful test of a wrong password. */
+export function testDbConnection(body: Omit<DbConnectionBody, 'name'>): Promise<{ ok: boolean; detail?: string }> {
+  return apiFetch<{ ok: boolean; detail?: string }>('/api/db-connections/test', { method: 'POST', body });
+}
+
+// ---- Databases ----
 
 export interface DatabaseListItem {
   id: number;
   projectId: number | null;
+  connectionId: number | null;
   engine: DbEngine;
   name: string;
   username: string;
   createdAt: number;
   projectName: string | null;
+  /** The connection this database lives on, and where an app reaches it. */
+  connectionKey: string;
+  /** Null only if that connection has gone missing under the database. */
+  connectionName: string | null;
+  host: string;
+  port: number;
 }
 
 export interface CreateDatabaseBody {
-  engine: DbEngine;
+  /** The connection to create on (`local:mysql`, `external:7`). */
+  connection?: string;
+  /** Accepted on its own to mean the host's engine — what this call meant before connections existed. */
+  engine?: DbEngine;
   name: string;
   projectId?: number;
 }
@@ -590,11 +707,17 @@ export interface DatabaseCreated {
   name: string;
   username: string;
   password: string;
+  connectionKey: string;
+  connectionName: string;
+  host: string;
+  port: number;
 }
 
 export interface DatabaseCredentials {
   username: string;
   password: string;
+  host: string;
+  port: number;
   env: Record<string, string>;
 }
 
@@ -636,6 +759,8 @@ export interface MailpitInfo {
 export interface ServicesInfo {
   redis: RedisInfo | null;
   mailpit: MailpitInfo | null;
+  /** Engines with admin credentials configured on the host — the only ones a database can be created on. */
+  databaseEngines: Record<DbEngine, boolean>;
 }
 
 export function fetchServicesInfo(): Promise<ServicesInfo> {
@@ -887,6 +1012,14 @@ export function putGithubApp(body: ManualGithubAppBody): Promise<GithubStatus> {
   return apiFetch<GithubStatus>('/api/github/app', { method: 'PUT', body });
 }
 
-export function resolveGithubInstallation(): Promise<{ installationId: number }> {
-  return apiFetch<{ installationId: number }>('/api/github/resolve-installation', { method: 'POST' });
+/**
+ * With no `installationId` the server auto-detects, but only when the app has exactly one
+ * installation — otherwise it 409s with `{ error: 'multiple installations', installations }` so the
+ * caller can ask which account to deploy from rather than binding to an arbitrary one.
+ */
+export function resolveGithubInstallation(installationId?: number): Promise<{ installationId: number }> {
+  return apiFetch<{ installationId: number }>('/api/github/resolve-installation', {
+    method: 'POST',
+    ...(installationId === undefined ? {} : { body: { installationId } }),
+  });
 }

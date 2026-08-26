@@ -7,7 +7,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import * as path from 'node:path';
-import type { DbAdmin, DbEngine } from '../src/services/dbprovision.js';
+import type { DbAdmin, DbAdminTarget } from '../src/services/dbprovision.js';
 import { FakeDnsClient } from '../src/services/cloudflare.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { buildOwnerApp, createAdmin, createMember, tmpDataDir } from './helpers.js';
@@ -15,8 +15,9 @@ import { buildOwnerApp, createAdmin, createMember, tmpDataDir } from './helpers.
 const FORBIDDEN_ADMIN = { error: 'requires admin' };
 
 class NoopDbAdmin implements DbAdmin {
-  async createDatabase(_engine: DbEngine, _name: string, _user: string, _password: string): Promise<void> {}
-  async dropDatabase(_engine: DbEngine, _name: string, _user: string): Promise<void> {}
+  async createDatabase(_target: DbAdminTarget, _name: string, _user: string, _password: string): Promise<void> {}
+  async dropDatabase(_target: DbAdminTarget, _name: string, _user: string): Promise<void> {}
+  async testConnection(_target: DbAdminTarget): Promise<void> {}
 }
 
 describe('role gates: admin+ routes', () => {
@@ -90,6 +91,22 @@ describe('role gates: admin+ routes', () => {
     expect(memberRes.json()).toEqual(FORBIDDEN_ADMIN);
 
     const adminRes = await app.inject({ method: 'POST', url: '/api/github/resolve-installation', headers: { cookie: adminCookie } });
+    expect(adminRes.statusCode).toBe(503); // clears the role gate; 503s only because no github_app is configured
+    expect(adminRes.json()).toEqual({ error: 'github app not configured' });
+
+    await app.close();
+  });
+
+  it('GET /api/github/installations: member 403s, admin clears the gate (503 not configured)', async () => {
+    const { app } = await buildOwnerApp();
+    const { cookie: memberCookie } = await createMember(app);
+    const { cookie: adminCookie } = await createAdmin(app);
+
+    const memberRes = await app.inject({ method: 'GET', url: '/api/github/installations', headers: { cookie: memberCookie } });
+    expect(memberRes.statusCode).toBe(403);
+    expect(memberRes.json()).toEqual(FORBIDDEN_ADMIN);
+
+    const adminRes = await app.inject({ method: 'GET', url: '/api/github/installations', headers: { cookie: adminCookie } });
     expect(adminRes.statusCode).toBe(503); // clears the role gate; 503s only because no github_app is configured
     expect(adminRes.json()).toEqual({ error: 'github app not configured' });
 

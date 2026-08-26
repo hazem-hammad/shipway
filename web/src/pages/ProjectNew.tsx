@@ -14,11 +14,13 @@ import {
   ArrowRight,
   Braces,
   ChevronDown,
+  Database,
   GitBranch,
   Globe,
   HeartPulse,
   Link2,
   Lock,
+  PlayCircle,
   Rocket,
   Search,
   Tag,
@@ -27,16 +29,43 @@ import {
 } from 'lucide-react';
 import {
   ApiError,
+  createDatabase,
   createProject,
   deployProject,
+  fetchDatabaseCredentials,
+  injectDatabase,
   putProjectEnv,
   type CloudflareVerifyResult,
   type CreateProjectBody,
+  type DatabaseListItem,
+  type DbConnection,
   type DnsOutcome,
   type GithubRepo,
   type ProjectType,
 } from '../api';
-import { useCloudflareVerify, useGithubBranches, useGithubRepos, useGithubStatus, useSettings } from '../hooks';
+import {
+  useCloudflareVerify,
+  useDatabases,
+  useDbConnections,
+  useGitBranches,
+  useGithubBranches,
+  useGithubDirs,
+  useGithubRepos,
+  useGithubStatus,
+  useServicesInfo,
+  useSettings,
+} from '../hooks';
+import { EnvDraftEditor, useEnvDraft } from '../components/EnvDraft';
+import {
+  LARAVEL_BUILD_CMD,
+  LARAVEL_INSTALL_CMD,
+  LARAVEL_POST_DEPLOY_SCRIPT,
+  LARAVEL_PRE_DEPLOY_SCRIPT,
+  buildPhpEnv,
+  generateAppKey,
+  upsertEnvVars,
+} from '../../../server/src/deploy/laravel.js';
+import { IDENTIFIER_RE, connectionEnv, isReservedDbName, type DbEngine } from '../../../server/src/services/dbconn.js';
 import { NextjsIcon, NodeIcon, PhpIcon, StaticIcon, type BrandIconProps } from '../components/BrandIcons';
 import {
   Badge,
@@ -117,17 +146,121 @@ interface TypeDefaults {
   installCmd: string;
   buildCmd: string;
   startCmd: string;
+  /** Release-relative directory nginx serves as the web root. '' means the repo root. */
+  publicDir: string;
+  preDeployScript: string;
+  postDeployScript: string;
 }
 
+/**
+ * Mirrors `defaultsForType` in `server/src/routes/projects.ts`, which is the authority — this copy
+ * only exists so the fields are already filled in while the user is still looking at the form. The
+ * php row comes from `deploy/laravel.ts`, imported rather than retyped, so the two can't drift.
+ */
 const TYPE_DEFAULTS: Record<ProjectType, TypeDefaults> = {
-  php: { installCmd: 'composer install --no-dev --optimize-autoloader --no-interaction', buildCmd: '', startCmd: '' },
-  node: { installCmd: 'npm ci', buildCmd: 'npm run build', startCmd: 'npm start' },
-  nextjs: { installCmd: 'npm ci', buildCmd: 'npm run build', startCmd: 'npm start' },
-  static: { installCmd: '', buildCmd: '', startCmd: '' },
+  php: {
+    installCmd: LARAVEL_INSTALL_CMD,
+    buildCmd: LARAVEL_BUILD_CMD,
+    startCmd: '',
+    publicDir: 'public',
+    preDeployScript: LARAVEL_PRE_DEPLOY_SCRIPT,
+    postDeployScript: LARAVEL_POST_DEPLOY_SCRIPT,
+  },
+  node: { installCmd: 'npm ci', buildCmd: 'npm run build', startCmd: 'npm start', publicDir: '', preDeployScript: '', postDeployScript: '' },
+  nextjs: { installCmd: 'npm ci', buildCmd: 'npm run build', startCmd: 'npm start', publicDir: '', preDeployScript: '', postDeployScript: '' },
+  static: { installCmd: '', buildCmd: '', startCmd: '', publicDir: '', preDeployScript: '', postDeployScript: '' },
 };
+
+/**
+ * Mirrors the server's `isValidPublicDir` (server/src/system/templates.ts) so a value that would be
+ * rejected with a bare "invalid publicDir" 400 is caught inline instead. Kept deliberately in sync:
+ * the directory is interpolated into the vhost's `root`, so a leading `/` or a `..` segment could
+ * point the web root outside the release.
+ */
+const PUBLIC_DIR_RE = /^[a-zA-Z0-9][a-zA-Z0-9_./-]*$/;
+
+/**
+ * Offered alongside the repo's real directories. A site's web root is very often produced by the
+ * build rather than committed, so these cover the conventional output names that `listTopLevelDirs`
+ * cannot see.
+ */
+const COMMON_PUBLIC_DIRS = ['public', 'dist', 'build', 'out', '_site'];
+
+function publicDirError(value: string): string | null {
+  if (value === '') return null;
+  if (!PUBLIC_DIR_RE.test(value)) {
+    return 'Must be a relative path starting with a letter or number — no leading slash.';
+  }
+  if (value.split('/').some((segment) => segment === '..')) {
+    return 'Cannot contain a ".." segment.';
+  }
+  return null;
+}
 
 const PHP_VERSIONS = ['8.1', '8.2', '8.3', '8.4'];
 const NODE_VERSIONS = ['18', '20', '22'];
+
+// ---------------------------------------------------------------------------
+// Optional database — a connection first, then a database on it
+// ---------------------------------------------------------------------------
+
+const DB_ENGINES: { value: DbEngine; label: string }[] = [
+  { value: 'mysql', label: 'MySQL' },
+  { value: 'postgres', label: 'PostgreSQL' },
+];
+
+/**
+ * How a connection is labelled in the picker: its name, then where it actually points. The host and
+ * port are the part that tells a local engine from a registered RDS instance at a glance, which is
+ * the whole reason the connection is asked for first.
+ */
+function connectionLabel(connection: DbConnection): string {
+  return `${connection.name} · ${connection.host}:${String(connection.port)}`;
+}
+
+/**
+ * A database name suggestion from the project slug: hyphens aren't legal in either engine's
+ * unquoted identifiers (and `IDENTIFIER_RE` rejects them), so they become underscores, and the
+ * result is trimmed to the 32 characters that regex allows.
+ */
+function dbNameFromSlug(slug: string): string {
+  const candidate = slug.replace(/-/g, '_').replace(/[^a-z0-9_]/g, '').replace(/^[^a-z]+/, '');
+  return candidate.slice(0, 32);
+}
+
+const DB_ENGINE_LABEL: Record<DbEngine, string> = { mysql: 'MySQL', postgres: 'PostgreSQL' };
+
+function dbNameError(name: string): string | null {
+  if (name === '') return 'Give the database a name.';
+  if (!IDENTIFIER_RE.test(name)) {
+    return 'Lowercase letters, numbers, and underscores only, starting with a letter. Up to 32 characters.';
+  }
+  // Mirrors the server's own refusal (routes/databases.ts): `mysql`, `postgres`, `information_schema`
+  // and friends are the engines' own system databases, and creating a project database with one of
+  // those names grants the project access to the server's user and grant tables.
+  if (isReservedDbName(name)) {
+    return `"${name}" is a system database name on MySQL or PostgreSQL. Pick another name.`;
+  }
+  return null;
+}
+
+/**
+ * How a project gets its database: no database at all, a new one created on the chosen connection,
+ * or one that is already there.
+ */
+type DbMode = 'none' | 'create' | 'existing';
+
+/** The Connection dropdown's "don't give this project a database" value. */
+const DB_CONNECTION_NONE = '';
+
+/**
+ * `name · project` — the name first, since that is what the user picks by. The connection is not
+ * repeated: the list only holds databases on the connection already selected above it.
+ */
+function databaseOptionLabel(database: DatabaseListItem): string {
+  const attached = database.projectName === null ? 'unattached' : database.projectName;
+  return `${database.name} · ${attached}`;
+}
 
 interface ProvisionError {
   step: string;
@@ -136,6 +269,19 @@ interface ProvisionError {
 
 function errorMessage(err: unknown): string {
   return err instanceof ApiError ? err.message : 'Something went wrong. Try again.';
+}
+
+/**
+ * `POST /api/databases` fails with a bare `{ error: 'database provisioning failed', detail }` — the
+ * `error` alone ("database provisioning failed") says nothing actionable, so the `detail` (missing
+ * admin credentials, a name the engine already has, …) is what gets shown.
+ */
+function databaseErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    const detail = (err.body as { detail?: string } | undefined)?.detail;
+    return detail === undefined || detail === '' ? err.message : `${err.message}: ${detail}`;
+  }
+  return 'Something went wrong creating the database.';
 }
 
 function sleep(ms: number): Promise<void> {
@@ -218,8 +364,20 @@ export default function ProjectNewPage() {
   const [installCmd, setInstallCmd] = useState(TYPE_DEFAULTS.php.installCmd);
   const [buildCmd, setBuildCmd] = useState(TYPE_DEFAULTS.php.buildCmd);
   const [startCmd, setStartCmd] = useState(TYPE_DEFAULTS.php.startCmd);
+  const [publicDir, setPublicDir] = useState(TYPE_DEFAULTS.php.publicDir);
+  const [preDeployScript, setPreDeployScript] = useState(TYPE_DEFAULTS.php.preDeployScript);
+  const [postDeployScript, setPostDeployScript] = useState(TYPE_DEFAULTS.php.postDeployScript);
   const [healthCheckPath, setHealthCheckPath] = useState('');
-  const [envContent, setEnvContent] = useState('');
+
+  // Optional database, asked as two questions: which connection, then which database on it.
+  // 'create' provisions one right after the project and before its env is written (see
+  // handleDeploy), so the generated password can go straight into DB_PASSWORD; 'existing' reuses a
+  // database already on that connection and injects its stored credentials.
+  const [dbConnectionId, setDbConnectionId] = useState<string>(DB_CONNECTION_NONE);
+  const [dbCreateNew, setDbCreateNew] = useState(false);
+  const [dbExistingId, setDbExistingId] = useState<number | null>(null);
+  const [dbNameInput, setDbNameInput] = useState('');
+  const [dbNameTouched, setDbNameTouched] = useState(false);
 
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
@@ -229,6 +387,10 @@ export default function ProjectNewPage() {
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [provisionError, setProvisionError] = useState<ProvisionError | null>(null);
+  // Set once the project row exists, so a follow-up step that failed (the database) can be reported
+  // without offering a Deploy button that would only 409 on the now-taken slug.
+  const [created, setCreated] = useState<{ id: number; slug: string } | null>(null);
+  const [dbError, setDbError] = useState<string | null>(null);
 
   // "Create anyway without a DNS record" — required only while dnsReady is false (spec §3 "New
   // Project DNS"); reset to false below whenever the underlying gap reason changes, so a stale ack
@@ -244,6 +406,19 @@ export default function ProjectNewPage() {
   const domainCardRef = useRef<HTMLDivElement>(null);
 
   const isNodeLike = type === 'node' || type === 'nextjs';
+  // Same runtimes as the project's Settings page: node/nextjs are proxied to a port, so a web root
+  // is meaningless there — php and static are the two nginx serves files from directly.
+  const showPublicDir = type === 'php' || type === 'static';
+  const publicDirIssue = showPublicDir ? publicDirError(publicDir) : null;
+  // Suggestions for the public-directory field: the repo's own top-level folders (GitHub sources
+  // only — a plain Git URL isn't cloned until deploy, so there's nothing to list yet), followed by
+  // the conventional build-output names that wouldn't be committed.
+  const dirsRepo = showPublicDir && source?.kind === 'github' ? source.repo : null;
+  const dirsQuery = useGithubDirs(dirsRepo, dirsRepo === null ? null : source?.branch ?? null);
+  const publicDirOptions = useMemo(() => {
+    const fromRepo = dirsQuery.data ?? [];
+    return [...fromRepo, ...COMMON_PUBLIC_DIRS.filter((d) => !fromRepo.includes(d))];
+  }, [dirsQuery.data]);
   const baseDomain = settingsQuery.data?.base_domain ?? 'your-domain';
   const serverIp = settingsQuery.data?.server_ip ?? null;
   const settingsSettled = !settingsQuery.isPending;
@@ -259,12 +434,165 @@ export default function ProjectNewPage() {
     setCreateAnyway(false);
   }, [dnsGapReason]);
 
+  // ---- environment variables ----
+
+  // Generated once per visit, deliberately: an APP_KEY that changed while the user read the env
+  // would not be the key their app ends up with.
+  const appKeyRef = useRef(generateAppKey());
+  const envDraft = useEnvDraft('');
+  // Redis/mailpit as this server actually has them, so the template can point the app at something
+  // that will answer (and degrade the driver when it can't — see deploy/laravel.ts). The same
+  // response carries which engines can take a database, which is what the connection list is built
+  // from.
+  const servicesQuery = useServicesInfo();
+  const redis = servicesQuery.data?.redis ?? null;
+  const mailpit = servicesQuery.data?.mailpit ?? null;
+  const servicesSettled = !servicesQuery.isPending;
+  // Every server a database can go on: this host's engines plus any registered external one. An
+  // engine with no admin credentials never appears in it, so nothing here has to check for that.
+  const dbConnectionsQuery = useDbConnections();
+  const dbConnections = dbConnectionsQuery.data ?? [];
+  const dbConnection = dbConnections.find((row) => row.key === dbConnectionId) ?? null;
+  // 'mysql' is only ever a placeholder for the no-connection case: every path that reads this
+  // (creating the database, rendering the env block) runs with a connection selected.
+  const dbEngine: DbEngine = dbConnection?.engine ?? 'mysql';
+
+  const databasesQuery = useDatabases();
+  // A database whose name is a system schema (`mysql`, `postgres`, …) is never offered here: its
+  // user holds privileges on the engine's own tables, so attaching it to a project would put those
+  // credentials in an app's .env. The card says how many were hidden rather than silently shortening
+  // the list. Such rows can only predate the create-time guard in routes/databases.ts.
+  const selectableDatabases = (databasesQuery.data ?? []).filter((row) => !isReservedDbName(row.name));
+  // A database belongs to the connection it was created on, so the list below is only ever that
+  // connection's own — which is what makes "create a new one here" and "use one that's already
+  // there" two answers to the same question rather than two unrelated pickers.
+  const existingDatabases = dbConnection === null ? [] : selectableDatabases.filter((row) => row.connectionKey === dbConnection.key);
+  const hiddenDatabaseCount =
+    dbConnection === null
+      ? 0
+      : (databasesQuery.data ?? []).filter((row) => row.connectionKey === dbConnection.key && isReservedDbName(row.name)).length;
+  const existingDb = existingDatabases.find((row) => row.id === dbExistingId) ?? null;
+
+  const dbMode: DbMode = dbConnection === null ? 'none' : dbCreateNew ? 'create' : 'existing';
+  const dbName = dbNameTouched ? dbNameInput : dbNameFromSlug(slug);
+  const dbNameIssue = dbMode === 'create' ? dbNameError(dbName) : null;
+  // "Use an existing database" with nothing chosen blocks Deploy, but is not shown in red: an
+  // unfinished form is not a mistake, and the placeholder plus the disabled button already say so.
+  // A database that *was* chosen and has since been dropped (in another tab, between picking it and
+  // deploying) is a mistake, and that one gets the error text.
+  const existingDbUnpicked = dbMode === 'existing' && existingDb === null;
+  const existingDbError = existingDbUnpicked && dbExistingId !== null ? 'That database no longer exists. Pick another.' : null;
+  const dbBlocked = dbNameIssue !== null || existingDbUnpicked;
+
+  // What the env template renders as its DB_* block. For an existing database the real password is
+  // fetched at submit time (it's stored encrypted server-side, revealed only on request), so the
+  // block shows its name and user now and gets the password written into it then.
+  const dbTarget =
+    dbMode === 'create' && dbNameIssue === null && dbConnection !== null
+      ? {
+          engine: dbEngine,
+          name: dbName,
+          username: dbName,
+          password: '',
+          provisioned: true,
+          host: dbConnection.host,
+          port: dbConnection.port,
+        }
+      : dbMode === 'existing' && existingDb !== null
+        ? {
+            engine: existingDb.engine,
+            name: existingDb.name,
+            username: existingDb.username,
+            password: '',
+            provisioned: false,
+            host: existingDb.host,
+            port: existingDb.port,
+          }
+        : null;
+
+  /**
+   * The Laravel starting point for a php project, recomputed live from the name/slug/database the
+   * user is choosing. Empty for every other type — a node/next/static project has no env Shipway
+   * can guess. `DB_PASSWORD` is blank here because the database does not exist yet; `handleDeploy`
+   * fills it in (via `upsertEnvVars`) the moment it does.
+   */
+  const envTemplate = useMemo(() => {
+    if (type !== 'php' || !servicesSettled) return '';
+    return buildPhpEnv({
+      appName: name.trim() === '' ? 'Laravel' : name,
+      appUrl: `https://${slug === '' ? 'your-project' : slug}.${baseDomain}`,
+      appKey: appKeyRef.current,
+      baseDomain,
+      redis: redis ? { host: redis.host, port: redis.port, password: redis.password ?? null } : null,
+      mail: mailpit ? { host: mailpit.smtpHost, port: mailpit.smtpPort } : null,
+      db: dbTarget,
+    });
+  }, [
+    type,
+    servicesSettled,
+    name,
+    slug,
+    baseDomain,
+    redis,
+    mailpit,
+    dbTarget?.engine,
+    dbTarget?.name,
+    dbTarget?.username,
+    dbTarget?.provisioned,
+    dbTarget?.host,
+    dbTarget?.port,
+  ]);
+
+  // Keeps the draft in step with the template until the user types in it — from then on it is
+  // theirs, and only the explicit "Reset" button below re-applies the template. The ref makes this
+  // idempotent: `reset` builds fresh row objects every time, so re-running it on its own re-render
+  // would loop forever.
+  const appliedTemplateRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (envDraft.dirty || appliedTemplateRef.current === envTemplate) return;
+    appliedTemplateRef.current = envTemplate;
+    envDraft.reset(envTemplate);
+  }, [envTemplate, envDraft]);
+
+  // Only fires if the chosen connection stops being offered — its engine turns out to have no admin
+  // credentials on this host once `/api/services/info` settles. Clearing it is the honest outcome:
+  // there is nowhere to put the database that was being described.
+  useEffect(() => {
+    if (dbConnectionId !== DB_CONNECTION_NONE && !dbConnectionsQuery.isPending && !dbConnections.some((row) => row.key === dbConnectionId)) {
+      setDbConnectionId(DB_CONNECTION_NONE);
+      setDbCreateNew(false);
+      setDbExistingId(null);
+    }
+  }, [dbConnections, dbConnectionId, dbConnectionsQuery.isPending]);
+
+  /**
+   * Picking a connection clears what was chosen on the previous one: a database belongs to the
+   * connection it lives on, so carrying that selection across would point the project at a database
+   * the new connection has never heard of. A connection with nothing on it yet opens on "create a
+   * new database", since that is the only thing it can offer.
+   */
+  function handleDbConnectionChange(next: string): void {
+    setDbConnectionId(next);
+    setDbExistingId(null);
+    const connection = dbConnections.find((row) => row.key === next) ?? null;
+    const hasExisting = connection !== null && selectableDatabases.some((row) => row.connectionKey === connection.key);
+    setDbCreateNew(connection !== null && !hasExisting);
+  }
+
+  function resetEnvToTemplate(): void {
+    appliedTemplateRef.current = envTemplate;
+    envDraft.reset(envTemplate);
+  }
+
   function handleTypeChange(next: ProjectType) {
     setType(next);
     const defaults = TYPE_DEFAULTS[next];
     setInstallCmd(defaults.installCmd);
     setBuildCmd(defaults.buildCmd);
     setStartCmd(defaults.startCmd);
+    setPublicDir(defaults.publicDir);
+    setPreDeployScript(defaults.preDeployScript);
+    setPostDeployScript(defaults.postDeployScript);
   }
 
   function handleNameChange(value: string) {
@@ -302,12 +630,26 @@ export default function ProjectNewPage() {
     slug !== '' &&
     SLUG_RE.test(slug) &&
     branch.trim() !== '' &&
+    publicDirIssue === null &&
+    !dbBlocked &&
+    created === null &&
     !submitting &&
     (dnsReady || createAnyway);
 
   function setBranch(next: string) {
     if (!source) return;
     setSource({ ...source, branch: next });
+  }
+
+  /** Queues the first deploy and lands on its live log, or on the project if queueing failed. */
+  async function startFirstDeploy(projectId: number): Promise<void> {
+    try {
+      const { deploymentId } = await deployProject(projectId);
+      navigate(`/projects/${String(projectId)}/deployments/${String(deploymentId)}`);
+    } catch {
+      // Best-effort, matching the create-then-deploy split below — land on the project instead.
+      navigate(`/projects/${String(projectId)}`);
+    }
   }
 
   async function handleDeploy(event: FormEvent) {
@@ -318,6 +660,7 @@ export default function ProjectNewPage() {
     setProvisionError(null);
     setSlugApiError(null);
     setDnsResult(null);
+    setDbError(null);
     setSubmitting(true);
 
     const body: CreateProjectBody = {
@@ -328,13 +671,17 @@ export default function ProjectNewPage() {
       ...(source.kind === 'github' ? { repo: source.repo } : { repoUrl: source.repoUrl }),
       installCmd,
       buildCmd,
+      preDeployScript,
+      postDeployScript,
       healthCheckPath: healthCheckPath.trim() === '' ? null : healthCheckPath.trim(),
+      ...(showPublicDir ? { publicDir } : {}),
       ...(type === 'php' ? { phpVersion } : {}),
       ...(isNodeLike ? { nodeVersion, startCmd } : {}),
     };
 
     try {
       const project = await createProject(body);
+      setCreated({ id: project.id, slug: project.slug });
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
       await queryClient.invalidateQueries({ queryKey: ['overview'] });
 
@@ -356,22 +703,62 @@ export default function ProjectNewPage() {
       domainCardRef.current?.scrollIntoView({ block: 'nearest' });
       await sleep(DNS_RESULT_DISPLAY_MS);
 
-      // Env is set post-create (PUT), before the first deploy, only when something was pasted.
-      if (envContent.trim() !== '') {
+      // The database comes before the env write, not after: its password is generated server-side
+      // and returned exactly once (POST /api/databases), so this is the only moment it can be put
+      // into the env the user just reviewed. `upsertEnvVars` writes it wherever the DB_* keys
+      // ended up — rewritten in place if the template's block survived their edits, appended if
+      // they deleted it.
+      let envText = envDraft.text();
+      let dbFailure: string | null = null;
+      let attachExistingDbId: number | null = null;
+      try {
+        if (dbMode === 'create' && dbNameIssue === null && dbConnection !== null) {
+          const db = await createDatabase({ connection: dbConnection.key, name: dbName, projectId: project.id });
+          envText = upsertEnvVars(
+            envText,
+            connectionEnv(db.engine, { name: db.name, username: db.username, password: db.password }, { host: db.host, port: db.port }),
+          );
+        } else if (dbMode === 'existing' && existingDb !== null) {
+          // The stored password is only handed out by this endpoint, so this is where the env's
+          // blank DB_PASSWORD gets its real value. `credentials.env` is the server's own rendering
+          // of the DB_* block (`connectionEnv`), used verbatim rather than reassembled here.
+          const credentials = await fetchDatabaseCredentials(existingDb.id);
+          envText = upsertEnvVars(envText, credentials.env);
+          attachExistingDbId = existingDb.id;
+        }
+      } catch (err) {
+        dbFailure = databaseErrorMessage(err);
+        setDbError(dbFailure);
+      }
+
+      if (envText.trim() !== '') {
         try {
-          await putProjectEnv(project.id, envContent);
+          await putProjectEnv(project.id, envText);
         } catch {
           // Best-effort — the project exists either way; env can still be set from its page.
         }
       }
 
-      try {
-        const { deploymentId } = await deployProject(project.id);
-        navigate(`/projects/${String(project.id)}/deployments/${String(deploymentId)}`);
-      } catch {
-        // Best-effort, matching the create-then-deploy split above — land on the project instead.
-        navigate(`/projects/${String(project.id)}`);
+      // Records the association (and audits it) now that the env is saved. Its own env append is a
+      // no-op here — every DB_* key it would add is already in the env just written — so this is
+      // purely about the database no longer showing up as belonging to nobody.
+      if (attachExistingDbId !== null) {
+        try {
+          await injectDatabase(attachExistingDbId, project.id);
+          await queryClient.invalidateQueries({ queryKey: ['databases'] });
+        } catch {
+          // The credentials are already in the env, which is what actually matters for the deploy.
+        }
       }
+
+      // A failed database is not a failed project, but deploying an app whose DB_PASSWORD is still
+      // blank would just fail its migrations — so stop here and let the user decide (the rail shows
+      // what went wrong, with "Deploy anyway" and a link to the project).
+      if (dbFailure !== null) {
+        return;
+      }
+
+      await startFirstDeploy(project.id);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         setSlugApiError(err.message === 'this name is reserved' ? 'This name is reserved.' : 'This slug is already in use.');
@@ -420,13 +807,24 @@ export default function ProjectNewPage() {
               domainCardRef={domainCardRef}
               type={type}
               buildCmd={buildCmd}
+              database={dbTarget ? { engine: dbTarget.engine, name: dbTarget.name } : null}
               submitting={submitting}
               canSubmit={canSubmit}
               formError={formError}
               provisionError={provisionError}
+              created={created}
+              dbError={dbError}
+              onDeployAnyway={() => {
+                if (created) void startFirstDeploy(created.id);
+              }}
             />
           }
         >
+          {/* Name/slug first: the project's domain, its suggested database name, and the APP_URL in
+              the env below are all derived from the slug, so they should be settled before the user
+              reads any of them. */}
+          <ProjectNameCard name={name} slug={slug} slugError={slugError} onNameChange={handleNameChange} onSlugChange={handleSlugChange} />
+
           <FrameworkTiles type={type} onChange={handleTypeChange} />
 
           {type === 'php' && (
@@ -457,16 +855,64 @@ export default function ProjectNewPage() {
             buildCmd={buildCmd}
             startCmd={startCmd}
             isNodeLike={isNodeLike}
+            showPublicDir={showPublicDir}
+            publicDir={publicDir}
+            publicDirIssue={publicDirIssue}
+            publicDirOptions={publicDirOptions}
             onInstallCmd={setInstallCmd}
             onBuildCmd={setBuildCmd}
             onStartCmd={setStartCmd}
+            onPublicDir={setPublicDir}
           />
 
-          <EnvVarsCard value={envContent} onChange={setEnvContent} />
+          <DeployScriptsCard
+            type={type}
+            preDeployScript={preDeployScript}
+            postDeployScript={postDeployScript}
+            onPreDeployScript={setPreDeployScript}
+            onPostDeployScript={setPostDeployScript}
+            onResetToDefaults={() => {
+              setPreDeployScript(TYPE_DEFAULTS[type].preDeployScript);
+              setPostDeployScript(TYPE_DEFAULTS[type].postDeployScript);
+            }}
+          />
+
+          <DatabaseCard
+            connections={dbConnections}
+            connectionId={dbConnectionId}
+            connection={dbConnection}
+            mode={dbMode}
+            existingDatabases={existingDatabases}
+            existingDatabasesPending={databasesQuery.isPending}
+            existingId={dbExistingId}
+            existingDb={existingDb}
+            existingError={existingDbError}
+            hiddenDatabaseCount={hiddenDatabaseCount}
+            name={dbName}
+            nameIssue={dbNameIssue}
+            onConnectionChange={handleDbConnectionChange}
+            onCreateNewChange={(value) => {
+              setDbCreateNew(value);
+              if (value) setDbExistingId(null);
+            }}
+            onExistingChange={setDbExistingId}
+            onNameChange={(value) => {
+              setDbNameTouched(true);
+              setDbNameInput(value);
+            }}
+          />
+
+          <EnvVarsCard
+            draft={envDraft}
+            type={type}
+            servicesPending={!servicesSettled}
+            redisConfigured={redis !== null}
+            mailpitConfigured={mailpit !== null}
+            onReset={resetEnvToTemplate}
+          />
 
           <HealthCheckCard value={healthCheckPath} onChange={setHealthCheckPath} />
 
-          <ProjectNameCard name={name} slug={slug} slugError={slugError} onNameChange={handleNameChange} onSlugChange={handleSlugChange} />
         </PageWithRail>
       </form>
     </div>
@@ -782,17 +1228,27 @@ function DeployConfigDetails({
   buildCmd,
   startCmd,
   isNodeLike,
+  showPublicDir,
+  publicDir,
+  publicDirIssue,
+  publicDirOptions,
   onInstallCmd,
   onBuildCmd,
   onStartCmd,
+  onPublicDir,
 }: {
   installCmd: string;
   buildCmd: string;
   startCmd: string;
   isNodeLike: boolean;
+  showPublicDir: boolean;
+  publicDir: string;
+  publicDirIssue: string | null;
+  publicDirOptions: string[];
   onInstallCmd: (v: string) => void;
   onBuildCmd: (v: string) => void;
   onStartCmd: (v: string) => void;
+  onPublicDir: (v: string) => void;
 }) {
   return (
     <details open className="group rounded-2xl border border-line bg-surface">
@@ -818,26 +1274,370 @@ function DeployConfigDetails({
             <Input mono value={startCmd} onChange={(event) => onStartCmd(event.target.value)} />
           </Field>
         )}
+        {showPublicDir && (
+          <Field
+            label="Public directory"
+            error={publicDirIssue ?? undefined}
+            hint="The folder nginx serves, relative to the repo root. Pick one of the repo's folders, or type a build-output folder (dist, build, …) — those don't exist until the build runs, so they aren't listed. Leave blank to serve the repo root."
+          >
+            <Input
+              mono
+              list="public-dir-options"
+              value={publicDir}
+              onChange={(event) => onPublicDir(event.target.value)}
+              placeholder="repo root"
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <datalist id="public-dir-options">
+              {publicDirOptions.map((dir) => (
+                <option key={dir} value={dir} />
+              ))}
+            </datalist>
+          </Field>
+        )}
       </div>
     </details>
   );
 }
 
-function EnvVarsCard({ value, onChange }: { value: string; onChange: (v: string) => void }) {
-  const lineCount = value === '' ? 0 : value.split('\n').filter((line) => line.trim() !== '').length;
+/**
+ * Environment variables, in the same two views the project's Environment tab uses (a key/value
+ * table, and the whole file as free text) — because for a php project this box is not empty: it
+ * arrives holding the Laravel defaults from `deploy/laravel.ts`, already pointed at this server's
+ * redis and mailpit and at whatever database is being created alongside the project. The point is
+ * that the user reads and edits it here, before the first deploy, instead of meeting a 500 after it.
+ *
+ * `onReset` re-applies that template, which is the only way back to it once the draft is dirty (the
+ * live regeneration in the page stops the moment the user types, so their edits are never eaten by
+ * a later keystroke in the Name field).
+ */
+/**
+ * Says which of this server's shared services the env is already wired to — and, when one is
+ * missing, which driver the template fell back to because of it (see `deploy/laravel.ts`), so a
+ * `sync` queue or a logged email is never a surprise later.
+ */
+function servicesNote(redisConfigured: boolean, mailpitConfigured: boolean): string {
+  if (redisConfigured && mailpitConfigured) return "This server's redis and Mailpit credentials are already filled in.";
+  if (redisConfigured) return "Redis credentials are filled in. No Mailpit here, so mail is written to the log.";
+  if (mailpitConfigured) return "Mailpit credentials are filled in. No redis here, so the queue runs sync.";
+  return 'No redis or Mailpit on this server, so the queue runs sync and mail goes to the log.';
+}
+
+function EnvVarsCard({
+  draft,
+  type,
+  servicesPending,
+  redisConfigured,
+  mailpitConfigured,
+  onReset,
+}: {
+  draft: ReturnType<typeof useEnvDraft>;
+  type: ProjectType;
+  servicesPending: boolean;
+  redisConfigured: boolean;
+  mailpitConfigured: boolean;
+  onReset: () => void;
+}) {
+  const isPhp = type === 'php';
+  const description = isPhp
+    ? 'Laravel defaults, ready to edit. Written to .env before the first deploy.'
+    : 'Paste your .env. Written before the first deploy.';
+
   return (
     <Card>
-      <CardHeader icon={<Braces size={20} strokeWidth={ICON_STROKE} />} title="Environment variables" description="Paste your .env. Set after the project is created, before the first deploy." />
-      <div className="mt-4 flex flex-col gap-1.5">
-        <Textarea mono rows={6} placeholder={'APP_KEY=\nDB_HOST=127.0.0.1'} value={value} onChange={(event) => onChange(event.target.value)} />
-        <div className="flex items-center justify-between text-[13px] text-soft">
-          <span>.env format</span>
-          <span>
-            {lineCount} {lineCount === 1 ? 'variable' : 'variables'}
-          </span>
-        </div>
+      <CardHeader icon={<Braces size={20} strokeWidth={ICON_STROKE} />} title="Environment variables" description={description} />
+
+      <div className="mt-4 flex flex-col gap-3">
+        {isPhp && servicesPending ? (
+          <Skeleton className="h-64 w-full rounded-xl" />
+        ) : (
+          <EnvDraftEditor
+            draft={draft}
+            rawLabel="Raw .env"
+            emptyText={isPhp ? 'No variables yet — Reset to defaults fills in a working Laravel .env.' : 'No environment variables yet.'}
+            rawRows={16}
+          />
+        )}
+
+        {isPhp && !servicesPending && (
+          <div className="flex flex-wrap items-center gap-3">
+            <Button type="button" variant="outline" size="sm" onClick={onReset} disabled={!draft.dirty}>
+              Reset to Laravel defaults
+            </Button>
+            <span className="text-[13px] text-soft">{servicesNote(redisConfigured, mailpitConfigured)}</span>
+          </div>
+        )}
       </div>
     </Card>
+  );
+}
+
+/**
+ * Pre/post-deploy scripts, prefilled for php with the Laravel commands that belong at each stage
+ * (`deploy/laravel.ts` documents why migrate lives in the build command and `storage:link`/
+ * `queue:restart` run post-activation). Collapsed by default for every other type, where there is
+ * nothing to prefill.
+ */
+function DeployScriptsCard({
+  type,
+  preDeployScript,
+  postDeployScript,
+  onPreDeployScript,
+  onPostDeployScript,
+  onResetToDefaults,
+}: {
+  type: ProjectType;
+  preDeployScript: string;
+  postDeployScript: string;
+  onPreDeployScript: (v: string) => void;
+  onPostDeployScript: (v: string) => void;
+  onResetToDefaults: () => void;
+}) {
+  const isPhp = type === 'php';
+
+  return (
+    <details open={isPhp} className="group rounded-2xl border border-line bg-surface">
+      <summary className="flex cursor-pointer list-none items-center gap-3.5 p-6 [&::-webkit-details-marker]:hidden">
+        <IconChip>
+          <PlayCircle size={20} strokeWidth={ICON_STROKE} />
+        </IconChip>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-xl font-semibold text-ink">Deploy scripts</h2>
+          <p className="mt-0.5 text-sm text-soft">
+            {isPhp ? "Laravel's artisan steps, at the stage each one belongs to." : 'Shell scripts run around each deploy.'}
+          </p>
+        </div>
+        <ChevronDown size={18} strokeWidth={ICON_STROKE} aria-hidden className="shrink-0 text-icon transition-transform duration-150 ease-out group-open:rotate-180" />
+      </summary>
+      <div className="flex flex-col gap-4 px-6 pb-6">
+        <Field label="Pre-deploy" hint="Runs after the code is exported and .env is written, before the install command. A non-zero exit fails the deploy.">
+          <Textarea mono spellCheck={false} rows={6} value={preDeployScript} onChange={(event) => onPreDeployScript(event.target.value)} />
+        </Field>
+        <Field label="Post-deploy" hint="Runs once the release is live and healthy. A failure here does not roll it back.">
+          <Textarea mono spellCheck={false} rows={8} value={postDeployScript} onChange={(event) => onPostDeployScript(event.target.value)} />
+        </Field>
+        {isPhp && (
+          <div>
+            <Button type="button" variant="outline" size="sm" onClick={onResetToDefaults}>
+              Reset to Laravel defaults
+            </Button>
+          </div>
+        )}
+      </div>
+    </details>
+  );
+}
+
+/**
+ * The project's database, asked the way it actually works: first the connection — a database server
+ * Shipway can reach — then either a new database created on it (a name is all it takes; Shipway
+ * provisions the database and its user) or one that is already there, connected to as-is.
+ *
+ * Connection first rather than one flat list of every database, because the connection is the axis
+ * that grows: an external Postgres (RDS, a managed instance) becomes another entry in that first
+ * dropdown whose own databases fill the second, and nothing else about this card changes.
+ */
+function DatabaseCard({
+  connections,
+  connectionId,
+  connection,
+  mode,
+  existingDatabases,
+  existingDatabasesPending,
+  existingId,
+  existingDb,
+  existingError,
+  hiddenDatabaseCount,
+  name,
+  nameIssue,
+  onConnectionChange,
+  onCreateNewChange,
+  onExistingChange,
+  onNameChange,
+}: {
+  connections: DbConnection[];
+  connectionId: string;
+  connection: DbConnection | null;
+  mode: DbMode;
+  existingDatabases: DatabaseListItem[];
+  existingDatabasesPending: boolean;
+  existingId: number | null;
+  existingDb: DatabaseListItem | null;
+  existingError: string | null;
+  hiddenDatabaseCount: number;
+  name: string;
+  nameIssue: string | null;
+  onConnectionChange: (id: string) => void;
+  onCreateNewChange: (createNew: boolean) => void;
+  onExistingChange: (id: number | null) => void;
+  onNameChange: (name: string) => void;
+}) {
+  // Named so the card can say which of this host's engines is missing rather than just quietly
+  // listing fewer connections — an absent entry otherwise reads as a bug rather than as
+  // unconfigured credentials. Registered external servers are not expected to be there at all, so
+  // only the two local engines are checked for.
+  const missingEngines = DB_ENGINES.filter((engine) => !connections.some((row) => row.kind === 'local' && row.engine === engine.value));
+  // Nothing to pick from, so the choice collapses to "create a new one" on its own.
+  const noExisting = !existingDatabasesPending && existingDatabases.length === 0;
+
+  return (
+    <Card>
+      <CardHeader
+        icon={<Database size={20} strokeWidth={ICON_STROKE} />}
+        title="Database"
+        description="Pick a connection, then create a database on it or use one that's already there. Its credentials go into the env below as DB_*."
+      />
+      <div className="mt-4 flex flex-col gap-4">
+        <Field
+          label="Connection"
+          hint={
+            connections.length === 0
+              ? 'No database server on this host has admin credentials configured.'
+              : 'The database server this project connects to.'
+          }
+        >
+          <Select mono value={connectionId} onChange={(event) => onConnectionChange(event.target.value)}>
+            <option value={DB_CONNECTION_NONE}>No database</option>
+            {connections.map((row) => (
+              <option key={row.key} value={row.key}>
+                {connectionLabel(row)}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        {missingEngines.length > 0 && (
+          <p className="text-[13px] text-soft">
+            {missingEngines.map((engine) => engine.label).join(' and ')} has no admin credentials on this server, so it isn&rsquo;t
+            listed as a connection. External servers can be registered on the{' '}
+            <Link href="/databases" className="font-medium text-link hover:underline">
+              Databases page
+            </Link>
+            .
+          </p>
+        )}
+
+        {connection !== null && (
+          <>
+            <div role="radiogroup" aria-label="How this project gets its database" className="flex flex-col gap-3 sm:flex-row">
+              <DbModeOption
+                label="Use an existing database"
+                description={noExisting ? 'Nothing on this connection yet' : `${String(existingDatabases.length)} on this connection`}
+                checked={mode === 'existing'}
+                disabled={noExisting}
+                onSelect={() => onCreateNewChange(false)}
+              />
+              <DbModeOption
+                label="Create a new database"
+                description="Shipway provisions it and its user"
+                checked={mode === 'create'}
+                disabled={false}
+                onSelect={() => onCreateNewChange(true)}
+              />
+            </div>
+
+            {mode === 'existing' &&
+              (existingDatabasesPending ? (
+                <Skeleton className="h-11 w-full" />
+              ) : (
+                <Field
+                  label="Database"
+                  error={existingError ?? undefined}
+                  hint={
+                    existingError
+                      ? undefined
+                      : existingDatabases.length === 0
+                        ? 'No databases on this connection yet — create one instead.'
+                        : 'Databases on this connection, as listed on the Databases page.'
+                  }
+                >
+                  <Select
+                    mono
+                    value={existingId === null ? '' : String(existingId)}
+                    onChange={(event) => onExistingChange(event.target.value === '' ? null : Number(event.target.value))}
+                  >
+                    <option value="">Select a database…</option>
+                    {existingDatabases.map((database) => (
+                      <option key={database.id} value={database.id}>
+                        {databaseOptionLabel(database)}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              ))}
+
+            {mode === 'create' && (
+              <Field
+                label="Database name"
+                error={nameIssue ?? undefined}
+                hint={nameIssue ? undefined : `Created on ${connection.name}, with a user of the same name. Suggested from the project slug.`}
+              >
+                <Input mono value={name} onChange={(event) => onNameChange(event.target.value)} autoComplete="off" spellCheck={false} />
+              </Field>
+            )}
+          </>
+        )}
+
+        {hiddenDatabaseCount > 0 && (
+          <p className="text-[13px] text-warn">
+            {hiddenDatabaseCount} {hiddenDatabaseCount === 1 ? 'database is' : 'databases are'} not listed: their name is a system
+            database on MySQL or PostgreSQL, so their credentials must not go into a project.{' '}
+            <Link href="/databases" className="font-medium text-link hover:underline">
+              Review them
+            </Link>
+            .
+          </p>
+        )}
+
+        {mode === 'existing' && existingDb !== null && (
+          <div className="rounded-xl bg-surface-2 px-4 py-3 font-mono text-sm text-soft">
+            user {existingDb.username} · password filled in when the project is created
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/** One of the two answers to "how does this project get its database" — same shape as the engine
+ * radios on the Databases page, so the two pages read as one idea. */
+function DbModeOption({
+  label,
+  description,
+  checked,
+  disabled,
+  onSelect,
+}: {
+  label: string;
+  description: string;
+  checked: boolean;
+  disabled: boolean;
+  onSelect: () => void;
+}) {
+  return (
+    <label
+      className={`flex flex-1 items-start gap-3 rounded-xl border px-4 py-3 transition-colors duration-150 ease-out ${
+        disabled
+          ? 'cursor-not-allowed border-line bg-surface opacity-60'
+          : checked
+            ? 'cursor-pointer border-focus bg-surface-2'
+            : 'cursor-pointer border-line bg-surface hover:bg-surface-2'
+      }`}
+    >
+      <input
+        type="radio"
+        name="db-mode"
+        checked={checked}
+        disabled={disabled}
+        onChange={onSelect}
+        className="mt-0.5 h-4 w-4 accent-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      />
+      <span className="min-w-0">
+        <span className="block text-sm font-semibold text-ink">{label}</span>
+        <span className="mt-0.5 block text-[13px] text-soft">{description}</span>
+      </span>
+    </label>
   );
 }
 
@@ -900,10 +1700,14 @@ function ConfigureRail({
   domainCardRef,
   type,
   buildCmd,
+  database,
   submitting,
   canSubmit,
   formError,
   provisionError,
+  created,
+  dbError,
+  onDeployAnyway,
 }: {
   source: Source | null;
   onBranchChange: (branch: string) => void;
@@ -920,10 +1724,14 @@ function ConfigureRail({
   domainCardRef: RefObject<HTMLDivElement | null>;
   type: ProjectType;
   buildCmd: string;
+  database: { engine: DbEngine; name: string } | null;
   submitting: boolean;
   canSubmit: boolean;
   formError: string | null;
   provisionError: ProvisionError | null;
+  created: { id: number; slug: string } | null;
+  dbError: string | null;
+  onDeployAnyway: () => void;
 }) {
   const domain = `${slug || 'your-project'}.${baseDomain}`;
 
@@ -934,9 +1742,11 @@ function ConfigureRail({
         <div className="mt-4">
           {source?.kind === 'github' ? (
             <GithubBranchField repo={source.repo} branch={source.branch} onChange={onBranchChange} />
+          ) : source?.kind === 'url' ? (
+            <GitUrlBranchField repoUrl={source.repoUrl} branch={source.branch} onChange={onBranchChange} />
           ) : (
             <Field label="Branch">
-              <Input mono value={source?.branch ?? ''} onChange={(event) => onBranchChange(event.target.value)} />
+              <Input mono value="" onChange={(event) => onBranchChange(event.target.value)} />
             </Field>
           )}
         </div>
@@ -961,6 +1771,7 @@ function ConfigureRail({
           <SummaryRow label="Domain" value={domain} mono />
           <SummaryRow label="Framework" value={TYPE_LABEL[type]} />
           <SummaryRow label="Build command" value={buildCmd || 'none'} mono />
+          <SummaryRow label="Database" value={database ? `${DB_ENGINE_LABEL[database.engine]} · ${database.name}` : 'none'} mono={database !== null} />
         </div>
       </Card>
 
@@ -976,9 +1787,33 @@ function ConfigureRail({
         </div>
       )}
 
-      <Button type="submit" loading={submitting} disabled={!canSubmit} className="w-full">
-        Deploy
-      </Button>
+      {/* The project exists but its database does not, so its first deploy would fail its
+          migrations. Deploying is still the user's call — nothing here is stuck. */}
+      {created && dbError ? (
+        <div className="flex flex-col gap-3">
+          <div className="rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
+            <p className="text-sm font-medium text-danger">Project created, but its database wasn&rsquo;t</p>
+            <p className="mt-1 text-sm text-soft">{dbError}</p>
+            <p className="mt-2 text-sm text-soft">
+              Create it from{' '}
+              <Link href="/databases" className="font-medium text-link hover:underline">
+                Databases
+              </Link>{' '}
+              and use &ldquo;Add to project env&rdquo;, then deploy.
+            </p>
+          </div>
+          <Button type="button" variant="outline" onClick={onDeployAnyway} className="w-full">
+            Deploy anyway
+          </Button>
+          <ButtonLink href={`/projects/${String(created.id)}`} variant="secondary" className="w-full">
+            Open project
+          </ButtonLink>
+        </div>
+      ) : (
+        <Button type="submit" loading={submitting} disabled={!canSubmit} className="w-full">
+          Deploy
+        </Button>
+      )}
     </>
   );
 }
@@ -1084,6 +1919,61 @@ function SummaryRow({ label, value, mono = false }: { label: string; value: stri
       <span className="text-sm text-soft">{label}</span>
       <span className={`min-w-0 truncate text-right text-sm font-medium text-ink ${mono ? 'font-mono' : ''}`}>{value}</span>
     </div>
+  );
+}
+
+/**
+ * Branch dropdown for a pasted Git URL, from `git ls-remote` (`GET /api/git/branches`). Falls back
+ * to a free-text input whenever the remote can't be listed — a private URL without credentials, a
+ * host that doesn't answer — because a branch typed by hand still deploys fine; only the
+ * convenience of picking from a list is lost.
+ *
+ * On the first successful listing it also corrects the branch: step 1 has to guess `main` before
+ * anything about the remote is known, and a repo whose default is `master` (or `develop`) would
+ * otherwise fail its first deploy with "branch not found". The ref keeps that to exactly once, so
+ * it can never fight a choice the user makes afterwards.
+ */
+function GitUrlBranchField({ repoUrl, branch, onChange }: { repoUrl: string; branch: string; onChange: (branch: string) => void }) {
+  const branchesQuery = useGitBranches(repoUrl);
+  const branches = branchesQuery.data?.branches;
+  const defaultBranch = branchesQuery.data?.defaultBranch ?? null;
+  const correctedRef = useRef(false);
+
+  useEffect(() => {
+    if (correctedRef.current || !branches || branches.length === 0) return;
+    correctedRef.current = true;
+    if (!branches.includes(branch) && defaultBranch !== null) {
+      onChange(defaultBranch);
+    }
+  }, [branches, defaultBranch, branch, onChange]);
+
+  if (branchesQuery.isPending) {
+    return <Skeleton className="h-11 w-full" />;
+  }
+
+  if (branchesQuery.isError || !branches || branches.length === 0) {
+    return (
+      <Field
+        label="Branch"
+        hint={branchesQuery.isError ? "Couldn't read the branches from this URL — type the branch to deploy." : undefined}
+      >
+        <Input mono value={branch} onChange={(event) => onChange(event.target.value)} />
+      </Field>
+    );
+  }
+
+  const options = branches.includes(branch) ? branches : [branch, ...branches];
+
+  return (
+    <Field label="Branch">
+      <Select mono value={branch} onChange={(event) => onChange(event.target.value)}>
+        {options.map((option) => (
+          <option key={option} value={option}>
+            {option}
+          </option>
+        ))}
+      </Select>
+    </Field>
   );
 }
 

@@ -21,7 +21,9 @@ import { authRoutes } from './routes/auth.js';
 import { cloudflareRoutes } from './routes/cloudflare.js';
 import { cronRoutes } from './routes/cron.js';
 import { databaseRoutes, servicesRoutes } from './routes/databases.js';
+import { dbConnectionRoutes } from './routes/dbconnections.js';
 import { deploymentRoutes } from './routes/deployments.js';
+import { gitRoutes } from './routes/git.js';
 import { githubRoutes } from './routes/github.js';
 import { mailRoutes } from './routes/mail.js';
 import { notificationRoutes } from './routes/notifications.js';
@@ -36,7 +38,7 @@ import { recordAudit, runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle 
 import { FakeDnsClient, isBlankCredential, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
-import { makeGitOps } from './services/git.js';
+import { makeGitOps, type GitOps } from './services/git.js';
 import { GitHubService, resolveCloneUrl, type GithubAppConfig } from './services/github.js';
 import { DEFAULT_MAIL_TIMEOUT_MS } from './services/mailer.js';
 import { startServiceWatch, type ServiceWatchHandle } from './services/servicewatch.js';
@@ -76,6 +78,9 @@ declare module 'fastify' {
     queue: DeployQueue;
     /** Provisions/deprovisions MySQL/Postgres databases; backed by `mysql_admin_url`/`postgres_admin_url` settings. */
     dbAdmin: DbAdmin;
+    /** Git plumbing (mirror fetch, release export, remote branch listing). Shared by the deploy
+     * pipeline and `routes/git.ts`, so a test can inject one double for both. */
+    gitOps: GitOps;
     /** The 60s service-status poller's handle (Task 4), or `undefined` when it isn't running — see
      * `buildApp`'s `deps.serviceWatch` for when that is. `app.close()` stops it via an `onClose` hook. */
     serviceWatch: ServiceWatchHandle | undefined;
@@ -214,6 +219,9 @@ export async function buildApp(
     /** Test-only override: replaces the real mysql2/pg-backed `DbAdmin` with a fake (e.g. one that
      * records calls and can be made to throw), so database route tests never touch a real server. */
     dbAdmin?: DbAdmin;
+    /** Test-only override: replaces the real `execa`-backed `GitOps` (used by both the deploy
+     * pipeline and `/api/git/branches`) with a stub, so a route test never shells out to git. */
+    gitOps?: GitOps;
     /** Test-only override: path to the built web SPA's `dist` directory, in place of the real
      * `web/dist` sibling package. Lets tests exercise the SPA-fallback static serving (present and
      * absent) without depending on whether `web` has actually been built in the checkout. */
@@ -262,16 +270,12 @@ export async function buildApp(
     return githubAppCfg ? new GitHubService(githubAppCfg) : null;
   });
   app.decorate('sysops', deps.sysops ?? makeSysOps(cfg));
+  app.decorate('gitOps', deps.gitOps ?? makeGitOps());
   app.decorate('secretBox', SecretBox.load(cfg.secretKeyPath));
   app.decorate('mailSendTimeoutMs', deps.mailSendTimeoutMs ?? DEFAULT_MAIL_TIMEOUT_MS);
-  app.decorate(
-    'dbAdmin',
-    deps.dbAdmin ??
-      makeDbAdmin(() => ({
-        mysqlUrl: getSetting<string>(app.db, 'mysql_admin_url') ?? undefined,
-        postgresUrl: getSetting<string>(app.db, 'postgres_admin_url') ?? undefined,
-      })),
-  );
+  // Takes its admin credentials per call, from the connection the route resolved (see
+  // `services/dbconnections.ts`) — nothing to configure here.
+  app.decorate('dbAdmin', deps.dbAdmin ?? makeDbAdmin());
   app.decorate(
     'dns',
     deps.dns ??
@@ -333,7 +337,7 @@ export async function buildApp(
     cfg,
     db: app.db,
     sysops: app.sysops,
-    gitOps: makeGitOps(),
+    gitOps: app.gitOps,
     secretBox: app.secretBox,
     getCloneUrl,
     runShell: makeRunShell(),
@@ -432,9 +436,11 @@ export async function buildApp(
   await app.register(settingsRoutes);
   await app.register(cloudflareRoutes);
   await app.register(mailRoutes);
+  await app.register(gitRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);
+  await app.register(dbConnectionRoutes);
   await app.register(databaseRoutes);
   await app.register(servicesRoutes);
   await app.register(workerRoutes);

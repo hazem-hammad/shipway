@@ -51,6 +51,16 @@ export interface GitOps {
    * pipe, and an abort mid-export rejects with a clear cancellation error (see `fetchBranchTip`).
    */
   exportRelease(projectDir: string, sha: string, releaseDir: string, signal?: AbortSignal): Promise<void>;
+  /**
+   * Lists the branches `url` advertises, plus the branch its `HEAD` points at, without cloning
+   * anything — `git ls-remote`, so it's safe to call from a request handler while someone is still
+   * filling in the New Project form. Credentials embedded in `url` are used (that's how a private
+   * repo without a GitHub App is reachable at all) and stripped from any error text.
+   *
+   * `signal` is passed to git as `cancelSignal`; callers should always pass one with a timeout,
+   * since an unreachable or slow remote is otherwise bounded only by git's own patience.
+   */
+  listRemoteBranches(url: string, signal?: AbortSignal): Promise<{ branches: string[]; defaultBranch: string | null }>;
 }
 
 /** Strips `user:token@` credentials from a URL so they never leak into thrown error text. */
@@ -138,6 +148,45 @@ export function makeGitOps(run: typeof execa = execa): GitOps {
       }
     },
 
+    async listRemoteBranches(url, signal) {
+      // A url starting with `-` would be read as a flag by git; `ls-remote` has no `--` separator
+      // to hide behind, so reject it outright (the routes' url schema already excludes it).
+      if (url.startsWith('-')) {
+        throw new Error('invalid repository url');
+      }
+
+      let stdout: string;
+      try {
+        // `--symref` makes the remote also report what HEAD points at, which is the branch to
+        // preselect. `GIT_TERMINAL_PROMPT=0` is what keeps this bounded: without it, a private repo
+        // whose url carries no credentials makes git block forever on a username prompt that no
+        // one is there to answer, and `cancelSignal` would be the only thing that ever ends it.
+        const result = await run('git', ['ls-remote', '--symref', url, 'HEAD', 'refs/heads/*'], {
+          ...cancelableOpts(signal),
+          env: { GIT_TERMINAL_PROMPT: '0' },
+        });
+        stdout = result.stdout;
+      } catch (err) {
+        throw signal?.aborted ? canceledError() : sanitizeError(err, url);
+      }
+
+      const branches: string[] = [];
+      let defaultBranch: string | null = null;
+      for (const line of stdout.split('\n')) {
+        const symref = /^ref:\s+refs\/heads\/(\S+)\s+HEAD$/.exec(line.trim());
+        if (symref) {
+          defaultBranch = symref[1] as string;
+          continue;
+        }
+        const head = /^[0-9a-f]{40}\s+refs\/heads\/(.+)$/.exec(line.trim());
+        if (head) {
+          branches.push(head[1] as string);
+        }
+      }
+
+      return { branches, defaultBranch };
+    },
+
     async exportRelease(projectDir, sha, releaseDir, signal) {
       if (!SHA_RE.test(sha)) {
         throw new Error(`invalid sha: "${sha}"`);
@@ -146,7 +195,18 @@ export function makeGitOps(run: typeof execa = execa): GitOps {
       const repoDir = join(projectDir, 'repo');
       await mkdir(releaseDir, { recursive: true });
       try {
-        await run('git', ['-C', repoDir, 'archive', sha], cancelableOpts(signal)).pipe('tar', ['-x', '-C', releaseDir], cancelableOpts(signal));
+        // `buffer: false` is load-bearing, not an optimization. execa buffers a subprocess's stdout
+        // and decodes it as UTF-8 by default, even when that stdout is piped straight into another
+        // process. `git archive` emits the whole repo as a binary tar stream — 364MB for a real
+        // project seen in the wild — so buffering it built a string past V8's internal array limit
+        // and killed the entire Shipway process with `Fatal JavaScript invalid size error`
+        // (SIGILL/core dump, taking the dashboard and every other deploy down with it) instead of
+        // failing the one deploy. Nothing reads this stdout: tar does, via the pipe.
+        await run('git', ['-C', repoDir, 'archive', sha], { ...cancelableOpts(signal), buffer: false }).pipe(
+          'tar',
+          ['-x', '-C', releaseDir],
+          cancelableOpts(signal),
+        );
       } catch (err) {
         throw signal?.aborted ? canceledError() : err;
       }

@@ -1,0 +1,48 @@
+[Unit]
+# pgAdmin 4, served under https://ship.<base-domain>/db/pgadmin/ via the
+# dashboard vhost (see templates/nginx-dashboard.conf). Installed by
+# setup/install.sh into a self-contained venv at /opt/pgadmin/venv, rather than
+# from the pgadmin4-web Debian package — that package depends on apache2, which
+# would fight nginx for ports 80/443 on this box.
+Description=pgAdmin 4 (Shipway database console)
+Documentation=https://www.pgadmin.org/docs/
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=pgadmin
+Group=pgadmin
+# pgAdmin4.py resolves config.py, config_local.py and its commit_hash relative
+# to its own directory, so it has to be the working directory. ${PGADMIN_DIR} is
+# substituted by setup/install.sh, which asks the venv's own interpreter where
+# site-packages is — hardcoding python3.12 here would break on any other minor.
+WorkingDirectory=${PGADMIN_DIR}
+Environment=PYTHONUNBUFFERED=1
+# One worker with the gevent class, matching pgAdmin's own container config:
+# the query tool and ERD talk over SocketIO, which needs a cooperative worker
+# rather than the default sync one. Multiple workers are avoided because
+# pgAdmin keeps session state on disk under DATA_DIR.
+ExecStart=/opt/pgadmin/venv/bin/gunicorn \
+    --bind 127.0.0.1:5050 \
+    --workers 1 \
+    --threads 25 \
+    --worker-class gevent \
+    --timeout 120 \
+    --limit-request-line 8190 \
+    pgAdmin4:app
+Restart=on-failure
+RestartSec=5
+
+# Only the two data paths are writable; everything else, including the venv, is
+# read-only to this service.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/pgadmin /var/log/pgadmin
+
+[Install]
+WantedBy=multi-user.target

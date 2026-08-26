@@ -97,6 +97,26 @@ describe('renderNginxVhost — shared across all vhost types', () => {
     certName: 'intcore.dev',
   };
 
+  it('omits auth_basic entirely unless authEnabled is set', () => {
+    const out = renderNginxVhost(base);
+    expect(out).not.toContain('auth_basic');
+    expect(out).not.toContain('shipway-auth');
+  });
+
+  it('emits auth_basic on the server block (not one location) when authEnabled, pointed at the project htpasswd', () => {
+    const out = renderNginxVhost({ ...base, authEnabled: true });
+    expect(out).toContain('auth_basic "Restricted";');
+    expect(out).toContain('auth_basic_user_file /etc/nginx/shipway-auth/shipway-blog.htpasswd;');
+
+    // Server-block scope is the point: a location-scoped auth_basic would leave the try_files
+    // fallback and asset paths reachable without credentials.
+    const httpsBlock = out.slice(out.indexOf('listen 443'));
+    const authIndex = httpsBlock.indexOf('auth_basic "Restricted";');
+    const firstLocation = httpsBlock.indexOf('location');
+    expect(authIndex).toBeGreaterThan(-1);
+    expect(authIndex).toBeLessThan(firstLocation);
+  });
+
   it('emits the https server block with ssl + http2', () => {
     const out = renderNginxVhost(base);
     expect(out).toContain('listen 443 ssl http2;');

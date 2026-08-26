@@ -6,24 +6,54 @@
  * reveal (`GET /:id/credentials`) can return the password again since it's decrypted server-side,
  * but isn't a one-time event the same way.
  */
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useEffect, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, Database as DatabaseIcon, Eye, EyeOff, Mail, Plus } from 'lucide-react';
+import { Check, Copy, Database as DatabaseIcon, ExternalLink, Eye, EyeOff, Mail, Plus, Server } from 'lucide-react';
 import {
   ApiError,
   createDatabase,
+  createDbConnection,
   deleteDatabase,
+  deleteDbConnection,
   fetchDatabaseCredentials,
   injectDatabase,
+  testDbConnection,
+  updateDbConnection,
   type DatabaseCreated,
   type DatabaseListItem,
+  type DbConnection,
   type DbEngine,
 } from '../api';
-import { useDatabases, useProjects, useServicesInfo } from '../hooks';
-import { Badge, Button, Card, CardHeader, Chip, EmptyState, Field, ICON_STROKE, Input, PageHeader, Select, Skeleton } from '../components/ui';
+import { useDatabases, useDbConnections, useProjects, useServicesInfo, useSettings } from '../hooks';
+import { Badge, Button, buttonClasses, Card, CardHeader, Chip, EmptyState, Field, ICON_STROKE, Input, PageHeader, Select, Skeleton } from '../components/ui';
 import { formatRelativeTime } from '../lib/format';
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
+
+/**
+ * The console for a database's engine: phpMyAdmin for MySQL, pgAdmin for PostgreSQL. Both are
+ * served under paths on the dashboard host, so the browser already carries the Shipway session
+ * that nginx checks before letting the request through — no second password to open them.
+ *
+ * phpMyAdmin takes a database name in the URL, so that much is prefilled. pgAdmin works from
+ * saved server connections rather than query parameters, so it can only be opened at its root.
+ */
+function consoleUrl(baseDomain: string, database: DatabaseListItem): string {
+  const base = `https://ship.${baseDomain}/db`;
+  if (database.engine === 'mysql') {
+    return `${base}/phpmyadmin/index.php?route=/database/structure&db=${encodeURIComponent(database.name)}`;
+  }
+  return `${base}/pgadmin/`;
+}
+
+/**
+ * phpMyAdmin and pgAdmin are installed on this host and configured against its own engines, so the
+ * Manage link only means anything for a database that lives here. A database on a registered
+ * external server is managed with whatever that provider gives you.
+ */
+function hasConsole(database: DatabaseListItem): boolean {
+  return database.connectionId === null;
+}
 
 const ENGINE_OPTIONS: { value: DbEngine; label: string }[] = [
   { value: 'mysql', label: 'MySQL' },
@@ -45,6 +75,10 @@ function portFor(engine: DbEngine): number {
 
 export default function DatabasesPage() {
   const databasesQuery = useDatabases();
+  // Only used to build the database-console URLs; the Manage link is simply omitted until it loads,
+  // rather than rendering a link to `ship.undefined`.
+  const settingsQuery = useSettings();
+  const baseDomain = settingsQuery.data?.base_domain ?? null;
   const [creating, setCreating] = useState(false);
   const [createdCreds, setCreatedCreds] = useState<DatabaseCreated | null>(null);
 
@@ -52,7 +86,7 @@ export default function DatabasesPage() {
     <div>
       <PageHeader
         title="Databases"
-        subtitle="MySQL and Postgres databases on this server"
+        subtitle="MySQL and Postgres databases, on this server or on a connection you register"
         actions={
           !creating &&
           !createdCreds && (
@@ -94,6 +128,9 @@ export default function DatabasesPage() {
                 name={createdCreds.name}
                 username={createdCreds.username}
                 password={createdCreds.password}
+                host={createdCreds.host}
+                port={createdCreds.port}
+                connectionName={createdCreds.connectionName}
                 oneTime
               />
             </div>
@@ -114,11 +151,13 @@ export default function DatabasesPage() {
           <Card>
             <div className="divide-y divide-line">
               {databasesQuery.data.map((database) => (
-                <DatabaseRow key={database.id} database={database} />
+                <DatabaseRow key={database.id} database={database} baseDomain={baseDomain} />
               ))}
             </div>
           </Card>
         )}
+
+        <ConnectionsCard />
 
         <ServicesInfoPanels />
       </div>
@@ -129,12 +168,26 @@ export default function DatabasesPage() {
 function CreateDatabaseForm({ onCreated, onCancel }: { onCreated: (created: DatabaseCreated) => void; onCancel: () => void }) {
   const queryClient = useQueryClient();
   const projectsQuery = useProjects();
-  const [engine, setEngine] = useState<DbEngine>('mysql');
+  // Only connections that can actually take a database are listed — a host engine with no admin
+  // credentials never appears (see /api/db-connections), so picking one can't turn into a 502.
+  const connectionsQuery = useDbConnections();
+  const connections = connectionsQuery.data ?? [];
+  const [connectionKey, setConnectionKey] = useState('');
   const [name, setName] = useState('');
   const [projectId, setProjectId] = useState('');
   const [nameError, setNameError] = useState<string | null>(null);
   const [formError, setFormError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  const connection = connections.find((row) => row.key === connectionKey) ?? null;
+
+  // Selects the first connection once the list arrives, and re-selects if the chosen one is
+  // unregistered in another tab. A form with no connection selected can't submit.
+  useEffect(() => {
+    if (connections.length > 0 && !connections.some((row) => row.key === connectionKey)) {
+      setConnectionKey(connections[0]!.key);
+    }
+  }, [connections, connectionKey]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -145,19 +198,24 @@ function CreateDatabaseForm({ onCreated, onCancel }: { onCreated: (created: Data
       setNameError('Lowercase letters, digits, underscores; must start with a letter.');
       return;
     }
+    if (connection === null) {
+      setFormError('Pick a connection to create this database on.');
+      return;
+    }
 
     setSubmitting(true);
     try {
       const created = await createDatabase({
-        engine,
+        connection: connection.key,
         name,
         ...(projectId !== '' ? { projectId: Number(projectId) } : {}),
       });
       await queryClient.invalidateQueries({ queryKey: ['databases'] });
+      await queryClient.invalidateQueries({ queryKey: ['db-connections'] });
       onCreated(created);
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
-        setNameError('A database with this name already exists for this engine.');
+        setNameError(`A database with this name already exists on ${connection.name}.`);
       } else {
         setFormError(errorMessage(err, 'Could not create the database. Try again.'));
       }
@@ -169,26 +227,23 @@ function CreateDatabaseForm({ onCreated, onCancel }: { onCreated: (created: Data
   return (
     <Card>
       <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[560px] flex-col gap-4" noValidate>
-        <div role="radiogroup" aria-label="Engine" className="flex gap-3">
-          {ENGINE_OPTIONS.map((option) => (
-            <label
-              key={option.value}
-              className={`flex flex-1 items-center justify-center gap-2 rounded-xl border px-4 py-3.5 text-base font-semibold transition-colors duration-150 ease-out ${
-                engine === option.value ? 'border-focus bg-surface-2 text-ink' : 'border-line bg-surface text-ink hover:bg-surface-2'
-              }`}
-            >
-              <input
-                type="radio"
-                name="db-engine"
-                value={option.value}
-                checked={engine === option.value}
-                onChange={() => setEngine(option.value)}
-                className="h-4 w-4 accent-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-              />
-              {option.label}
-            </label>
-          ))}
-        </div>
+        {connectionsQuery.isPending ? (
+          <Skeleton className="h-11 w-full" />
+        ) : connections.length === 0 ? (
+          <p className="text-[13px] text-warn">
+            No database server is configured on this host, and no external connection is registered — add one below first.
+          </p>
+        ) : (
+          <Field label="Connection" hint={connection === null ? undefined : `${ENGINE_LABEL[connection.engine]} at ${connection.host}:${String(connection.port)}`}>
+            <Select value={connectionKey} onChange={(event) => setConnectionKey(event.target.value)}>
+              {connections.map((row) => (
+                <option key={row.key} value={row.key}>
+                  {row.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
 
         <Field label="Name" hint="Lowercase, digits, underscores; starts with a letter. Up to 32 chars." error={nameError ?? undefined}>
           <Input
@@ -233,7 +288,7 @@ function CreateDatabaseForm({ onCreated, onCancel }: { onCreated: (created: Data
   );
 }
 
-function DatabaseRow({ database }: { database: DatabaseListItem }) {
+function DatabaseRow({ database, baseDomain }: { database: DatabaseListItem; baseDomain: string | null }) {
   const [expanded, setExpanded] = useState<'reveal' | 'drop' | null>(null);
   const [credentials, setCredentials] = useState<{ username: string; password: string } | null>(null);
   const [revealLoading, setRevealLoading] = useState(false);
@@ -268,10 +323,26 @@ function DatabaseRow({ database }: { database: DatabaseListItem }) {
         <Badge className="shrink-0">{ENGINE_LABEL[database.engine]}</Badge>
         <div className="min-w-0 flex-1">
           <div className="truncate font-mono text-base font-semibold text-ink">{database.name}</div>
-          <div className="mt-0.5 truncate text-sm text-soft">{database.projectName ?? 'Not linked'}</div>
+          <div className="mt-0.5 truncate text-sm text-soft">
+            {database.projectName ?? 'Not linked'}
+            {' · '}
+            {database.connectionName ?? `${database.host}:${String(database.port)}`}
+          </div>
         </div>
         <span className="hidden shrink-0 text-sm text-soft sm:block">{formatRelativeTime(database.createdAt)}</span>
         <div className="flex shrink-0 items-center gap-2">
+          {baseDomain && hasConsole(database) && (
+            <a
+              href={consoleUrl(baseDomain, database)}
+              target="_blank"
+              rel="noreferrer noopener"
+              className={buttonClasses('secondary', 'sm')}
+              title="Browse tables and run SQL — phpMyAdmin for MySQL, pgAdmin for Postgres"
+            >
+              Manage
+              <ExternalLink size={14} strokeWidth={ICON_STROKE} aria-hidden />
+            </a>
+          )}
           <Button variant="outline" size="sm" onClick={() => void toggleReveal()}>
             {expanded === 'reveal' ? 'Hide credentials' : 'Credentials'}
           </Button>
@@ -296,6 +367,9 @@ function DatabaseRow({ database }: { database: DatabaseListItem }) {
               name={database.name}
               username={credentials.username}
               password={credentials.password}
+              host={database.host}
+              port={database.port}
+              connectionName={database.connectionName}
               oneTime={false}
             />
           ) : null}
@@ -325,6 +399,7 @@ function DropConfirm({ database, onDropped }: { database: DatabaseListItem; onDr
     try {
       await deleteDatabase(database.id, confirmText);
       await queryClient.invalidateQueries({ queryKey: ['databases'] });
+      await queryClient.invalidateQueries({ queryKey: ['db-connections'] });
       onDropped();
     } catch (err) {
       setError(errorMessage(err, 'Could not drop the database. Try again.'));
@@ -365,6 +440,9 @@ function CredentialsPanel({
   name,
   username,
   password,
+  host,
+  port,
+  connectionName,
   oneTime,
 }: {
   databaseId: number;
@@ -372,6 +450,9 @@ function CredentialsPanel({
   name: string;
   username: string;
   password: string;
+  host: string;
+  port: number;
+  connectionName: string | null;
   oneTime: boolean;
 }) {
   const projectsQuery = useProjects();
@@ -401,10 +482,11 @@ function CredentialsPanel({
       <p className="mb-3 flex items-center gap-2">
         <Badge>{ENGINE_LABEL[engine]}</Badge>
         <span className="font-mono text-sm font-semibold text-ink">{name}</span>
+        {connectionName && <span className="truncate text-sm text-soft">on {connectionName}</span>}
       </p>
       <div className="flex flex-col gap-2">
-        <CredentialRow label="Host" value="127.0.0.1" />
-        <CredentialRow label="Port" value={String(portFor(engine))} />
+        <CredentialRow label="Host" value={host} />
+        <CredentialRow label="Port" value={String(port)} />
         <CredentialRow label="Username" value={username} />
         <CredentialRow label="Password" value={password} />
       </div>
@@ -462,6 +544,297 @@ function CredentialRow({ label, value }: { label: string; value: string }) {
         {copied ? 'Copied' : 'Copy'}
       </button>
     </div>
+  );
+}
+
+/**
+ * The database servers Shipway can put a database on. The two engines running on this host are
+ * always here and are not editable — their admin credentials came from `install.sh` and are not
+ * something to re-type in a browser. Everything else is a connection someone registered: an RDS
+ * instance, a managed Postgres, another box.
+ *
+ * Removing a connection only makes Shipway forget how to reach it; nothing on the remote server is
+ * touched, and the API refuses while databases are still on it.
+ */
+function ConnectionsCard() {
+  const connectionsQuery = useDbConnections();
+  const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<DbConnection | null>(null);
+
+  const connections = connectionsQuery.data ?? [];
+
+  return (
+    <Card>
+      <div className="flex items-start justify-between gap-4">
+        <CardHeader
+          icon={<Server size={20} strokeWidth={ICON_STROKE} />}
+          title="Connections"
+          description="Where databases can be created — this server's engines, plus any external server you register."
+        />
+        {!adding && editing === null && (
+          <Button variant="secondary" size="sm" onClick={() => setAdding(true)}>
+            <Plus size={16} strokeWidth={2} aria-hidden />
+            Add connection
+          </Button>
+        )}
+      </div>
+
+      <div className="mt-4 flex flex-col gap-4">
+        {(adding || editing !== null) && (
+          <ConnectionForm
+            existing={editing}
+            onDone={() => {
+              setAdding(false);
+              setEditing(null);
+            }}
+          />
+        )}
+
+        {connectionsQuery.isPending ? (
+          <Skeleton className="h-24 w-full rounded-xl" />
+        ) : connectionsQuery.isError ? (
+          <p role="alert" className="text-sm text-danger">
+            Could not load connections.
+          </p>
+        ) : (
+          <div className="divide-y divide-line">
+            {connections.map((connection) => (
+              <ConnectionRow key={connection.key} connection={connection} onEdit={() => setEditing(connection)} />
+            ))}
+          </div>
+        )}
+      </div>
+    </Card>
+  );
+}
+
+function ConnectionRow({ connection, onEdit }: { connection: DbConnection; onEdit: () => void }) {
+  const queryClient = useQueryClient();
+  const [removing, setRemoving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function handleRemove() {
+    if (connection.id === null) return;
+    setError(null);
+    setRemoving(true);
+    try {
+      await deleteDbConnection(connection.id);
+      await queryClient.invalidateQueries({ queryKey: ['db-connections'] });
+    } catch (err) {
+      // A 409 here is the "still has N databases on it" refusal, whose message is the whole point.
+      setError(errorMessage(err, 'Could not remove the connection.'));
+    } finally {
+      setRemoving(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col gap-2 py-3">
+      <div className="flex items-center gap-4">
+        <Badge className="shrink-0">{ENGINE_LABEL[connection.engine]}</Badge>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-base font-semibold text-ink">{connection.name}</div>
+          <div className="mt-0.5 truncate font-mono text-sm text-soft">
+            {connection.host}:{connection.port}
+            {connection.adminUsername !== null && ` · ${connection.adminUsername}`}
+            {connection.tls && ' · TLS'}
+          </div>
+        </div>
+        <span className="hidden shrink-0 text-sm text-soft sm:block">
+          {connection.databaseCount} {connection.databaseCount === 1 ? 'database' : 'databases'}
+        </span>
+        <div className="flex shrink-0 items-center gap-2">
+          {connection.kind === 'local' ? (
+            <span className="text-sm text-soft" title="Configured by the Shipway installer on this host">
+              This server
+            </span>
+          ) : (
+            <>
+              <Button variant="outline" size="sm" onClick={onEdit}>
+                Edit
+              </Button>
+              <Button variant="danger" size="sm" loading={removing} onClick={() => void handleRemove()}>
+                Remove
+              </Button>
+            </>
+          )}
+        </div>
+      </div>
+      {error && (
+        <p role="alert" className="text-sm text-danger">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Add/edit one external connection. The credentials are tried against the real server before
+ * anything is stored — by the Test button on demand, and by the API itself on save — so a typo
+ * surfaces here rather than as a failed deploy later.
+ *
+ * Editing never shows the stored password: leaving the field blank keeps it, which is also what
+ * makes a rename or a host change a one-field edit.
+ */
+function ConnectionForm({ existing, onDone }: { existing: DbConnection | null; onDone: () => void }) {
+  const queryClient = useQueryClient();
+  const [name, setName] = useState(existing?.name ?? '');
+  const [engine, setEngine] = useState<DbEngine>(existing?.engine ?? 'mysql');
+  const [host, setHost] = useState(existing?.host ?? '');
+  const [port, setPort] = useState(String(existing?.port ?? portFor(existing?.engine ?? 'mysql')));
+  const [adminUsername, setAdminUsername] = useState(existing?.adminUsername ?? '');
+  const [adminPassword, setAdminPassword] = useState('');
+  const [tls, setTls] = useState(existing?.tls ?? false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; detail?: string } | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // The port follows the engine until it is edited away from that engine's default — so switching
+  // engine on an untouched form does the obvious thing, and a deliberate 5433 is never overwritten.
+  function handleEngineChange(next: DbEngine) {
+    setEngine(next);
+    setPort((current) => (current === String(portFor(engine)) ? String(portFor(next)) : current));
+    setTestResult(null);
+  }
+
+  // On edit, the password field is empty and means "keep the stored one" — which the test endpoint
+  // has no way to know, since it takes credentials rather than a connection id.
+  const canTest = host.trim() !== '' && adminUsername.trim() !== '' && adminPassword !== '';
+  const canSave = name.trim() !== '' && host.trim() !== '' && adminUsername.trim() !== '' && (existing !== null || adminPassword !== '');
+
+  async function handleTest() {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await testDbConnection({ engine, host: host.trim(), port: Number(port), adminUsername: adminUsername.trim(), adminPassword, tls });
+      setTestResult(result);
+    } catch (err) {
+      setTestResult({ ok: false, detail: errorMessage(err, 'Could not reach the server.') });
+    } finally {
+      setTesting(false);
+    }
+  }
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError(null);
+    setSaving(true);
+    try {
+      if (existing?.id != null) {
+        await updateDbConnection(existing.id, {
+          name: name.trim(),
+          host: host.trim(),
+          port: Number(port),
+          adminUsername: adminUsername.trim(),
+          tls,
+          ...(adminPassword !== '' ? { adminPassword } : {}),
+        });
+      } else {
+        await createDbConnection({ name: name.trim(), engine, host: host.trim(), port: Number(port), adminUsername: adminUsername.trim(), adminPassword, tls });
+      }
+      await queryClient.invalidateQueries({ queryKey: ['db-connections'] });
+      onDone();
+    } catch (err) {
+      // The API's 502 detail is the driver's own message ("password authentication failed",
+      // "ENOTFOUND …") — far more useful than the status line, so it is what gets shown.
+      const detail = err instanceof ApiError ? (err.body as { detail?: string } | undefined)?.detail : undefined;
+      const base = errorMessage(err, 'Could not save the connection.');
+      setError(detail ? `${base}: ${detail}` : base);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[560px] flex-col gap-4 rounded-xl bg-surface-2 p-4" noValidate>
+      <Field label="Name" hint="How this server is shown when picking where a database goes.">
+        <Input required autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="RDS production" />
+      </Field>
+
+      {existing === null ? (
+        <Field label="Engine">
+          <Select value={engine} onChange={(event) => handleEngineChange(event.target.value as DbEngine)}>
+            {ENGINE_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+      ) : (
+        // Changing it would point the databases already on this connection at a server that has
+        // never heard of them, so the API refuses it too.
+        <p className="text-[13px] text-soft">
+          Engine: {ENGINE_LABEL[engine]} — a connection&rsquo;s engine can&rsquo;t change. Register a second connection instead.
+        </p>
+      )}
+
+      <div className="flex gap-3">
+        <div className="flex-1">
+          <Field label="Host" hint="Hostname or IP — no scheme, no path.">
+            <Input mono required value={host} onChange={(event) => setHost(event.target.value)} placeholder="db.abc123.eu-west-1.rds.amazonaws.com" />
+          </Field>
+        </div>
+        <div className="w-28">
+          <Field label="Port">
+            <Input mono required value={port} onChange={(event) => setPort(event.target.value)} inputMode="numeric" />
+          </Field>
+        </div>
+      </div>
+
+      <Field label="Admin user" hint="Needs to create databases and users/roles on that server.">
+        <Input mono required value={adminUsername} onChange={(event) => setAdminUsername(event.target.value)} />
+      </Field>
+
+      <Field label="Admin password" hint={existing === null ? 'Stored encrypted; never shown again.' : 'Leave blank to keep the stored password.'}>
+        <Input
+          mono
+          type="password"
+          value={adminPassword}
+          onChange={(event) => {
+            setAdminPassword(event.target.value);
+            setTestResult(null);
+          }}
+          autoComplete="new-password"
+        />
+      </Field>
+
+      <label className="flex items-center gap-2 text-sm text-ink">
+        <input
+          type="checkbox"
+          checked={tls}
+          onChange={(event) => setTls(event.target.checked)}
+          className="h-4 w-4 accent-[var(--primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+        />
+        Connect over TLS (required by most managed instances)
+      </label>
+
+      {testResult && (
+        <p className={`text-sm ${testResult.ok ? 'text-ok' : 'text-danger'}`} role={testResult.ok ? undefined : 'alert'}>
+          {testResult.ok ? 'Connected.' : (testResult.detail ?? 'Could not connect.')}
+        </p>
+      )}
+
+      {error && (
+        <p role="alert" className="text-sm text-danger">
+          {error}
+        </p>
+      )}
+
+      <div className="flex items-center gap-2">
+        <Button type="submit" loading={saving} disabled={!canSave}>
+          {existing === null ? 'Add connection' : 'Save changes'}
+        </Button>
+        <Button type="button" variant="secondary" loading={testing} disabled={!canTest} onClick={() => void handleTest()}>
+          Test connection
+        </Button>
+        <Button type="button" variant="outline" onClick={onDone} disabled={saving}>
+          Cancel
+        </Button>
+      </div>
+    </form>
   );
 }
 

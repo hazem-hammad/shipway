@@ -119,6 +119,17 @@ export interface VhostInput {
   phpVersion?: string;
   port?: number;
   certName: string; // e.g. 'intcore.dev' -> /etc/letsencrypt/live/<certName>/
+  /** When true, the https server block gets `auth_basic` pointed at this project's htpasswd file. */
+  authEnabled?: boolean;
+}
+
+/**
+ * Path of a project's `auth_basic_user_file`. Must stay in sync with `HTPASSWD_DEST_RE` in
+ * setup/shipway-sysops — that whitelist is what allows Shipway (as `deployer`) to write here at all.
+ */
+export function htpasswdPath(slug: string): string {
+  assertSlug(slug);
+  return `/etc/nginx/shipway-auth/shipway-${slug}.htpasswd`;
 }
 
 function releaseRoot(appsDir: string, slug: string, publicDir: string): string {
@@ -232,6 +243,11 @@ export function renderNginxVhost(i: VhostInput): string {
     `    access_log /var/log/nginx/shipway-${i.slug}.access.log;`,
     `    error_log /var/log/nginx/shipway-${i.slug}.error.log;`,
     ``,
+    // Placed on the server block (not a single location) so it covers every request to this vhost
+    // — including the try_files fallback and any asset path — rather than leaving holes.
+    ...(i.authEnabled
+      ? [`    auth_basic "Restricted";`, `    auth_basic_user_file ${htpasswdPath(i.slug)};`, ``]
+      : []),
     body,
     `}`,
     ``,

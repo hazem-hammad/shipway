@@ -13,7 +13,8 @@ import type { ShipwayDb } from '../db/index.js';
 import { projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import type { SysOps } from '../sysops/types.js';
-import { assertSlug, renderAppUnit, renderNginxVhost, unitNames } from '../system/templates.js';
+import { assertSlug, htpasswdPath, renderAppUnit, renderNginxVhost, unitNames } from '../system/templates.js';
+import { renderHtpasswd } from '../system/htpasswd.js';
 import type { DnsClient } from './cloudflare.js';
 import { syncCrontab } from './cron.js';
 import { removeWorker } from './workers.js';
@@ -141,6 +142,29 @@ function requireBaseDomain(db: ShipwayDb): string {
   return baseDomain;
 }
 
+/**
+ * True only when basic auth is both switched on and actually usable — an `authEnabled` row with no
+ * user/hash yet would otherwise render an `auth_basic_user_file` pointing at a file that doesn't
+ * exist, which nginx accepts at config-test time and then 500s on every request.
+ */
+function authIsActive(project: ProjectRow): boolean {
+  return project.authEnabled && !!project.authUser && !!project.authHash;
+}
+
+/**
+ * Writes (or removes) a project's `auth_basic_user_file` so it matches the row. Runs before the
+ * vhost is installed, so the file a newly-auth-enabled vhost references already exists by the time
+ * nginx reloads.
+ */
+async function syncHtpasswd(deps: ProvisionDeps, project: ProjectRow): Promise<void> {
+  const dest = htpasswdPath(project.slug);
+  if (authIsActive(project)) {
+    await deps.sysops.installFile(dest, renderHtpasswd(project.authUser!, project.authHash!));
+  } else {
+    await deps.sysops.removeFile(dest);
+  }
+}
+
 /** Pure render of a project's vhost content — no filesystem/sysops interaction. */
 function renderVhostContent(deps: ProvisionDeps, project: ProjectRow, domain: string, certName: string): string {
   return renderNginxVhost({
@@ -152,6 +176,7 @@ function renderVhostContent(deps: ProvisionDeps, project: ProjectRow, domain: st
     phpVersion: project.phpVersion ?? undefined,
     port: project.port ?? undefined,
     certName,
+    authEnabled: authIsActive(project),
   });
 }
 
@@ -176,6 +201,8 @@ async function writeVhost(
   certName: string,
   previousContent: string | null,
 ): Promise<void> {
+  await syncHtpasswd(deps, project);
+
   const content = renderVhostContent(deps, project, domain, certName);
 
   const availablePath = vhostAvailablePath(project.slug);
@@ -360,6 +387,7 @@ export async function deprovisionProject(deps: ProvisionDeps, projectId: number)
 
   await attempt(() => deps.sysops.removeFile(vhostAvailablePath(project.slug)));
   await attempt(() => deps.sysops.removeFile(vhostEnabledPath(project.slug)));
+  await attempt(() => deps.sysops.removeFile(htpasswdPath(project.slug)));
   await attempt(() => deps.sysops.reloadNginx());
 
   if (deps.dns) {

@@ -379,12 +379,13 @@ function CloudflareStep({ onDone }: { onDone: (summary: string) => void }) {
 function GithubStep({ onSkip }: { onSkip: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
+  const [org, setOrg] = useState('');
 
   async function handleCreate() {
     setError(null);
     setCreating(true);
     try {
-      const { postUrl, manifestJson } = await fetchGithubManifest(window.location.origin);
+      const { postUrl, manifestJson } = await fetchGithubManifest(window.location.origin, org.trim() || undefined);
       submitManifestForm(postUrl, manifestJson);
       // The browser navigates to github.com from here; nothing left to do client-side.
     } catch (err) {
@@ -404,6 +405,14 @@ function GithubStep({ onSkip }: { onSkip: () => void }) {
           {error}
         </p>
       )}
+      <div className="mb-4 max-w-[420px]">
+        <Field
+          label="Organization (optional)"
+          hint="Leave blank to create the app under your own GitHub account. A personally-owned app can only be installed on that account, so enter your org's login to deploy org repositories."
+        >
+          <Input value={org} onChange={(event) => setOrg(event.target.value)} placeholder="my-org" autoComplete="off" spellCheck={false} />
+        </Field>
+      </div>
       <div className="flex items-center gap-4">
         <Button onClick={() => void handleCreate()} loading={creating}>
           Create GitHub App on GitHub

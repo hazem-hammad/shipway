@@ -38,6 +38,23 @@ async function makeFixtureRepo(dir: string, content: string): Promise<string> {
   return stdout.trim();
 }
 
+/** Like `makeFixtureRepo`, plus arbitrary extra tracked files (path -> content), dirs created. */
+async function makeFixtureRepoWithFiles(dir: string, content: string, extra: Record<string, string>): Promise<string> {
+  await execa('git', ['init', '-b', 'main'], { cwd: dir });
+  await execa('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
+  await execa('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'index.html'), content);
+  for (const [rel, body] of Object.entries(extra)) {
+    const full = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(full), { recursive: true });
+    fs.writeFileSync(full, body);
+  }
+  await execa('git', ['add', '-A'], { cwd: dir });
+  await execa('git', ['commit', '-m', 'first commit'], { cwd: dir });
+  const { stdout } = await execa('git', ['rev-parse', 'HEAD'], { cwd: dir });
+  return stdout.trim();
+}
+
 function makeCfg(): Config {
   return loadConfig({
     SHIPWAY_DEV: '1',
@@ -181,6 +198,7 @@ function poisonedGitOps(): GitOps {
   return {
     fetchBranchTip: () => Promise.reject(new Error('gitOps.fetchBranchTip must not be called for a rollback deploy')),
     exportRelease: () => Promise.reject(new Error('gitOps.exportRelease must not be called for a rollback deploy')),
+    listRemoteBranches: () => Promise.reject(new Error('gitOps.listRemoteBranches is not part of the deploy pipeline')),
   };
 }
 
@@ -395,8 +413,15 @@ describe('runDeploy — happy path (php)', () => {
     expect(fs.lstatSync(storageLink).isSymbolicLink()).toBe(true);
     expect(fs.realpathSync(storageLink)).toBe(fs.realpathSync(path.join(cfg.appsDir, 'shop', 'shared', 'storage')));
 
-    // install ran in the release dir
-    expect(shell.calls).toEqual([{ cmd: 'composer install', cwd: releaseDir }]);
+    // install ran in the release dir, then the php runtime was given write access to what it
+    // writes at runtime (see `grantWebWriteAccess`).
+    expect(shell.calls).toEqual([
+      { cmd: 'composer install', cwd: releaseDir },
+      {
+        cmd: `setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX -- '${path.join(cfg.appsDir, 'shop', 'shared', 'storage')}'`,
+        cwd: releaseDir,
+      },
+    ]);
 
     // B5: the install command's PATH is prefixed with the project's version-pinned php shim dir
     // (install.sh's /opt/php/<ver>/bin/php -> /usr/bin/php<ver>), so a bare `composer`/`php`
@@ -409,10 +434,168 @@ describe('runDeploy — happy path (php)', () => {
 
     // log sections in order
     const sections = lines.filter((l) => l.includes('==>')).map((l) => l.replace(/^\[[\d:]+\] ==> /, ''));
-    expect(sections).toEqual(['resolve', 'export', 'shared', 'env', 'pre_deploy', 'build', 'activate', 'restart', 'health', 'post_deploy', 'prune']);
+    expect(sections).toEqual([
+      'resolve',
+      'export',
+      'shared',
+      'env',
+      'pre_deploy',
+      'build',
+      'permissions',
+      'activate',
+      'restart',
+      'health',
+      'post_deploy',
+      'prune',
+    ]);
 
     // notify called on success
     expect(notifications).toEqual([{ project: 'shop', status: 'success', deploymentId, message: 'first commit' }]);
+  });
+});
+
+/**
+ * The deploy runs as `deployer`; the requests that follow are served by php-fpm as `www-data`. A
+ * Laravel app that can't write `storage/` builds perfectly and then 500s on its first page render,
+ * which is exactly the failure this stage exists to prevent — so what it grants, on which paths,
+ * and for which project types is pinned here.
+ */
+describe('runDeploy — runtime write access for php', () => {
+  it("grants www-data write access to the project's shared paths and bootstrap/cache, with inheritance", async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepoWithFiles(fixtureDir, '<h1>v1</h1>\n', {
+      'storage/logs/.gitignore': '*\n!.gitignore\n',
+      'bootstrap/cache/.gitignore': '*\n!.gitignore\n',
+    });
+    const { cfg, db, shell, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', sharedPaths: ['storage', 'uploads'] });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'manual' });
+
+    expect(await runDeploy(deps, deploymentId, logger, new AbortController().signal)).toBe('success');
+
+    const releaseDir = getDeploymentRow(db, deploymentId).releasePath as string;
+    const setfacl = shell.calls.find((call) => call.cmd.startsWith('setfacl'));
+    expect(setfacl).toBeDefined();
+
+    // `d:` (default) entries are the point: a file written by www-data at runtime and one written
+    // by deployer on the next deploy both stay accessible to the other.
+    expect(setfacl?.cmd).toContain('-m u:www-data:rwX');
+    expect(setfacl?.cmd).toContain('-m d:u:www-data:rwX');
+    // Every shared path, plus the release's own bootstrap/cache.
+    expect(setfacl?.cmd).toContain(`'${path.join(cfg.appsDir, 'shop', 'shared', 'storage')}'`);
+    expect(setfacl?.cmd).toContain(`'${path.join(cfg.appsDir, 'shop', 'shared', 'uploads')}'`);
+    expect(setfacl?.cmd).toContain(`'${path.join(releaseDir, 'bootstrap/cache')}'`);
+  });
+
+  it('skips bootstrap/cache when the repo has none, rather than naming a path that does not exist', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    const { cfg, db, shell, logger, deps } = makeHarness();
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+
+    const projectId = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', sharedPaths: ['storage'] });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'manual' });
+
+    expect(await runDeploy(deps, deploymentId, logger, new AbortController().signal)).toBe('success');
+
+    const setfacl = shell.calls.find((call) => call.cmd.startsWith('setfacl'));
+    expect(setfacl?.cmd).toContain(`'${path.join(cfg.appsDir, 'shop', 'shared', 'storage')}'`);
+    expect(setfacl?.cmd).not.toContain('bootstrap/cache');
+  });
+
+  it('does not run at all for a static project, which nginx only ever reads', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, shell, logger, deps } = makeHarness();
+
+    // Shared paths are set, so this is about the project type and not about there being nothing to
+    // grant: a static site is served straight off disk by nginx, and a node app runs as `deployer`
+    // under its own unit, so neither has a second user that needs writing rights.
+    const projectId = insertProject(db, { slug: 'brochure', type: 'static', sharedPaths: ['storage'] });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'manual' });
+
+    await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+
+    expect(shell.calls.some((call) => call.cmd.startsWith('setfacl'))).toBe(false);
+  });
+
+  it('warns but still deploys when setfacl fails — working code is not withheld over an ACL', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, shell, logger, deps } = makeHarness();
+    shell.failSubstring = 'setfacl';
+
+    const projectId = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', sharedPaths: ['storage'] });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'manual' });
+
+    const lines: string[] = [];
+    logger.on('line', (l: string) => lines.push(l));
+
+    expect(await runDeploy(deps, deploymentId, logger, new AbortController().signal)).toBe('success');
+    expect(lines.join('\n')).toContain('WARNING: could not grant www-data write access');
+  });
+
+  it('quotes a shared path containing a single quote instead of breaking the command', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { db, shell, logger, deps } = makeHarness();
+
+    // `sharedPaths` is a free-form string array on the project row, so this reaches the command
+    // unvalidated.
+    const projectId = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', sharedPaths: ["it's"] });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'manual' });
+
+    expect(await runDeploy(deps, deploymentId, logger, new AbortController().signal)).toBe('success');
+
+    // The whole path is one quoted word, with the embedded quote closed/escaped/reopened — so the
+    // trailing `s'` still belongs to the same argument rather than starting a new one.
+    const setfacl = shell.calls.find((call) => call.cmd.startsWith('setfacl'));
+    expect(setfacl?.cmd).toContain(`shared/it'\\''s'`);
+    expect(setfacl?.cmd.endsWith(`s'`)).toBe(true);
+  });
+});
+
+describe('runDeploy — shared paths seed from the release', () => {
+  it("copies the repo's committed skeleton into shared before symlinking, without overwriting existing shared data", async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    // A Laravel-shaped repo: the directories that matter exist in git only as .gitignore
+    // placeholders, and are exactly what the shared symlink used to discard.
+    await makeFixtureRepoWithFiles(fixtureDir, '<h1>v1</h1>\n', {
+      'storage/framework/views/.gitignore': '*\n!.gitignore\n',
+      'storage/framework/cache/data/.gitignore': '*\n!.gitignore\n',
+      'storage/logs/.gitignore': '*\n!.gitignore\n',
+    });
+    const { cfg, db, shell, logger, deps } = makeHarness();
+
+    const projectId = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', sharedPaths: ['storage'] });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+
+    // Pre-existing shared data — a log from an earlier deploy — must survive untouched.
+    const sharedStorage = path.join(cfg.appsDir, 'shop', 'shared', 'storage');
+    fs.mkdirSync(path.join(sharedStorage, 'logs'), { recursive: true });
+    fs.writeFileSync(path.join(sharedStorage, 'logs', 'laravel.log'), 'EXISTING LOG\n');
+
+    const deploymentId = insertDeployment(db, { projectId, trigger: 'manual' });
+    const result = await runDeploy(deps, deploymentId, logger, new AbortController().signal);
+    expect(result).toBe('success');
+
+    // The skeleton is now in shared, so `artisan package:discover` has a real cache path.
+    expect(fs.existsSync(path.join(sharedStorage, 'framework', 'views', '.gitignore'))).toBe(true);
+    expect(fs.existsSync(path.join(sharedStorage, 'framework', 'cache', 'data', '.gitignore'))).toBe(true);
+
+    // ...and it is reachable through the release symlink, which is what the app actually uses.
+    const releaseDir = getDeploymentRow(db, deploymentId).releasePath as string;
+    expect(fs.existsSync(path.join(releaseDir, 'storage', 'framework', 'views'))).toBe(true);
+
+    // Strictly additive: existing shared content wins over the repo's placeholder.
+    expect(fs.readFileSync(path.join(sharedStorage, 'logs', 'laravel.log'), 'utf8')).toBe('EXISTING LOG\n');
+
+    expect(shell.calls.length).toBeGreaterThanOrEqual(0);
   });
 });
 
@@ -637,6 +820,7 @@ describe('runDeploy — cancel during git resolve (root cause: GitOps never got 
           );
         }),
       exportRelease: () => Promise.reject(new Error('exportRelease must not be called — resolve never got past fetchBranchTip')),
+      listRemoteBranches: () => Promise.reject(new Error('listRemoteBranches is not part of the deploy pipeline')),
     };
 
     const { db, notifications, logger, deps } = makeHarness({ gitOps: hangingGitOps });
@@ -946,6 +1130,7 @@ describe('runDeploy — workers', () => {
       'env',
       'pre_deploy',
       'build',
+      'permissions',
       'activate',
       'restart',
       'workers',

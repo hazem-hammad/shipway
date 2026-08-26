@@ -263,6 +263,7 @@ describe('provisionProject — node/nextjs', () => {
     const { sysops } = await provisionNodeProject();
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-api.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-api.conf',
       'installFile /etc/nginx/sites-enabled/shipway-api.conf',
       'nginxTest',
@@ -294,6 +295,7 @@ describe('provisionProject — php', () => {
     await provisionProject({ db, cfg, sysops, dns }, id);
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-shop.conf',
       'installFile /etc/nginx/sites-enabled/shipway-shop.conf',
       'nginxTest',
@@ -316,6 +318,7 @@ describe('provisionProject — static', () => {
     await provisionProject({ db, cfg, sysops, dns }, id);
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-docs.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-docs.conf',
       'installFile /etc/nginx/sites-enabled/shipway-docs.conf',
       'nginxTest',
@@ -457,6 +460,7 @@ describe('provisionProject — nginxTest failure', () => {
     expect(caught).toBeInstanceOf(ProvisionError);
     expect((caught as ProvisionError).message).toContain('unexpected "}"');
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-broken.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-broken.conf',
       'installFile /etc/nginx/sites-enabled/shipway-broken.conf',
       'nginxTest',
@@ -486,6 +490,7 @@ describe('refreshProjectConfig', () => {
 
     expect(dns.calls).toEqual([]);
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-shop.conf',
       'installFile /etc/nginx/sites-enabled/shipway-shop.conf',
       'nginxTest',
@@ -510,6 +515,7 @@ describe('refreshProjectConfig', () => {
     await refreshProjectConfig({ db, cfg, sysops, dns }, id, previous);
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-api.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-api.conf',
       'installFile /etc/nginx/sites-enabled/shipway-api.conf',
       'nginxTest',
@@ -574,6 +580,7 @@ describe('deprovisionProject', () => {
       'removeFile /etc/systemd/system/shipway-app-api.service',
       'removeFile /etc/nginx/sites-available/shipway-api.conf',
       'removeFile /etc/nginx/sites-enabled/shipway-api.conf',
+      'removeFile /etc/nginx/shipway-auth/shipway-api.htpasswd',
       'reloadNginx',
       'readCrontab',
       'writeCrontab',
@@ -600,6 +607,7 @@ describe('deprovisionProject', () => {
     expect(callNames(sysops)).toEqual([
       'removeFile /etc/nginx/sites-available/shipway-shop.conf',
       'removeFile /etc/nginx/sites-enabled/shipway-shop.conf',
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
       'reloadNginx',
       'readCrontab',
       'writeCrontab',

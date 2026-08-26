@@ -4,9 +4,12 @@ import {
   fetchAuditConfig,
   fetchCronJobs,
   fetchDatabases,
+  fetchDbConnections,
   fetchDeployment,
   fetchDeployments,
+  fetchGitBranches,
   fetchGithubBranches,
+  fetchGithubDirs,
   fetchGithubRepos,
   fetchGithubStatus,
   fetchGlobalDeployments,
@@ -31,7 +34,9 @@ import {
   type CloudflareVerifyResult,
   type CronJob,
   type DatabaseListItem,
+  type DbConnection,
   type Deployment,
+  type GitRemoteBranches,
   type GithubRepo,
   type GithubStatus,
   type GlobalDeployment,
@@ -165,6 +170,30 @@ export function useGithubBranches(repo: string | null): UseQueryResult<string[]>
   });
 }
 
+/**
+ * Branches of a pasted git URL (`git ls-remote` server-side), so a non-GitHub source gets the same
+ * branch dropdown a GitHub repo does. Never retried: a failure here is usually a wrong URL or
+ * missing credentials, and hammering an unreachable remote three times just makes the form feel
+ * stuck — the field falls back to free text instead.
+ */
+export function useGitBranches(url: string | null): UseQueryResult<GitRemoteBranches> {
+  return useQuery({
+    queryKey: ['git-branches', url],
+    queryFn: () => fetchGitBranches(url ?? ''),
+    enabled: url !== null && url !== '',
+    retry: false,
+  });
+}
+
+/** Top-level directories of a GitHub repo at a branch — public-directory suggestions. */
+export function useGithubDirs(repo: string | null, branch: string | null): UseQueryResult<string[]> {
+  return useQuery({
+    queryKey: ['github-dirs', repo, branch],
+    queryFn: () => fetchGithubDirs(repo ?? '', branch ?? ''),
+    enabled: repo !== null && branch !== null && branch !== '',
+  });
+}
+
 // ---- Project detail ----
 
 export function useProject(id: number): UseQueryResult<Project> {
@@ -215,6 +244,12 @@ export function useCronJobs(projectId: number): UseQueryResult<CronJob[]> {
 
 export function useDatabases(): UseQueryResult<DatabaseListItem[]> {
   return useQuery({ queryKey: ['databases'], queryFn: fetchDatabases });
+}
+
+/** The database servers a database can be created on — the host's own engines plus every registered
+ * external one. Feeds both the Databases page's connection list and the new-project picker. */
+export function useDbConnections(): UseQueryResult<DbConnection[]> {
+  return useQuery({ queryKey: ['db-connections'], queryFn: fetchDbConnections });
 }
 
 /** Redis/Mailpit connection info for the info panels at the bottom of the Databases page. */

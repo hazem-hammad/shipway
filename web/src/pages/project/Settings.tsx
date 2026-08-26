@@ -6,7 +6,7 @@
  */
 import { type FormEvent, type ReactNode, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { HeartPulse, Settings as SettingsIcon, Terminal } from 'lucide-react';
+import { HeartPulse, Lock, Settings as SettingsIcon, Terminal } from 'lucide-react';
 import { ApiError, patchProject, type PatchProjectBody, type Project } from '../../api';
 import { useProject } from '../../hooks';
 import { Button, Card, CardHeader, Field, ICON_STROKE, Input, Select, Skeleton, Toggle } from '../../components/ui';
@@ -60,6 +60,7 @@ export default function SettingsTab({ projectId }: { projectId: number }) {
       <GeneralCard key={`general-${String(project.id)}`} project={project} onSaved={() => void handleSaved()} />
       <BuildRuntimeCard key={`build-${String(project.id)}`} project={project} onSaved={() => void handleSaved()} />
       <HealthDeploysCard key={`health-${String(project.id)}`} project={project} onSaved={() => void handleSaved()} />
+      <PasswordProtectionCard key={`auth-${String(project.id)}`} project={project} onSaved={() => void handleSaved()} />
     </div>
   );
 }
@@ -351,6 +352,114 @@ function HealthDeploysCard({ project, onSaved }: { project: Project; onSaved: ()
         </Field>
 
         <SaveRow saving={saving} dirty={dirty} error={error} provisionError={provisionError} />
+      </form>
+    </Card>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Password protection — nginx basic auth in front of the project's public site.
+// ---------------------------------------------------------------------------
+
+function PasswordProtectionCard({ project, onSaved }: { project: Project; onSaved: () => void }) {
+  const [authEnabled, setAuthEnabled] = useState(project.authEnabled);
+  const [authUser, setAuthUser] = useState(project.authUser ?? '');
+  const [authPassword, setAuthPassword] = useState('');
+  const [dirty, setDirty] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [provisionError, setProvisionError] = useState<ProvisionError | null>(null);
+
+  function change<T>(setter: (value: T) => void) {
+    return (value: T) => {
+      setter(value);
+      setDirty(true);
+      setError(null);
+      setProvisionError(null);
+    };
+  }
+
+  // Enabling with nothing to enforce is rejected by the API (it would render an auth_basic_user_file
+  // that doesn't exist); surface it here so Save isn't the thing that tells you.
+  const needsPassword = authEnabled && !project.authPasswordSet && authPassword === '';
+  const needsUser = authEnabled && authUser.trim() === '';
+
+  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSaving(true);
+    setError(null);
+    setProvisionError(null);
+
+    const body: PatchProjectBody = {
+      authEnabled,
+      ...(authUser.trim() === '' ? {} : { authUser: authUser.trim() }),
+      // Omitted when blank, so saving other changes doesn't clear an existing password.
+      ...(authPassword === '' ? {} : { authPassword }),
+    };
+
+    try {
+      await patchProject(project.id, body);
+      onSaved();
+      setDirty(false);
+      setAuthPassword('');
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 502) {
+        const payload = err.body as { step?: string; detail?: string } | undefined;
+        setProvisionError({ step: payload?.step ?? 'unknown', detail: payload?.detail ?? err.message });
+      } else {
+        setError(errorMessage(err, 'Could not save settings. Try again.'));
+      }
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader
+        icon={<Lock size={20} strokeWidth={ICON_STROKE} />}
+        title="Password protection"
+        description="Puts an HTTP basic auth prompt in front of the whole site. Gates who can reach it — it does not stop someone who has signed in from viewing the page source."
+      />
+      <form onSubmit={(event) => void handleSubmit(event)} className="mt-5 flex max-w-[560px] flex-col gap-5" noValidate>
+        <ToggleRow
+          label="Require a password"
+          description="Every request to this project's domain must authenticate."
+          checked={authEnabled}
+          onChange={change(setAuthEnabled)}
+        />
+
+        {authEnabled && (
+          <>
+            <Field label="Username" error={needsUser ? 'Required.' : undefined}>
+              <Input
+                mono
+                value={authUser}
+                onChange={(event) => change(setAuthUser)(event.target.value)}
+                placeholder="client"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </Field>
+
+            <Field
+              label="Password"
+              error={needsPassword ? 'Required — no password is stored yet.' : undefined}
+              hint={project.authPasswordSet ? 'A password is set. Type a new one to replace it, or leave blank to keep it.' : 'Stored as a hash; it cannot be shown again afterwards.'}
+            >
+              <Input
+                mono
+                type="password"
+                value={authPassword}
+                onChange={(event) => change(setAuthPassword)(event.target.value)}
+                placeholder={project.authPasswordSet ? '••••••••  (unchanged)' : ''}
+                autoComplete="new-password"
+              />
+            </Field>
+          </>
+        )}
+
+        <SaveRow saving={saving} dirty={dirty && !needsPassword && !needsUser} error={error} provisionError={provisionError} />
       </form>
     </Card>
   );

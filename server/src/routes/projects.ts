@@ -3,6 +3,12 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
 import { buildEnvFile, buildManagedVars, type SmtpConfig } from '../deploy/envfile.js';
+import {
+  LARAVEL_BUILD_CMD,
+  LARAVEL_INSTALL_CMD,
+  LARAVEL_POST_DEPLOY_SCRIPT,
+  LARAVEL_PRE_DEPLOY_SCRIPT,
+} from '../deploy/laravel.js';
 import { requireRole } from '../lib/authz.js';
 import { getActor, recordAudit } from '../services/audit.js';
 import {
@@ -15,6 +21,7 @@ import {
 } from '../services/provisioner.js';
 import { allocatePort } from '../system/ports.js';
 import { SLUG_RE, isValidPublicDir } from '../system/templates.js';
+import { hashAuthPassword, isValidAuthUser } from '../system/htpasswd.js';
 
 type ProjectRow = typeof projects.$inferSelect;
 type ProjectType = ProjectRow['type'];
@@ -101,13 +108,17 @@ const patchProjectSchema = z
     healthCheckPath: z.string().nullable(),
     autoDeploy: z.boolean(),
     notifyWebhookUrl: z.string().nullable(),
+    authEnabled: z.boolean(),
+    authUser: z.string().refine(isValidAuthUser, { message: 'invalid authUser' }),
+    /** Write-only: hashed into `authHash` and never stored or returned in plaintext. */
+    authPassword: z.string().min(1),
   })
   .partial();
 
 const IMMUTABLE_PATCH_FIELDS = ['slug', 'repo', 'type'] as const;
 
 /** Fields whose change requires re-rendering/reinstalling the vhost and (node/nextjs) app unit. */
-const REFRESH_TRIGGER_FIELDS = ['phpVersion', 'publicDir', 'startCmd', 'nodeVersion'] as const;
+const REFRESH_TRIGGER_FIELDS = ['phpVersion', 'publicDir', 'startCmd', 'nodeVersion', 'authEnabled', 'authUser', 'authPassword'] as const;
 
 /** `PATCH /api/projects/:id` handles both general settings and the pre/post-deploy scripts (there's
  * no separate scripts sub-route) — this picks the more specific `project.scripts.update` audit
@@ -147,19 +158,27 @@ interface ProjectDefaults {
   sharedPaths: string[];
   phpVersion: string | null;
   nodeVersion: string | null;
+  /** Prefilled pre/post-deploy scripts, or `null` for "leave empty" (every type but php). */
+  preDeployScript: string | null;
+  postDeployScript: string | null;
 }
 
 function defaultsForType(type: ProjectType): ProjectDefaults {
   switch (type) {
+    // A php project is assumed to be Laravel until told otherwise: the install/build commands and
+    // the pre/post-deploy scripts come from `deploy/laravel.ts`, the same source New Project shows
+    // (and lets the user edit) before creating it. Non-Laravel PHP just clears the fields.
     case 'php':
       return {
-        installCmd: 'composer install --no-dev --optimize-autoloader --no-interaction',
-        buildCmd: '',
+        installCmd: LARAVEL_INSTALL_CMD,
+        buildCmd: LARAVEL_BUILD_CMD,
         startCmd: null,
         publicDir: 'public',
         sharedPaths: ['storage', 'uploads'],
         phpVersion: '8.3',
         nodeVersion: null,
+        preDeployScript: LARAVEL_PRE_DEPLOY_SCRIPT,
+        postDeployScript: LARAVEL_POST_DEPLOY_SCRIPT,
       };
     case 'node':
     case 'nextjs':
@@ -171,6 +190,8 @@ function defaultsForType(type: ProjectType): ProjectDefaults {
         sharedPaths: [],
         phpVersion: null,
         nodeVersion: '22',
+        preDeployScript: null,
+        postDeployScript: null,
       };
     case 'static':
       return {
@@ -181,14 +202,23 @@ function defaultsForType(type: ProjectType): ProjectDefaults {
         sharedPaths: [],
         phpVersion: null,
         nodeVersion: null,
+        preDeployScript: null,
+        postDeployScript: null,
       };
   }
 }
 
-/** Never leaks the encrypted env/SMTP blobs to API clients. */
-function toPublicProject(project: ProjectRow): Omit<ProjectRow, 'envEncrypted' | 'smtpConfigEncrypted'> {
-  const { envEncrypted, smtpConfigEncrypted, ...rest } = project;
-  return rest;
+/**
+ * Never leaks the encrypted env/SMTP blobs — or the basic-auth password hash — to API clients.
+ * `authEnabled`/`authUser` are safe to expose (the UI needs them to render current state);
+ * `authHash` is not, so the client is told *whether* a password is set via `authPasswordSet`
+ * instead of being handed the hash to crack offline.
+ */
+function toPublicProject(
+  project: ProjectRow,
+): Omit<ProjectRow, 'envEncrypted' | 'smtpConfigEncrypted' | 'authHash'> & { authPasswordSet: boolean } {
+  const { envEncrypted, smtpConfigEncrypted, authHash, ...rest } = project;
+  return { ...rest, authPasswordSet: !!authHash };
 }
 
 function toErrorMessage(err: unknown): string {
@@ -273,8 +303,8 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         installCmd: body.installCmd ?? defaults.installCmd,
         buildCmd: body.buildCmd ?? defaults.buildCmd,
         startCmd: body.startCmd ?? defaults.startCmd,
-        preDeployScript: body.preDeployScript ?? null,
-        postDeployScript: body.postDeployScript ?? null,
+        preDeployScript: body.preDeployScript ?? defaults.preDeployScript,
+        postDeployScript: body.postDeployScript ?? defaults.postDeployScript,
         sharedPaths: body.sharedPaths ?? defaults.sharedPaths,
         healthCheckPath: body.healthCheckPath ?? null,
         autoDeploy: body.autoDeploy ?? true,
@@ -354,8 +384,33 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    if (Object.keys(parsed.data).length > 0) {
-      app.db.update(projects).set(parsed.data).where(eq(projects.id, id)).run();
+    // `authPassword` is not a column: hash it here and persist `authHash` instead, so the plaintext
+    // never reaches the database (or the audit log's changed-field list, which uses these keys).
+    const { authPassword, ...columnPatch } = parsed.data;
+    const patch: Record<string, unknown> = { ...columnPatch };
+    if (authPassword !== undefined) {
+      try {
+        patch.authHash = await hashAuthPassword(authPassword);
+      } catch (err) {
+        request.log.error(err, 'failed to hash project basic-auth password');
+        return reply.code(500).send({ error: 'failed to set password' });
+      }
+    }
+
+    // Turning auth on with no credentials to enforce would render an `auth_basic_user_file` that
+    // doesn't exist — nginx accepts that at config-test time and then 500s every request. Reject it
+    // here instead, accounting for values already stored on the row.
+    const willEnable = patch.authEnabled === undefined ? existing.authEnabled : patch.authEnabled === true;
+    if (willEnable) {
+      const user = patch.authUser === undefined ? existing.authUser : (patch.authUser as string);
+      const hasHash = patch.authHash !== undefined || !!existing.authHash;
+      if (!user || !hasHash) {
+        return reply.code(400).send({ error: 'authEnabled requires authUser and a password' });
+      }
+    }
+
+    if (Object.keys(patch).length > 0) {
+      app.db.update(projects).set(patch).where(eq(projects.id, id)).run();
     }
 
     const updated = app.db.select().from(projects).where(eq(projects.id, id)).get();

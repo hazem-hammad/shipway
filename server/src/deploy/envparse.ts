@@ -293,6 +293,17 @@ function formatValue(key: string, value: string): string {
   return formatValueDetailed(key, value).text;
 }
 
+/**
+ * A single `KEY=value` line, quoted exactly the way `serializeEnv` would write it (i.e. through
+ * `formatValueDetailed`, so the round-trip guarantee in its doc comment holds here too). Exported
+ * for callers that assemble or patch individual lines rather than a whole rows+extras document —
+ * `deploy/laravel.ts`'s `upsertEnvVars`, which rewrites specific keys in place inside env text it
+ * must otherwise leave byte-for-byte alone.
+ */
+export function formatEnvAssignment(key: string, value: string): string {
+  return `${key}=${formatValue(key, value)}`;
+}
+
 function formatRow(row: EnvRow): string {
   return `${row.key}=${formatValue(row.key, row.value)}`;
 }

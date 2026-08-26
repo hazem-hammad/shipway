@@ -180,7 +180,23 @@ function linkSharedPaths(projectDir: string, project: ProjectRow, releaseDir: st
   for (const entry of project.sharedPaths) {
     const target = path.join(sharedDir, entry);
     fs.mkdirSync(target, { recursive: true }); // mkdir -p, no-op if it already exists
-    replaceSymlink(path.join(releaseDir, entry), target);
+
+    // Seed the shared directory from whatever the repo actually committed at this path, before the
+    // symlink below discards it. Without this, sharing `storage` on a Laravel project throws away
+    // the tracked `storage/framework/{cache,sessions,views}/.gitignore` placeholders that create
+    // those directories, and `artisan package:discover` — run by composer's post-autoload-dump —
+    // dies with "Please provide a valid cache path." before the deploy can finish.
+    //
+    // `force: false` makes this strictly additive: anything already in shared (the real uploads,
+    // logs, and other data that shared paths exist to preserve) is never overwritten, so this is
+    // safe on every deploy and not just the first one — a subdirectory added to the repo later gets
+    // created too.
+    const releasePath = path.join(releaseDir, entry);
+    if (fs.existsSync(releasePath) && fs.lstatSync(releasePath).isDirectory()) {
+      fs.cpSync(releasePath, target, { recursive: true, force: false, errorOnExist: false });
+    }
+
+    replaceSymlink(releasePath, target);
   }
 }
 
@@ -301,6 +317,91 @@ async function runScript(
   if (exitCode !== 0) {
     throw new StageError(stage, `${stage} script exited with code ${String(exitCode)}`);
   }
+}
+
+/**
+ * The user php-fpm runs as. Every PHP project on the host is served by the distribution's own
+ * `php<version>-fpm` pool (`system/templates.ts` points each vhost at `/run/php/php<v>-fpm.sock`),
+ * which on Debian/Ubuntu — the only platform install.sh targets — runs as `www-data`.
+ */
+const WEB_USER = 'www-data';
+
+/** Laravel compiles its package/service manifests here, and writes them at runtime if a deploy
+ * didn't. Relative to the release, not shared: it is per-release build output. */
+const PHP_RUNTIME_WRITE_PATHS = ['bootstrap/cache'];
+
+/**
+ * Wraps `value` in single quotes for a POSIX shell, escaping any single quote it contains as
+ * `'\''` (close, escaped literal, reopen). A shared path is whatever the project's settings say —
+ * `sharedPaths` is a free-form string array — so it reaches the command below unvalidated, and
+ * naive quoting would break on a name as ordinary as `it's`.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Gives php-fpm write access to the paths a PHP app writes to while it is *running*.
+ *
+ * The deploy runs as `deployer` and everything it creates is `deployer:deployer` 0755, but the
+ * requests that follow are served as `www-data` — so without this a Laravel app comes up and dies
+ * on its first page render with "Failed to open stream: Permission denied" trying to compile a
+ * Blade view. The build itself never hits this, which is what makes the failure so easy to ship: a
+ * fully green deploy, and a 500 on the first request.
+ *
+ * POSIX ACLs rather than `chown`/`chgrp`: the `default:` entries make everything *later* created
+ * inside these directories carry the same access, so a file written by `www-data` at runtime and a
+ * file written by `deployer` on the next deploy are both readable and writable by the other. Group
+ * ownership alone can't express that — a file's group is inherited, but its group-write bit is
+ * whatever the creating process's umask says, and php-fpm's is 022. `deployer` owns these paths, so
+ * no privilege is needed to set this; `X` (capital) grants directory traversal without marking
+ * every plain file executable.
+ *
+ * Failure is logged, not fatal: a PHP project that never writes anything at runtime deploys fine
+ * without this, and refusing to release working code over it would be the wrong trade. The log line
+ * is what points at this when an app does need it.
+ */
+async function grantWebWriteAccess(
+  deps: PipelineDeps,
+  project: ProjectRow,
+  projectDir: string,
+  releaseDir: string,
+  env: Record<string, string>,
+  signal: AbortSignal,
+  logger: DeployLogger,
+): Promise<void> {
+  // node/nextjs run as `deployer` under their own systemd unit, and a static site is only ever read
+  // by nginx — php is the one runtime whose writes happen as another user.
+  if (project.type !== 'php') {
+    return;
+  }
+
+  // Shared paths are exactly the directories that exist to hold data written after the deploy
+  // (`storage`, `uploads`), so all of them get this — not just Laravel's.
+  const targets = [
+    ...project.sharedPaths.map((entry) => path.join(projectDir, 'shared', entry)),
+    ...PHP_RUNTIME_WRITE_PATHS.map((entry) => path.join(releaseDir, entry)),
+  ].filter((target) => fs.existsSync(target));
+
+  if (targets.length === 0) {
+    return;
+  }
+
+  const quoted = targets.map(shellQuote).join(' ');
+  const { exitCode } = await deps.runShell(
+    `setfacl -R -m u:${WEB_USER}:rwX -m d:u:${WEB_USER}:rwX -- ${quoted}`,
+    { cwd: releaseDir, env, signal, onOutput: (line) => { logger.line(line); } },
+  );
+
+  if (exitCode !== 0) {
+    logger.line(
+      `WARNING: could not grant ${WEB_USER} write access to ${targets.join(', ')} (setfacl exited ${String(exitCode)}). ` +
+        'A PHP app that writes at runtime (Laravel\'s storage/, for one) will fail with "Permission denied" on its first request.',
+    );
+    return;
+  }
+
+  logger.line(`granted ${WEB_USER} write access to ${targets.join(', ')}`);
 }
 
 /**
@@ -529,9 +630,9 @@ async function notifySafe(
 // ---------------------------------------------------------------------------
 
 /**
- * `resolve` -> `export` -> `shared` -> `env` -> `pre_deploy` -> `build` (install + build). On any
- * failure (including cancellation), deletes the release directory if one was created, then
- * rethrows for the caller to classify (failed vs. canceled).
+ * `resolve` -> `export` -> `shared` -> `env` -> `pre_deploy` -> `build` (install + build) ->
+ * `permissions`. On any failure (including cancellation), deletes the release directory if one was
+ * created, then rethrows for the caller to classify (failed vs. canceled).
  */
 async function runBuildPhase(
   deps: PipelineDeps,
@@ -574,6 +675,12 @@ async function runBuildPhase(
     checkAborted(signal);
     await runScript(deps, 'install', project.installCmd, releaseDir, shellEnv, signal, logger);
     await runScript(deps, 'build', project.buildCmd, releaseDir, shellEnv, signal, logger);
+
+    // After the build, so it covers everything the build just wrote, and before activate, so the
+    // first request to reach the new release already has somewhere to write.
+    logger.section('permissions');
+    checkAborted(signal);
+    await grantWebWriteAccess(deps, project, projectDir, releaseDir, shellEnv, signal, logger);
 
     return { releaseDir, commitMessage: message };
   } catch (err) {

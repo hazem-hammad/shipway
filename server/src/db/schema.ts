@@ -71,6 +71,13 @@ export const projects = sqliteTable('projects', {
     .default('mailpit'),
   smtpConfigEncrypted: blob('smtp_config_encrypted', { mode: 'buffer' }),
   notifyWebhookUrl: text('notify_webhook_url'),
+  /** Per-project HTTP basic auth on the public site (nginx `auth_basic`). `authHash` is an apr1
+   * crypt string for `auth_basic_user_file` — the plaintext password is never stored, and the hash
+   * is never returned by the API. Gates *access* to the site; it cannot stop a visitor who has
+   * authenticated from reading the markup their own browser rendered. */
+  authEnabled: integer('auth_enabled', { mode: 'boolean' }).notNull().default(false),
+  authUser: text('auth_user'),
+  authHash: text('auth_hash'),
   /** Git-URL source alternative to a GitHub App `repo` (Task 8): any https git URL, used verbatim
    * by the pipeline's `getCloneUrl` when set. `NULL` for GitHub-App-sourced projects. */
   repoUrl: text('repo_url'),
@@ -96,9 +103,47 @@ export const deployments = sqliteTable('deployments', {
   finishedAt: integer('finished_at', { mode: 'number' }),
 });
 
+/**
+ * A database server Shipway can provision on: an external MySQL/Postgres (RDS, Cloud SQL, a managed
+ * instance, another box) registered from the Databases page, holding the admin credentials Shipway
+ * uses to create databases and roles there.
+ *
+ * The two engines on the host itself are deliberately NOT rows here — they come from the admin URLs
+ * `install.sh` writes into settings (`mysql_admin_url` / `postgres_admin_url`), and moving them
+ * would mean migrating live secrets between two stores for no gain. `services/dbconnections.ts`
+ * presents both kinds as one list, which is the only place that distinction has to be understood.
+ */
+export const dbConnections = sqliteTable('db_connections', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  /** Display name, unique so it can be referred to unambiguously ("RDS production"). */
+  name: text('name').notNull().unique(),
+  engine: text('engine', { enum: ['mysql', 'postgres'] }).notNull(),
+  host: text('host').notNull(),
+  port: integer('port').notNull(),
+  /** The admin/superuser this connection provisions as — needs CREATE DATABASE and CREATE USER/ROLE. */
+  adminUsername: text('admin_username').notNull(),
+  adminPasswordEncrypted: blob('admin_password_encrypted', { mode: 'buffer' }).notNull(),
+  /**
+   * Connect over TLS without requiring the server's CA to be locally trusted — what a managed
+   * instance (RDS and friends, which present their own CA) needs to connect at all. Stored per
+   * connection because the answer differs per host, and a local socket needs it off.
+   */
+  tls: integer('tls', { mode: 'boolean' }).notNull().default(false),
+  createdAt: integer('created_at', { mode: 'number' })
+    .notNull()
+    .$defaultFn(() => Date.now()),
+});
+
 export const databases = sqliteTable('databases', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   projectId: integer('project_id').references(() => projects.id, { onDelete: 'cascade' }),
+  /**
+   * Which connection this database lives on. NULL means the host's own engine for `engine` — the
+   * only thing that existed before connections did, and still what every locally provisioned
+   * database uses. `onDelete: 'restrict'` so a connection can't be unregistered out from under the
+   * databases on it; the route refuses with a list of what is still there.
+   */
+  connectionId: integer('connection_id').references(() => dbConnections.id, { onDelete: 'restrict' }),
   engine: text('engine', { enum: ['mysql', 'postgres'] }).notNull(),
   name: text('name').notNull(),
   username: text('username').notNull(),

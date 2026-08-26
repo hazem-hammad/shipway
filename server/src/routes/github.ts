@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { getSetting, setSetting } from '../db/settings.js';
 import { requireRole } from '../lib/authz.js';
 import { getActor, recordAudit } from '../services/audit.js';
-import { exchangeManifestCode, GitHubService, type GithubAppConfig } from '../services/github.js';
+import { AmbiguousInstallationError, exchangeManifestCode, GitHubService, type GithubAppConfig } from '../services/github.js';
 
 const GITHUB_APP_SETTING_KEY = 'github_app';
 const NOT_CONFIGURED = { error: 'github app not configured' };
@@ -27,7 +27,17 @@ function buildStatus(cfg: GithubAppConfig | null): GithubStatus {
   };
 }
 
-const manifestQuerySchema = z.object({ baseUrl: z.string().url() });
+/**
+ * GitHub login rules for the optional `org`: 1-39 chars, alphanumeric or single hyphens, no
+ * leading/trailing hyphen. Validated (rather than just escaped) because it is interpolated into
+ * the github.com URL the browser is about to POST the manifest to.
+ */
+const GITHUB_LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+
+const manifestQuerySchema = z.object({
+  baseUrl: z.string().url(),
+  org: z.string().regex(GITHUB_LOGIN).optional(),
+});
 
 const manualAppSchema = z.object({
   appId: z.coerce.number().int(),
@@ -40,7 +50,16 @@ const manualAppSchema = z.object({
 // 400ing as a generic bad request — see the CSRF note on the callback route.
 const callbackQuerySchema = z.object({ code: z.string().min(1), state: z.string().optional() });
 
+const resolveBodySchema = z.object({
+  installationId: z.coerce.number().int().positive().optional(),
+});
+
 const branchesQuerySchema = z.object({ repo: z.string().regex(/^[^/]+\/[^/]+$/, 'expected owner/repo') });
+
+const dirsQuerySchema = z.object({
+  repo: z.string().regex(/^[^/]+\/[^/]+$/, 'expected owner/repo'),
+  branch: z.string().min(1),
+});
 
 /**
  * Registers the GitHub App setup/status/data routes. Everything here lives under `/api/github/`
@@ -93,7 +112,7 @@ export async function githubRoutes(
     if (!parsed.success) {
       return reply.code(400).send({ error: 'invalid request' });
     }
-    const { baseUrl } = parsed.data;
+    const { baseUrl, org } = parsed.data;
 
     const state = issueState();
     const suffix = randomBytes(2).toString('hex');
@@ -107,8 +126,16 @@ export async function githubRoutes(
       default_events: ['push'],
     };
 
+    // Without `org` this posts to the *personal* app-creation endpoint, which always yields a
+    // user-owned app — and since the manifest sets `public: false`, a user-owned app can only ever
+    // be installed on that same user account. Passing an org posts to the org's endpoint instead,
+    // so the app is owned by the org and installable on it.
+    const postUrl = org
+      ? `https://github.com/organizations/${encodeURIComponent(org)}/settings/apps/new?state=${state}`
+      : `https://github.com/settings/apps/new?state=${state}`;
+
     return {
-      postUrl: `https://github.com/settings/apps/new?state=${state}`,
+      postUrl,
       manifestJson: JSON.stringify(manifest),
     };
   });
@@ -171,6 +198,24 @@ export async function githubRoutes(
     return buildStatus(next);
   });
 
+  // Lists the accounts the app is installed on, so an admin can pick between them when the app is
+  // installed on more than one (e.g. both a personal account and an organization).
+  app.get('/api/github/installations', async (request, reply) => {
+    if (!requireRole(request, reply, 'admin')) return;
+
+    const cfg = getSetting<GithubAppConfig>(app.db, GITHUB_APP_SETTING_KEY);
+    if (!cfg) {
+      return reply.code(503).send(NOT_CONFIGURED);
+    }
+
+    try {
+      return { installations: await new GitHubService(cfg).listInstallations() };
+    } catch (err) {
+      request.log.error(err, 'failed to list github app installations');
+      return reply.code(502).send({ error: 'failed to list installations' });
+    }
+  });
+
   app.post('/api/github/resolve-installation', async (request, reply) => {
     if (!requireRole(request, reply, 'admin')) return;
 
@@ -179,10 +224,32 @@ export async function githubRoutes(
       return reply.code(503).send(NOT_CONFIGURED);
     }
 
+    // Body is optional: no body (or no installationId) keeps the original "detect it for me"
+    // behaviour, which now only succeeds when the choice is unambiguous.
+    const parsed = resolveBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid request' });
+    }
+    const requested = parsed.data.installationId;
+
     let installationId: number;
     try {
-      installationId = await new GitHubService(cfg).resolveInstallationId();
+      const service = new GitHubService(cfg);
+      if (requested === undefined) {
+        installationId = await service.resolveInstallationId();
+      } else {
+        // An explicit choice is still checked against GitHub, so a stale or hand-edited id can't
+        // be stored and then fail later at deploy time with a much less obvious error.
+        const installations = await service.listInstallations();
+        if (!installations.some((i) => i.id === requested)) {
+          return reply.code(400).send({ error: 'installation not found for this app' });
+        }
+        installationId = requested;
+      }
     } catch (err) {
+      if (err instanceof AmbiguousInstallationError) {
+        return reply.code(409).send({ error: 'multiple installations', installations: err.installations });
+      }
       request.log.error(err, 'failed to resolve github app installation');
       return reply.code(502).send({ error: 'failed to resolve installation' });
     }
@@ -221,5 +288,23 @@ export async function githubRoutes(
     }
 
     return new GitHubService(cfg).listBranches(parsed.data.repo);
+  });
+
+  // Top-level directories of a repo at a branch — suggestions for a project's "Public directory".
+  app.get('/api/github/dirs', async (request, reply) => {
+    const cfg = getSetting<GithubAppConfig>(app.db, GITHUB_APP_SETTING_KEY);
+    if (!cfg) {
+      return reply.code(503).send(NOT_CONFIGURED);
+    }
+    if (cfg.installationId === undefined) {
+      return reply.code(503).send(NOT_INSTALLED);
+    }
+
+    const parsed = dirsQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.code(400).send({ error: 'invalid request' });
+    }
+
+    return new GitHubService(cfg).listTopLevelDirs(parsed.data.repo, parsed.data.branch);
   });
 }

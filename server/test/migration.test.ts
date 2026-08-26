@@ -103,7 +103,11 @@ function build0001StateDb(dbPath: string): Database.Database {
   fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0000_snapshot.json'), path.join(legacyDir, 'meta/0000_snapshot.json'));
   fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0001_snapshot.json'), path.join(legacyDir, 'meta/0001_snapshot.json'));
   const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta/_journal.json'), 'utf8')) as { entries: { tag: string }[] };
-  journal.entries = journal.entries.filter((e) => e.tag !== '0002_notification_channel_type_target');
+  // Allowlist, not a blacklist: this fixture copies exactly the 0000 and 0001 SQL files above, so the
+  // journal must list exactly those two. Excluding later migrations by name instead meant every new
+  // migration added to the folder broke this fixture with "No file 000N_....sql found".
+  const LEGACY_TAGS = ['0000_clever_nick_fury', '0001_overconfident_karen_page'];
+  journal.entries = journal.entries.filter((e) => LEGACY_TAGS.includes(e.tag));
   fs.writeFileSync(path.join(legacyDir, 'meta/_journal.json'), JSON.stringify(journal));
 
   const client = new Database(dbPath);

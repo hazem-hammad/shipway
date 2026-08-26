@@ -10,6 +10,12 @@ import { auditEvents, deployments, projects } from '../src/db/schema.js';
 import { RESERVED_SLUGS } from '../src/routes/projects.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { FakeDnsClient } from '../src/services/cloudflare.js';
+import {
+  LARAVEL_BUILD_CMD,
+  LARAVEL_INSTALL_CMD,
+  LARAVEL_POST_DEPLOY_SCRIPT,
+  LARAVEL_PRE_DEPLOY_SCRIPT,
+} from '../src/deploy/laravel.js';
 
 function tmpDataDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-projects-routes-test-'));
@@ -137,11 +143,46 @@ describe('POST /api/projects', () => {
       type: 'php',
       phpVersion: '8.3',
       publicDir: 'public',
-      installCmd: 'composer install --no-dev --optimize-autoloader --no-interaction',
-      buildCmd: '',
+      installCmd: LARAVEL_INSTALL_CMD,
+      // A php project is assumed to be Laravel: migrations run pre-activation, and the pre/post
+      // deploy scripts come prefilled (see deploy/laravel.ts).
+      buildCmd: LARAVEL_BUILD_CMD,
+      preDeployScript: LARAVEL_PRE_DEPLOY_SCRIPT,
+      postDeployScript: LARAVEL_POST_DEPLOY_SCRIPT,
       sharedPaths: ['storage', 'uploads'],
       port: null,
     });
+
+    await app.close();
+  });
+
+  it('lets the request override the prefilled php scripts, including clearing them', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: { ...PHP_PAYLOAD, buildCmd: 'php artisan migrate --force', preDeployScript: '', postDeployScript: 'php artisan queue:restart' },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({
+      buildCmd: 'php artisan migrate --force',
+      preDeployScript: '',
+      postDeployScript: 'php artisan queue:restart',
+    });
+
+    await app.close();
+  });
+
+  it('leaves the pre/post deploy scripts empty for a non-php project', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+
+    const res = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: NODE_PAYLOAD });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ preDeployScript: null, postDeployScript: null });
 
     await app.close();
   });
@@ -529,6 +570,72 @@ describe('PATCH /api/projects/:id', () => {
 
     expect(res.statusCode).toBe(200);
     expect(res.json()).toMatchObject({ name: 'Shop Renamed', autoDeploy: false });
+
+    await app.close();
+  });
+
+  it('refuses to enable basic auth without a username and password — enabling with nothing to enforce would render an auth_basic_user_file that does not exist', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const bare = await app.inject({ method: 'PATCH', url: `/api/projects/${id}`, headers: { cookie }, payload: { authEnabled: true } });
+    expect(bare.statusCode).toBe(400);
+    expect(bare.json()).toEqual({ error: 'authEnabled requires authUser and a password' });
+
+    const userOnly = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${id}`,
+      headers: { cookie },
+      payload: { authEnabled: true, authUser: 'client' },
+    });
+    expect(userOnly.statusCode).toBe(400);
+
+    await app.close();
+  });
+
+  it('stores the basic-auth password as a hash and never returns it — the client only learns that one is set', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${id}`,
+      headers: { cookie },
+      payload: { authEnabled: true, authUser: 'client', authPassword: 'hunter2' },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as Record<string, unknown>;
+    expect(body).toMatchObject({ authEnabled: true, authUser: 'client', authPasswordSet: true });
+    expect(body.authHash).toBeUndefined();
+    expect(body.authPassword).toBeUndefined();
+    expect(JSON.stringify(body)).not.toContain('hunter2');
+
+    // GET must redact it too, not just the PATCH response.
+    const get = await app.inject({ method: 'GET', url: `/api/projects/${id}`, headers: { cookie } });
+    const fetched = get.json() as Record<string, unknown>;
+    expect(fetched.authHash).toBeUndefined();
+    expect(fetched.authPasswordSet).toBe(true);
+
+    await app.close();
+  });
+
+  it('rejects a username that would break the htpasswd line format', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    for (const authUser of ['has space', 'colon:here', 'sl/ash']) {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${id}`,
+        headers: { cookie },
+        payload: { authEnabled: true, authUser, authPassword: 'hunter2' },
+      });
+      expect(res.statusCode, authUser).toBe(400);
+    }
 
     await app.close();
   });

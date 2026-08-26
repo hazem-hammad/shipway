@@ -24,6 +24,7 @@
 #   /etc/nginx/sites-available/shipway-<slug>.conf
 #   /etc/nginx/sites-enabled/shipway-<slug>.conf
 #   /etc/systemd/system/shipway-<unit>.service
+#   /etc/nginx/shipway-auth/shipway-<slug>.htpasswd
 #
 # Anything else — an unknown verb, the wrong argument count, or a <dest>
 # outside the whitelist — prints an error to stderr and exits 2. Nothing is
@@ -33,6 +34,10 @@ set -euo pipefail
 
 readonly NGINX_DEST_RE='^/etc/nginx/sites-(available|enabled)/shipway-[a-z0-9-]+\.conf$'
 readonly SYSTEMD_DEST_RE='^/etc/systemd/system/shipway-[a-z0-9@.-]+\.service$'
+# Per-project basic-auth files for `auth_basic_user_file`. Same anchored shape as the vhost
+# pattern (no dots, no slashes, no `..` can appear in <slug>), confined to one directory that
+# install.sh creates and nothing else writes to.
+readonly HTPASSWD_DEST_RE='^/etc/nginx/shipway-auth/shipway-[a-z0-9-]+\.htpasswd$'
 
 usage() {
   echo "usage: shipway-sysops install-file <dest>   (content read from stdin)" >&2
@@ -43,7 +48,7 @@ usage() {
 # systemd-unit whitelist above.
 assert_whitelisted() {
   local dest="$1"
-  if [[ "$dest" =~ $NGINX_DEST_RE ]] || [[ "$dest" =~ $SYSTEMD_DEST_RE ]]; then
+  if [[ "$dest" =~ $NGINX_DEST_RE ]] || [[ "$dest" =~ $SYSTEMD_DEST_RE ]] || [[ "$dest" =~ $HTPASSWD_DEST_RE ]]; then
     return 0
   fi
   echo "shipway-sysops: refusing to touch path outside the whitelist: $dest" >&2
