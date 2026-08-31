@@ -1,7 +1,8 @@
 import { eq } from 'drizzle-orm';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { cronJobs, projects } from '../db/schema.js';
+import { canAccessProject } from '../lib/projectaccess.js';
 import { getActor, recordAudit } from '../services/audit.js';
 import { syncCrontab, validateCronExpr, type CronDeps } from '../services/cron.js';
 
@@ -26,6 +27,14 @@ const patchCronSchema = z
   })
   .partial();
 
+/** The host's IANA timezone, or `'UTC'` if the runtime can't name it (a container with no tzdata
+ * resolves to an empty string on some builds). Read per request rather than cached, so changing the
+ * host timezone doesn't need a Shipway restart to show correctly. */
+function hostTimezone(): string {
+  const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  return zone && zone.trim() !== '' ? zone : 'UTC';
+}
+
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -34,8 +43,12 @@ function toErrorMessage(err: unknown): string {
  * Rewrites a php project's command from a leading `php ` to `php<phpVersion> ` (e.g. `php artisan
  * schedule:run` -> `php8.3 artisan schedule:run`). Non-php projects, projects without a phpVersion,
  * and commands that don't start with exactly `php ` are returned unchanged.
+ *
+ * Exported so `routes/projects.ts` can apply the same rewrite to the scheduler cron it seeds for a
+ * new Laravel project — a second copy of this rule would be free to drift from the one that runs on
+ * every later edit.
  */
-function rewritePhpCommand(project: ProjectRow, command: string): string {
+export function rewritePhpCommand(project: ProjectRow, command: string): string {
   if (project.type === 'php' && project.phpVersion && command.startsWith('php ')) {
     return `php${project.phpVersion} ${command.slice('php '.length)}`;
   }
@@ -47,14 +60,23 @@ interface CronWithProject {
   project: ProjectRow;
 }
 
-/** Looks up a cron job row by id along with its owning project. `null` if either is missing. */
-function getCronWithProject(app: FastifyInstance, id: number): CronWithProject | null {
+/**
+ * Looks up a cron job row by id along with its owning project. `null` if either is missing — OR if
+ * the requesting user has no access to that project (`lib/projectaccess.ts`). Same reasoning as
+ * `routes/workers.ts`'s `getWorkerWithProject`: these routes are keyed by cron id, so `buildApp`'s
+ * path-based project guard can't reach them, and every call site already renders `null` as the
+ * "cron job not found" 404 that a scoped member should see.
+ */
+function getCronWithProject(app: FastifyInstance, request: FastifyRequest, id: number): CronWithProject | null {
   const cron = app.db.select().from(cronJobs).where(eq(cronJobs.id, id)).get();
   if (!cron) {
     return null;
   }
   const project = app.db.select().from(projects).where(eq(projects.id, cron.projectId)).get();
   if (!project) {
+    return null;
+  }
+  if (!canAccessProject(app.db, request.session.get('userId'), project.id)) {
     return null;
   }
   return { cron, project };
@@ -80,12 +102,27 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    const project = app.db.select({ id: projects.id }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
+    const project = app.db.select({ id: projects.id, slug: projects.slug }).from(projects).where(eq(projects.id, paramsParsed.data.id)).get();
     if (!project) {
       return reply.code(404).send({ error: 'project not found' });
     }
 
-    return app.db.select().from(cronJobs).where(eq(cronJobs.projectId, project.id)).all();
+    const jobs = app.db.select().from(cronJobs).where(eq(cronJobs.projectId, project.id)).all();
+
+    // `jobs` plus the context the dashboard needs to explain a schedule rather than just echo it —
+    // see `renderCronLine` in system/templates.ts, which is what these describe:
+    //  - `timezone`: the HOST's clock, which is the one cron actually fires on. Without it the
+    //    dashboard would compute "next run" against the viewer's browser timezone and quietly show
+    //    the wrong time to anyone in a different one.
+    //  - `workingDir`/`logDir`: the `cd` target and the log destination every rendered crontab line
+    //    gets, so the UI can answer "where does this run" and "where do I look when it fails"
+    //    without the reader having to know the layout.
+    return {
+      jobs,
+      timezone: hostTimezone(),
+      workingDir: `${app.cfg.appsDir}/${project.slug}/current`,
+      logDir: `${app.cfg.logsDir}/${project.slug}`,
+    };
   });
 
   app.post('/api/projects/:id/cron', async (request, reply) => {
@@ -141,7 +178,7 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'cron job not found' });
     }
 
-    const found = getCronWithProject(app, paramsParsed.data.id);
+    const found = getCronWithProject(app, request, paramsParsed.data.id);
     if (!found) {
       return reply.code(404).send({ error: 'cron job not found' });
     }
@@ -195,7 +232,7 @@ export async function cronRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(404).send({ error: 'cron job not found' });
     }
 
-    const found = getCronWithProject(app, paramsParsed.data.id);
+    const found = getCronWithProject(app, request, paramsParsed.data.id);
     if (!found) {
       return reply.code(404).send({ error: 'cron job not found' });
     }

@@ -18,12 +18,26 @@ import {
   fetchGithubManifest,
   putGithubApp,
   resolveGithubInstallation,
+  type GithubInstallation,
   type GithubStatus,
   type ManualGithubAppBody,
 } from '../../api';
 import { submitManifestForm } from '../../lib/github';
-import { useGithubStatus } from '../../hooks';
-import { Badge, Button, buttonClasses, Card, CardHeader, Field, ICON_STROKE, IconChip, Input, Skeleton, Textarea } from '../../components/ui';
+import { useGithubStatus, useIsAdmin } from '../../hooks';
+import {
+  Badge,
+  Button,
+  buttonClasses,
+  Card,
+  CardHeader,
+  Field,
+  ICON_STROKE,
+  IconChip,
+  Input,
+  ReadOnlyNotice,
+  Skeleton,
+  Textarea,
+} from '../../components/ui';
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
@@ -78,6 +92,17 @@ export default function GithubSection() {
 }
 
 function GithubStatusView({ status }: { status: GithubStatus }) {
+  const canEdit = useIsAdmin();
+
+  // Gated at the top rather than control-by-control, because every branch below is setup machinery:
+  // creating the app, installing it, re-detecting the installation, entering credentials by hand.
+  // None of it does anything for a member, and all of it 403s. What IS worth showing them is the
+  // answer to "can this instance deploy from GitHub at all", which is what their own New Project
+  // form depends on — so that state is rendered, and nothing else.
+  if (!canEdit) {
+    return <GithubStatusReadOnly status={status} />;
+  }
+
   if (!status.configured) {
     return <NotConfigured />;
   }
@@ -85,6 +110,40 @@ function GithubStatusView({ status }: { status: GithubStatus }) {
     return <NotInstalled appSlug={status.appSlug} />;
   }
   return <Installed appSlug={status.appSlug} />;
+}
+
+/** The member's view of Settings > GitHub: connection state, no setup actions. */
+function GithubStatusReadOnly({ status }: { status: GithubStatus }) {
+  const connected = status.configured && status.installed;
+
+  return (
+    <div className="flex max-w-[640px] flex-col gap-4">
+      <div className="flex items-center gap-3.5 rounded-xl bg-surface-2 px-4 py-3.5">
+        <IconChip>
+          <GitBranch size={20} strokeWidth={ICON_STROKE} />
+        </IconChip>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-base font-semibold text-ink">
+            {connected ? `@${status.appSlug ?? 'unknown app'}` : 'Not connected'}
+          </div>
+          <div className="text-sm text-soft">
+            {connected
+              ? 'Shipway GitHub App'
+              : status.configured
+                ? 'The app is created but not installed on an account yet.'
+                : 'No GitHub App is configured for this instance.'}
+          </div>
+        </div>
+        {connected && (
+          <Badge tone="ok" className="shrink-0">
+            Used for deploys
+          </Badge>
+        )}
+      </div>
+
+      <ReadOnlyNotice can="change the GitHub connection" />
+    </div>
+  );
 }
 
 function Installed({ appSlug }: { appSlug: string | null }) {
@@ -109,28 +168,87 @@ function Installed({ appSlug }: { appSlug: string | null }) {
           <ExternalLink size={16} strokeWidth={ICON_STROKE} aria-hidden />
         </a>
       )}
+
+      <InstallationBinder label="Re-detect installation" />
     </div>
   );
 }
 
-function NotInstalled({ appSlug }: { appSlug: string | null }) {
+/**
+ * "Which account does Shipway deploy from?" — the detect button plus, when the app turns out to be
+ * installed on several accounts, the picker to choose between them.
+ *
+ * Rendered in both the not-installed and installed states on purpose: re-pointing an already-bound
+ * app is a real operation (moving from a personal installation to an organization one, say), and
+ * the stored installationId goes stale the moment that old installation is removed on GitHub.
+ */
+function InstallationBinder({ label }: { label: string }) {
   const queryClient = useQueryClient();
   const [detecting, setDetecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Populated only when the server reports several installations (409): the app is installed on
+  // more than one account, so which one Shipway deploys from has to be an explicit choice.
+  const [choices, setChoices] = useState<GithubInstallation[] | null>(null);
 
-  async function handleDetect() {
+  async function bind(installationId?: number) {
     setError(null);
     setDetecting(true);
     try {
-      await resolveGithubInstallation();
+      await resolveGithubInstallation(installationId);
+      setChoices(null);
       await queryClient.invalidateQueries({ queryKey: ['github-status'] });
     } catch (err) {
-      setError(errorMessage(err, 'Could not detect the installation. Try again.'));
+      if (err instanceof ApiError && err.status === 409) {
+        const body = err.body as { installations?: GithubInstallation[] } | undefined;
+        setChoices(body?.installations ?? []);
+      } else {
+        setError(errorMessage(err, 'Could not detect the installation. Try again.'));
+      }
     } finally {
       setDetecting(false);
     }
   }
 
+  return (
+    <div className="flex flex-col gap-3">
+      {error && (
+        <p role="alert" className="text-sm text-danger">
+          {error}
+        </p>
+      )}
+
+      {choices && (
+        <div className="flex flex-col gap-2 rounded-xl bg-surface-2 px-4 py-3.5">
+          <p className="text-sm text-soft">
+            This app is installed on more than one account. Choose which one Shipway should deploy from.
+          </p>
+          {choices.map((inst) => (
+            <div key={inst.id} className="flex items-center gap-3">
+              <div className="min-w-0 flex-1 truncate text-sm text-ink">
+                {inst.account ?? `installation ${String(inst.id)}`}
+                <span className="text-soft">
+                  {inst.accountType ? ` · ${inst.accountType}` : ''}
+                  {inst.repositorySelection === 'selected' ? ' · selected repos' : ''}
+                </span>
+              </div>
+              <Button variant="secondary" onClick={() => void bind(inst.id)} loading={detecting}>
+                Use this
+              </Button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div>
+        <Button variant="secondary" onClick={() => void bind()} loading={detecting}>
+          {label}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function NotInstalled({ appSlug }: { appSlug: string | null }) {
   return (
     <div className="flex max-w-[640px] flex-col gap-3">
       {appSlug && (
@@ -144,16 +262,7 @@ function NotInstalled({ appSlug }: { appSlug: string | null }) {
           <ExternalLink size={13} strokeWidth={ICON_STROKE} aria-hidden />
         </a>
       )}
-      {error && (
-        <p role="alert" className="text-sm text-danger">
-          {error}
-        </p>
-      )}
-      <div>
-        <Button variant="secondary" onClick={() => void handleDetect()} loading={detecting}>
-          Detect installation
-        </Button>
-      </div>
+      <InstallationBinder label="Detect installation" />
     </div>
   );
 }
@@ -161,12 +270,13 @@ function NotInstalled({ appSlug }: { appSlug: string | null }) {
 function NotConfigured() {
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [org, setOrg] = useState('');
 
   async function handleCreate() {
     setError(null);
     setCreating(true);
     try {
-      const { postUrl, manifestJson } = await fetchGithubManifest(window.location.origin);
+      const { postUrl, manifestJson } = await fetchGithubManifest(window.location.origin, org.trim() || undefined);
       submitManifestForm(postUrl, manifestJson);
       // The browser navigates to github.com from here; nothing left to do client-side.
     } catch (err) {
@@ -182,6 +292,13 @@ function NotConfigured() {
           {error}
         </p>
       )}
+      <Field
+        label="Organization (optional)"
+        hint="Leave blank to create the app under your own GitHub account. An app owned by a personal account can only be installed on that account, so enter your org's login here to deploy org repositories."
+      >
+        <Input value={org} onChange={(event) => setOrg(event.target.value)} placeholder="my-org" autoComplete="off" spellCheck={false} />
+      </Field>
+
       <div>
         <Button onClick={() => void handleCreate()} loading={creating}>
           Create GitHub App

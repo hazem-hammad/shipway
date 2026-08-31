@@ -77,6 +77,10 @@ export class DevSysOps implements SysOps {
     return '';
   }
 
+  async syncPgAdminServers(payload: string): Promise<void> {
+    this.calls.push(`syncPgAdminServers (${Buffer.byteLength(payload, 'utf8')} bytes)`);
+  }
+
   async readCrontab(): Promise<string> {
     this.calls.push('readCrontab');
     return this.crontabContent;

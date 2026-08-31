@@ -4,20 +4,28 @@
  * (`pages/project/Smtp.tsx`, which only configures what a deployed project writes into its own
  * `.env`). The server never echoes a saved password back in full (`GET` masks it as "•••1234"), so
  * an untouched password field on save means "keep the current password" — same convention as
- * `settings/Cloudflare.tsx`'s token handling.
+ * `settings/Cloudflare.tsx`'s token handling (with one carve-out: the server won't carry a stored
+ * password across a driver CHANGE, so switching to/from SES requires re-entering the credential).
+ *
+ * The `ses` driver is Amazon SES's SMTP interface. The admin picks a region and enters SES SMTP
+ * credentials; the host, port, and TLS mode are derived server-side, so this form deliberately shows
+ * the resulting endpoint rather than letting anyone type one.
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Mail as MailIcon } from 'lucide-react';
 import { ApiError, putMailConfig, testMailConfig, type MailConfig, type MailConfigUpdate, type MailDriver } from '../../api';
-import { useMailConfig } from '../../hooks';
-import { Badge, Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton, Toggle } from '../../components/ui';
+import { useIsAdmin, useMailConfig } from '../../hooks';
+import { Badge, Button, Card, CardHeader, Field, ICON_STROKE, Input, ReadOnlyNotice, Select, Skeleton, Toggle } from '../../components/ui';
+import { SES_DEFAULT_REGION, SES_REGIONS, sesSmtpHost } from '../../lib/ses';
 
 const DRIVER_OPTIONS: { value: MailDriver; label: string; blurb: string }[] = [
   { value: 'none', label: 'None', blurb: 'Mail sending is disabled.' },
   { value: 'mailpit', label: 'Mailpit', blurb: 'The local catch-all. Nothing leaves the server.' },
   { value: 'smtp', label: 'SMTP', blurb: 'Send through your own SMTP server.' },
+  { value: 'ses', label: 'Amazon SES', blurb: "Send through Amazon SES using your region's SMTP credentials." },
 ];
+
 
 export default function MailSection() {
   const mailQuery = useMailConfig();
@@ -46,12 +54,14 @@ export default function MailSection() {
 }
 
 function MailForm({ config }: { config: MailConfig }) {
+  const canEdit = useIsAdmin();
   const queryClient = useQueryClient();
 
   const [driver, setDriver] = useState<MailDriver>(config.driver);
   const [host, setHost] = useState(config.host);
   const [port, setPort] = useState(String(config.port));
   const [secure, setSecure] = useState(config.secure);
+  const [region, setRegion] = useState(config.region ?? SES_DEFAULT_REGION);
   const [username, setUsername] = useState(config.username ?? '');
   const [password, setPassword] = useState('');
   const [fromAddress, setFromAddress] = useState(config.fromAddress);
@@ -85,6 +95,15 @@ function MailForm({ config }: { config: MailConfig }) {
         body.fromAddress = fromAddress.trim();
         if (fromName.trim() !== '') body.fromName = fromName.trim();
       }
+      if (driver === 'ses') {
+        // No host/port/secure: the server derives the SES endpoint from the region, so sending them
+        // would only be ignored.
+        body.region = region.trim();
+        body.username = username.trim();
+        if (password.trim() !== '') body.password = password;
+        body.fromAddress = fromAddress.trim();
+        if (fromName.trim() !== '') body.fromName = fromName.trim();
+      }
       const updated = await putMailConfig(body);
       queryClient.setQueryData(['mail-config'], updated);
       setDirty(false);
@@ -109,8 +128,15 @@ function MailForm({ config }: { config: MailConfig }) {
     }
   }
 
-  const canSubmit = dirty && !saving && (driver !== 'smtp' || (host.trim() !== '' && port.trim() !== '' && fromAddress.trim() !== ''));
-  const canTest = testTo.trim() !== '' && !testing && !dirty;
+  // A stored password only carries over when the driver is UNCHANGED (the server refuses to reuse an
+  // SMTP credential as an SES one), so switching to SES makes the password field mandatory again.
+  const hasStoredSesPassword = config.driver === 'ses' && config.password !== null;
+  const sesComplete = region.trim() !== '' && username.trim() !== '' && fromAddress.trim() !== '' && (password.trim() !== '' || hasStoredSesPassword);
+  const smtpComplete = host.trim() !== '' && port.trim() !== '' && fromAddress.trim() !== '';
+  // `canEdit` is folded in here rather than only onto the buttons, so every path that could fire a
+  // request — including a stray Enter in a text field — is closed for a member, not just the click.
+  const canSubmit = canEdit && dirty && !saving && (driver === 'smtp' ? smtpComplete : driver === 'ses' ? sesComplete : true);
+  const canTest = canEdit && testTo.trim() !== '' && !testing && !dirty;
 
   return (
     <div className="flex max-w-[640px] flex-col gap-8">
@@ -125,6 +151,7 @@ function MailForm({ config }: { config: MailConfig }) {
             >
               <input
                 type="radio"
+                disabled={!canEdit}
                 name="mail-driver"
                 value={option.value}
                 checked={driver === option.value}
@@ -149,6 +176,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <Field label="Host">
               <Input
                 mono
+                disabled={!canEdit}
                 required
                 value={host}
                 onChange={(event) => {
@@ -160,6 +188,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <Field label="Port">
               <Input
                 mono
+                disabled={!canEdit}
                 required
                 type="number"
                 value={port}
@@ -172,6 +201,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <div className="flex items-center justify-between gap-3">
               <span className="text-sm font-medium text-ink">Use TLS</span>
               <Toggle
+                disabled={!canEdit}
                 checked={secure}
                 onChange={(next) => {
                   setSecure(next);
@@ -183,6 +213,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <Field label="Username" hint="Optional.">
               <Input
                 mono
+                disabled={!canEdit}
                 value={username}
                 onChange={(event) => {
                   setUsername(event.target.value);
@@ -193,6 +224,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <Field label="Password" hint="Leave blank to keep the current password.">
               <Input
                 mono
+                disabled={!canEdit}
                 type="password"
                 placeholder={config.password ?? undefined}
                 value={password}
@@ -205,6 +237,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <Field label="From address">
               <Input
                 mono
+                disabled={!canEdit}
                 required
                 type="email"
                 value={fromAddress}
@@ -217,6 +250,7 @@ function MailForm({ config }: { config: MailConfig }) {
             <Field label="From name" hint="Optional.">
               <Input
                 mono
+                disabled={!canEdit}
                 value={fromName}
                 onChange={(event) => {
                   setFromName(event.target.value);
@@ -227,6 +261,88 @@ function MailForm({ config }: { config: MailConfig }) {
           </div>
         )}
 
+        {driver === 'ses' && (
+          <div className="flex flex-col gap-4 rounded-xl bg-surface-2 p-4">
+            <Field label="Region" hint="The AWS region your SES identity is verified in.">
+              <Select
+                disabled={!canEdit}
+                mono
+                required
+                value={region}
+                onChange={(event) => {
+                  setRegion(event.target.value);
+                  markDirty();
+                }}
+              >
+                {/* A region saved before it was added here (or set via the API) still renders as the
+                    selected option rather than silently snapping to another region. */}
+                {!SES_REGIONS.includes(region) && region.trim() !== '' && <option value={region}>{region}</option>}
+                {SES_REGIONS.map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="SMTP username"
+              hint="From SES > SMTP settings > Create SMTP credentials. Not an AWS access key ID — SMTP auth rejects those."
+            >
+              <Input
+                mono
+                disabled={!canEdit}
+                required
+                value={username}
+                onChange={(event) => {
+                  setUsername(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="SMTP password" hint={hasStoredSesPassword ? 'Leave blank to keep the current password.' : 'Shown only once by AWS when the credentials are created.'}>
+              <Input
+                mono
+                disabled={!canEdit}
+                required={!hasStoredSesPassword}
+                type="password"
+                placeholder={config.driver === 'ses' ? (config.password ?? undefined) : undefined}
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="From address" hint="Must be an address or domain you've verified in SES.">
+              <Input
+                mono
+                disabled={!canEdit}
+                required
+                type="email"
+                value={fromAddress}
+                onChange={(event) => {
+                  setFromAddress(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="From name" hint="Optional.">
+              <Input
+                mono
+                disabled={!canEdit}
+                value={fromName}
+                onChange={(event) => {
+                  setFromName(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <p className="font-mono text-[13px] text-soft">
+              {region.trim() === '' ? 'Pick a region to see the endpoint.' : `${sesSmtpHost(region)}:587 (STARTTLS)`}
+            </p>
+          </div>
+        )}
+
         {error && (
           <p role="alert" className="text-sm text-danger">
             {error}
@@ -234,16 +350,33 @@ function MailForm({ config }: { config: MailConfig }) {
         )}
 
         <div>
-          <Button type="submit" loading={saving} disabled={!canSubmit}>
-            Save
-          </Button>
+          {canEdit ? (
+            <Button type="submit" loading={saving} disabled={!canSubmit}>
+              Save
+            </Button>
+          ) : (
+            <ReadOnlyNotice can="change mail settings" />
+          )}
         </div>
       </form>
 
+      {/* Hidden rather than disabled for a member: `POST /api/settings/mail/test` is admin-gated, and
+          a test-send is a diagnostic for credentials only an admin can set — showing the row inert
+          would just be a dead control under a section they cannot act on anyway. */}
+      {canEdit && (
       <div className="flex flex-col gap-3 border-t border-line pt-6">
         <p className="text-sm font-medium text-ink">Send test email</p>
         <form onSubmit={(event) => void handleTest(event)} className="flex flex-wrap items-center gap-3">
-          <Input mono type="email" required placeholder="you@example.com" value={testTo} onChange={(event) => setTestTo(event.target.value)} className="max-w-[280px]" />
+          <Input
+            mono
+            type="email"
+            required
+            disabled={!canEdit}
+            placeholder="you@example.com"
+            value={testTo}
+            onChange={(event) => setTestTo(event.target.value)}
+            className="max-w-[280px]"
+          />
           <Button type="submit" variant="secondary" loading={testing} disabled={!canTest}>
             Send test email
           </Button>
@@ -256,6 +389,7 @@ function MailForm({ config }: { config: MailConfig }) {
         </form>
         {dirty && <p className="text-[13px] text-soft">Save your changes before sending a test email.</p>}
       </div>
+      )}
     </div>
   );
 }

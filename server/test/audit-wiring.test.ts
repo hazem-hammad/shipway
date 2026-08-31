@@ -14,7 +14,7 @@ import { auditEvents } from '../src/db/schema.js';
 import { setSetting } from '../src/db/settings.js';
 import type { DeployQueueDeps } from '../src/deploy/queue.js';
 import { FakeDnsClient } from '../src/services/cloudflare.js';
-import type { DbAdmin, DbEngine } from '../src/services/dbprovision.js';
+import type { DbAdmin, DbAdminTarget } from '../src/services/dbprovision.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { buildOwnerApp, createAdmin, createMember, tmpDataDir } from './helpers.js';
 
@@ -35,8 +35,11 @@ class FakeRun {
 }
 
 class NoopDbAdmin implements DbAdmin {
-  async createDatabase(_engine: DbEngine, _name: string, _user: string, _password: string): Promise<void> {}
-  async dropDatabase(_engine: DbEngine, _name: string, _user: string): Promise<void> {}
+  async createDatabase(_target: DbAdminTarget, _name: string, _user: string, _password: string): Promise<void> {}
+  async dropDatabase(_target: DbAdminTarget, _name: string, _user: string): Promise<void> {}
+  async testConnection(_target: DbAdminTarget): Promise<void> {}
+  async importSql(_target: DbAdminTarget, _database: string, _sqlPath: string): Promise<void> {}
+  async dumpSql(_target: DbAdminTarget, _database: string, _sqlPath: string): Promise<void> {}
 }
 
 async function buildProvisioningApp(opts: { dataDir?: string } = {}) {

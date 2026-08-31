@@ -108,6 +108,10 @@ export class RealSysOps implements SysOps {
     return result.stdout;
   }
 
+  async syncPgAdminServers(payload: string): Promise<void> {
+    await this.run('sudo', ['shipway-sysops', 'pgadmin-sync'], { input: payload });
+  }
+
   async readCrontab(): Promise<string> {
     const result = await this.run('crontab', ['-l'], { reject: false });
     if (result.exitCode === 0) {

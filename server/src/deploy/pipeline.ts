@@ -23,13 +23,13 @@ import type { ShipwayDb } from '../db/index.js';
 import { deployments, projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import { AbortedError } from '../lib/aborted-error.js';
+import { projectDomain } from '../lib/domain.js';
 import type { SecretBox } from '../lib/secretbox.js';
 import type { GitOps } from '../services/git.js';
+import { restartRuntime, restartWorkers, writeSharedEnv } from '../services/envapply.js';
 import { nodeBinDir, phpBinDir } from '../services/provisioner.js';
-import { workerInstances } from '../services/workers.js';
 import type { SysOps } from '../sysops/types.js';
 import { unitNames } from '../system/templates.js';
-import { buildEnvFile, buildManagedVars, type SmtpConfig } from './envfile.js';
 import type { DeployLogger } from './logger.js';
 
 type DeploymentRow = typeof deployments.$inferSelect;
@@ -62,7 +62,9 @@ export interface PipelineDeps {
      * instead of `deploy_failed` on the notification bus. Unset for a plain failure or a pre-activate
      * one, where nothing was ever rolled back. */
     rolledBack?: boolean;
-  }) => Promise<void>;
+    /** A one-line summary of what the notification did, written into the deploy log by
+     * `notifySafe`. `void` is still accepted so a test double can stay a bare stub. */
+  }) => Promise<string | void>;
   /** Injectable delay, used between health-check retries. `signal`, when given and aborted,
    * resolves the sleep immediately instead of waiting out the full `ms`. Tests pass an instant
    * stub. */
@@ -180,30 +182,35 @@ function linkSharedPaths(projectDir: string, project: ProjectRow, releaseDir: st
   for (const entry of project.sharedPaths) {
     const target = path.join(sharedDir, entry);
     fs.mkdirSync(target, { recursive: true }); // mkdir -p, no-op if it already exists
-    replaceSymlink(path.join(releaseDir, entry), target);
+
+    // Seed the shared directory from whatever the repo actually committed at this path, before the
+    // symlink below discards it. Without this, sharing `storage` on a Laravel project throws away
+    // the tracked `storage/framework/{cache,sessions,views}/.gitignore` placeholders that create
+    // those directories, and `artisan package:discover` — run by composer's post-autoload-dump —
+    // dies with "Please provide a valid cache path." before the deploy can finish.
+    //
+    // `force: false` makes this strictly additive: anything already in shared (the real uploads,
+    // logs, and other data that shared paths exist to preserve) is never overwritten, so this is
+    // safe on every deploy and not just the first one — a subdirectory added to the repo later gets
+    // created too.
+    const releasePath = path.join(releaseDir, entry);
+    if (fs.existsSync(releasePath) && fs.lstatSync(releasePath).isDirectory()) {
+      fs.cpSync(releasePath, target, { recursive: true, force: false, errorOnExist: false });
+    }
+
+    replaceSymlink(releasePath, target);
   }
 }
 
-/** Decrypts and JSON-parses `project.smtpConfigEncrypted`, or `undefined` if unset. */
-function decryptSmtpConfig(secretBox: SecretBox, project: ProjectRow): SmtpConfig | undefined {
-  if (!project.smtpConfigEncrypted) {
-    return undefined;
-  }
-  return JSON.parse(secretBox.decrypt(project.smtpConfigEncrypted)) as SmtpConfig;
-}
-
-/** Writes `shared/.env` (decrypted user env + managed block) and symlinks it into the release. */
-function writeReleaseEnv(deps: PipelineDeps, project: ProjectRow, projectDir: string, releaseDir: string): void {
-  const sharedDir = path.join(projectDir, 'shared');
-  fs.mkdirSync(sharedDir, { recursive: true });
-
-  const userEnv = project.envEncrypted ? deps.secretBox.decrypt(project.envEncrypted) : '';
-  const smtpConfig = decryptSmtpConfig(deps.secretBox, project);
-  const managed = buildManagedVars({ smtpMode: project.smtpMode, smtpConfig });
-  const content = buildEnvFile(userEnv, managed);
-
-  const envPath = path.join(sharedDir, '.env');
-  fs.writeFileSync(envPath, content, 'utf8');
+/**
+ * Writes `shared/.env` (decrypted user env + managed block) and symlinks it into the release.
+ *
+ * The write itself is `services/envapply.ts`'s, shared with the Environment tab's save — and this
+ * symlink is precisely what lets a later env change reach an already-live release without building
+ * a new one. It is (re)created on every deploy because a fresh release directory has no `.env` yet.
+ */
+function writeReleaseEnv(deps: PipelineDeps, project: ProjectRow, _projectDir: string, releaseDir: string): void {
+  const envPath = writeSharedEnv(deps, project);
   replaceSymlink(path.join(releaseDir, '.env'), envPath);
 }
 
@@ -239,10 +246,11 @@ function parseEnvContent(content: string): Record<string, string> {
 }
 
 /**
- * Builds the environment for `runShell`: `process.env`, with `PATH` prefixed by the project's node
- * bin dir for node-like projects or its php version's shim dir for php projects (see
- * `services/provisioner.ts`'s `nodeBinDir`/`phpBinDir`), then every `KEY=value` pair parsed from the
- * release's final `.env` content, then (node-like only) `PORT` set from the project's assigned port.
+ * Builds the environment for `runShell`: `process.env` (minus `NODE_ENV`, see below), with `PATH`
+ * prefixed by the project's node bin dir for node-like projects or its php version's shim dir for
+ * php projects (see `services/provisioner.ts`'s `nodeBinDir`/`phpBinDir`), then every `KEY=value`
+ * pair parsed from the release's final `.env` content, then (node-like only) `PORT` set from the
+ * project's assigned port.
  */
 function buildShellEnv(cfg: Config, project: ProjectRow, envFileContent: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -251,6 +259,15 @@ function buildShellEnv(cfg: Config, project: ProjectRow, envFileContent: string)
       env[key] = value;
     }
   }
+
+  // Shipway's own systemd unit sets `NODE_ENV=production` (it is a production node service), and
+  // every deploy script would otherwise inherit it from this process — a detail of how the
+  // dashboard happens to be run, silently reshaping how the user's app builds. It is not harmless:
+  // under `NODE_ENV=production` npm omits `devDependencies`, and a Next.js app keeps its entire
+  // build toolchain there (typescript, the postcss/tailwind plugins), so the install "succeeds" and
+  // the build then fails on a module the repo clearly declares. The project's own `.env` is applied
+  // below and can still set `NODE_ENV` deliberately.
+  delete env.NODE_ENV;
 
   if (isNodeLike(project.type)) {
     const prefix = nodeBinDir(cfg, project.nodeVersion ?? '22');
@@ -304,6 +321,91 @@ async function runScript(
 }
 
 /**
+ * The user php-fpm runs as. Every PHP project on the host is served by the distribution's own
+ * `php<version>-fpm` pool (`system/templates.ts` points each vhost at `/run/php/php<v>-fpm.sock`),
+ * which on Debian/Ubuntu — the only platform install.sh targets — runs as `www-data`.
+ */
+const WEB_USER = 'www-data';
+
+/** Laravel compiles its package/service manifests here, and writes them at runtime if a deploy
+ * didn't. Relative to the release, not shared: it is per-release build output. */
+const PHP_RUNTIME_WRITE_PATHS = ['bootstrap/cache'];
+
+/**
+ * Wraps `value` in single quotes for a POSIX shell, escaping any single quote it contains as
+ * `'\''` (close, escaped literal, reopen). A shared path is whatever the project's settings say —
+ * `sharedPaths` is a free-form string array — so it reaches the command below unvalidated, and
+ * naive quoting would break on a name as ordinary as `it's`.
+ */
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Gives php-fpm write access to the paths a PHP app writes to while it is *running*.
+ *
+ * The deploy runs as `deployer` and everything it creates is `deployer:deployer` 0755, but the
+ * requests that follow are served as `www-data` — so without this a Laravel app comes up and dies
+ * on its first page render with "Failed to open stream: Permission denied" trying to compile a
+ * Blade view. The build itself never hits this, which is what makes the failure so easy to ship: a
+ * fully green deploy, and a 500 on the first request.
+ *
+ * POSIX ACLs rather than `chown`/`chgrp`: the `default:` entries make everything *later* created
+ * inside these directories carry the same access, so a file written by `www-data` at runtime and a
+ * file written by `deployer` on the next deploy are both readable and writable by the other. Group
+ * ownership alone can't express that — a file's group is inherited, but its group-write bit is
+ * whatever the creating process's umask says, and php-fpm's is 022. `deployer` owns these paths, so
+ * no privilege is needed to set this; `X` (capital) grants directory traversal without marking
+ * every plain file executable.
+ *
+ * Failure is logged, not fatal: a PHP project that never writes anything at runtime deploys fine
+ * without this, and refusing to release working code over it would be the wrong trade. The log line
+ * is what points at this when an app does need it.
+ */
+async function grantWebWriteAccess(
+  deps: PipelineDeps,
+  project: ProjectRow,
+  projectDir: string,
+  releaseDir: string,
+  env: Record<string, string>,
+  signal: AbortSignal,
+  logger: DeployLogger,
+): Promise<void> {
+  // node/nextjs run as `deployer` under their own systemd unit, and a static site is only ever read
+  // by nginx — php is the one runtime whose writes happen as another user.
+  if (project.type !== 'php') {
+    return;
+  }
+
+  // Shared paths are exactly the directories that exist to hold data written after the deploy
+  // (`storage`, `uploads`), so all of them get this — not just Laravel's.
+  const targets = [
+    ...project.sharedPaths.map((entry) => path.join(projectDir, 'shared', entry)),
+    ...PHP_RUNTIME_WRITE_PATHS.map((entry) => path.join(releaseDir, entry)),
+  ].filter((target) => fs.existsSync(target));
+
+  if (targets.length === 0) {
+    return;
+  }
+
+  const quoted = targets.map(shellQuote).join(' ');
+  const { exitCode } = await deps.runShell(
+    `setfacl -R -m u:${WEB_USER}:rwX -m d:u:${WEB_USER}:rwX -- ${quoted}`,
+    { cwd: releaseDir, env, signal, onOutput: (line) => { logger.line(line); } },
+  );
+
+  if (exitCode !== 0) {
+    logger.line(
+      `WARNING: could not grant ${WEB_USER} write access to ${targets.join(', ')} (setfacl exited ${String(exitCode)}). ` +
+        'A PHP app that writes at runtime (Laravel\'s storage/, for one) will fail with "Permission denied" on its first request.',
+    );
+    return;
+  }
+
+  logger.line(`granted ${WEB_USER} write access to ${targets.join(', ')}`);
+}
+
+/**
  * Atomically points `<projectDir>/current` at `releaseDir` (`ln -sfn` + `mv -T` via a temp symlink
  * + rename). Returns the path `current` pointed at before the switch, or `null` if it didn't exist.
  */
@@ -325,45 +427,8 @@ function activateRelease(projectDir: string, releaseDir: string): string | null 
   return previous;
 }
 
-/**
- * `signal` is optional and deliberately NOT passed by the rollback path in
- * `handlePostActivateFailure`: that call must run to completion and restore the previous release
- * even when `signal` is already aborted (that's the whole point of a rollback during a cancel) — a
- * `cancelSignal` that's already fired would immediately kill it. The forward activate→restart path
- * does pass it, so a genuinely-hung restart is still interruptible, and (per `sysops/real.ts`'s
- * `unitAction`/`reloadPhpFpm`) a failure caused by that abort throws `AbortedError` specifically,
- * distinguishable from an unrelated restart failure that merely coincides with a cancel.
- */
-async function restartRuntime(deps: PipelineDeps, project: ProjectRow, signal?: AbortSignal): Promise<void> {
-  switch (project.type) {
-    case 'php': {
-      if (!project.phpVersion) {
-        throw new Error(`project "${project.slug}" has no phpVersion configured`);
-      }
-      await deps.sysops.reloadPhpFpm(project.phpVersion, signal);
-      return;
-    }
-    case 'node':
-    case 'nextjs':
-      await deps.sysops.unitAction('restart', unitNames.app(project.slug), signal);
-      return;
-    case 'static':
-      return;
-  }
-}
-
 function getProjectWorkers(db: ShipwayDb, projectId: number): WorkerRow[] {
   return db.select().from(workers).where(eq(workers.projectId, projectId)).all();
-}
-
-/** Restarts every instance of every worker in `rows`. See `restartRuntime`'s doc comment for why
- * `signal` is optional and omitted by the rollback path. */
-async function restartWorkers(deps: PipelineDeps, project: ProjectRow, rows: WorkerRow[], signal?: AbortSignal): Promise<void> {
-  for (const worker of rows) {
-    for (const unit of workerInstances(project.slug, worker.name, worker.processes)) {
-      await deps.sysops.unitAction('restart', unit, signal);
-    }
-  }
 }
 
 const HEALTH_CHECK_TRIES = 5;
@@ -425,7 +490,7 @@ function defaultWaitForPort(port: number, timeoutMs: number, signal?: AbortSigna
 
 /**
  * `healthCheckPath` set: polls the URL (node-like: `http://127.0.0.1:<port><path>`; php/static:
- * `https://<slug>.<baseDomain><path>`) up to 5 times, 3s apart, accepting any 2xx/3xx status.
+ * `https://<subdomain>.<baseDomain><path>`) up to 5 times, 3s apart, accepting any 2xx/3xx status.
  * Unset, node-like: waits up to 15s for the port to accept connections. Unset, php/static: skipped
  * (always healthy). `signal` short-circuits all of the above the moment it aborts — the fetch, the
  * between-retry sleep, and the port poll all bail immediately rather than running out their clock.
@@ -440,7 +505,7 @@ async function runHealthCheck(deps: PipelineDeps, project: ProjectRow, signal: A
   if (project.healthCheckPath) {
     const url = isNodeLike(project.type)
       ? `http://127.0.0.1:${String(project.port)}${project.healthCheckPath}`
-      : `https://${project.slug}.${getSetting<string>(deps.db, 'base_domain') ?? ''}${project.healthCheckPath}`;
+      : `https://${projectDomain(project, getSetting<string>(deps.db, 'base_domain') ?? '')}${project.healthCheckPath}`;
 
     for (let attempt = 1; attempt <= HEALTH_CHECK_TRIES; attempt++) {
       if (signal.aborted) {
@@ -512,13 +577,25 @@ function pruneReleases(projectDir: string): void {
   }
 }
 
+/**
+ * Runs the notify hook and records what it did in the deploy log — including on success.
+ *
+ * Logging only failures (the previous behavior) made "did this deploy email anyone?" unanswerable
+ * after the fact: a deploy that notified nobody and a deploy that emailed the whole team produced
+ * byte-identical logs. Every deploy now ends with one line saying which it was, so the next question
+ * about a missing notification is answered by reading the log instead of re-deriving it from the
+ * database and the source.
+ */
 async function notifySafe(
   deps: PipelineDeps,
   logger: DeployLogger,
   payload: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string; rolledBack?: boolean },
 ): Promise<void> {
   try {
-    await deps.notify(payload);
+    const summary = await deps.notify(payload);
+    if (typeof summary === 'string' && summary !== '') {
+      logger.line(summary);
+    }
   } catch (err) {
     logger.line(`notify failed: ${errMessage(err)}`);
   }
@@ -529,9 +606,9 @@ async function notifySafe(
 // ---------------------------------------------------------------------------
 
 /**
- * `resolve` -> `export` -> `shared` -> `env` -> `pre_deploy` -> `build` (install + build). On any
- * failure (including cancellation), deletes the release directory if one was created, then
- * rethrows for the caller to classify (failed vs. canceled).
+ * `resolve` -> `export` -> `shared` -> `env` -> `pre_deploy` -> `build` (install + build) ->
+ * `permissions`. On any failure (including cancellation), deletes the release directory if one was
+ * created, then rethrows for the caller to classify (failed vs. canceled).
  */
 async function runBuildPhase(
   deps: PipelineDeps,
@@ -574,6 +651,12 @@ async function runBuildPhase(
     checkAborted(signal);
     await runScript(deps, 'install', project.installCmd, releaseDir, shellEnv, signal, logger);
     await runScript(deps, 'build', project.buildCmd, releaseDir, shellEnv, signal, logger);
+
+    // After the build, so it covers everything the build just wrote, and before activate, so the
+    // first request to reach the new release already has somewhere to write.
+    logger.section('permissions');
+    checkAborted(signal);
+    await grantWebWriteAccess(deps, project, projectDir, releaseDir, shellEnv, signal, logger);
 
     return { releaseDir, commitMessage: message };
   } catch (err) {

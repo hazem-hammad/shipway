@@ -8,7 +8,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { openDb } from '../src/db/index.js';
-import { auditEvents, deployments, notificationChannels, notificationSubscriptions, projects, users } from '../src/db/schema.js';
+import { auditEvents, deployments, projectNotificationEvents, projectNotificationRecipients, projects, users } from '../src/db/schema.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_FOLDER = path.resolve(__dirname, '../drizzle');
@@ -55,35 +55,81 @@ function buildLegacyV1Db(dbPath: string): void {
   client.close();
 }
 
-describe('migration 0002 — fresh install', () => {
-  it('notification_channels gets type (default webhook) + nullable target/url columns', () => {
+/** A minimal project row, for the FK-scoped tests below. */
+function insertBareProject(db: ReturnType<typeof openDb>, slug: string): number {
+  db.insert(projects).values({ name: slug, slug, repo: `acme/${slug}`, branch: 'main', type: 'static' }).run();
+  const row = db.select({ id: projects.id }).from(projects).where(eq(projects.slug, slug)).get();
+  if (!row) throw new Error('failed to insert test project');
+  return row.id;
+}
+
+describe('migrations 0005/0006 — fresh install', () => {
+  it('drops the instance-wide notification channel tables (notifications are per-project now)', () => {
     const db = openDb(tmpDbPath());
 
-    const columns = db.all<{ name: string; notnull: number; dflt_value: string | null }>(sql`PRAGMA table_info(notification_channels)`);
-    const byName = new Map(columns.map((c) => [c.name, c]));
-
-    expect(byName.get('type')).toMatchObject({ notnull: 1, dflt_value: "'webhook'" });
-    expect(byName.get('target')).toMatchObject({ notnull: 0 });
-    expect(byName.get('url')).toMatchObject({ notnull: 0 });
+    const tableNames = new Set(db.all<{ name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'table'`).map((row) => row.name));
+    expect(tableNames.has('notification_channels')).toBe(false);
+    expect(tableNames.has('notification_subscriptions')).toBe(false);
+    expect(tableNames.has('project_notification_recipients')).toBe(true);
+    expect(tableNames.has('project_notification_events')).toBe(true);
   });
 
-  it('a channel inserted with no type/url/target defaults to webhook + null/null', () => {
+  it('project_notification_recipients rejects the same address twice on one project, but allows it across projects', () => {
     const db = openDb(tmpDbPath());
-    db.insert(notificationChannels).values({ name: 'default-shape', url: 'https://hooks.slack.com/services/x' }).run();
+    const shop = insertBareProject(db, 'shop');
+    const blog = insertBareProject(db, 'blog');
 
-    const row = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'default-shape')).get();
-    expect(row?.type).toBe('webhook');
-    expect(row?.target).toBeNull();
+    db.insert(projectNotificationRecipients).values({ projectId: shop, email: 'ops@example.com' }).run();
+    expect(() => db.insert(projectNotificationRecipients).values({ projectId: shop, email: 'ops@example.com' }).run()).toThrow();
+
+    // The same person can be on two different projects' lists — the uniqueness is per project.
+    expect(() => db.insert(projectNotificationRecipients).values({ projectId: blog, email: 'ops@example.com' }).run()).not.toThrow();
   });
 
-  it('an email channel can be inserted with a null url and a target address', () => {
+  it('project_notification_events rejects a duplicate (project, event) pair', () => {
     const db = openDb(tmpDbPath());
-    db.insert(notificationChannels).values({ name: 'ops-email', type: 'email', target: 'ops@example.com' }).run();
+    const projectId = insertBareProject(db, 'shop');
 
-    const row = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'ops-email')).get();
-    expect(row?.url).toBeNull();
-    expect(row?.type).toBe('email');
-    expect(row?.target).toBe('ops@example.com');
+    db.insert(projectNotificationEvents).values({ projectId, event: 'deploy_failed' }).run();
+    expect(() => db.insert(projectNotificationEvents).values({ projectId, event: 'deploy_failed' }).run()).toThrow();
+  });
+
+  it('backfills the default event set for projects that already existed before the upgrade', () => {
+    const dbPath = tmpDbPath();
+    const client = build0001StateDb(dbPath);
+
+    // A project row seeded at 0001 shape, i.e. one that predates project notifications entirely.
+    client
+      .prepare("INSERT INTO projects (name, slug, repo, branch, type, shared_paths, smtp_mode, created_at) VALUES (?, ?, ?, ?, ?, '[]', 'mailpit', ?)")
+      .run('Shop', 'shop', 'acme/shop', 'main', 'node', Date.now());
+    client.close();
+
+    const db = openDb(dbPath); // applies 0002..0006, including 0006's backfill
+    const projectId = db.select({ id: projects.id }).from(projects).where(eq(projects.slug, 'shop')).get()!.id;
+
+    const events = db
+      .select({ event: projectNotificationEvents.event })
+      .from(projectNotificationEvents)
+      .where(eq(projectNotificationEvents.projectId, projectId))
+      .all()
+      .map((row) => row.event)
+      .sort();
+    expect(events).toEqual(['deploy_canceled', 'deploy_failed', 'deploy_rolled_back']);
+
+    // No recipients are invented — an upgraded install still emails nobody until someone says so.
+    expect(db.select().from(projectNotificationRecipients).all()).toHaveLength(0);
+  });
+
+  it('both project notification tables cascade on project delete', () => {
+    const db = openDb(tmpDbPath());
+    const projectId = insertBareProject(db, 'shop');
+    db.insert(projectNotificationRecipients).values({ projectId, email: 'ops@example.com' }).run();
+    db.insert(projectNotificationEvents).values({ projectId, event: 'deploy_failed' }).run();
+
+    db.delete(projects).where(eq(projects.id, projectId)).run();
+
+    expect(db.select().from(projectNotificationRecipients).all()).toHaveLength(0);
+    expect(db.select().from(projectNotificationEvents).all()).toHaveLength(0);
   });
 });
 
@@ -103,7 +149,11 @@ function build0001StateDb(dbPath: string): Database.Database {
   fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0000_snapshot.json'), path.join(legacyDir, 'meta/0000_snapshot.json'));
   fs.copyFileSync(path.join(MIGRATIONS_FOLDER, 'meta/0001_snapshot.json'), path.join(legacyDir, 'meta/0001_snapshot.json'));
   const journal = JSON.parse(fs.readFileSync(path.join(MIGRATIONS_FOLDER, 'meta/_journal.json'), 'utf8')) as { entries: { tag: string }[] };
-  journal.entries = journal.entries.filter((e) => e.tag !== '0002_notification_channel_type_target');
+  // Allowlist, not a blacklist: this fixture copies exactly the 0000 and 0001 SQL files above, so the
+  // journal must list exactly those two. Excluding later migrations by name instead meant every new
+  // migration added to the folder broke this fixture with "No file 000N_....sql found".
+  const LEGACY_TAGS = ['0000_clever_nick_fury', '0001_overconfident_karen_page'];
+  journal.entries = journal.entries.filter((e) => LEGACY_TAGS.includes(e.tag));
   fs.writeFileSync(path.join(legacyDir, 'meta/_journal.json'), JSON.stringify(journal));
 
   const client = new Database(dbPath);
@@ -114,22 +164,25 @@ function build0001StateDb(dbPath: string): Database.Database {
   return client;
 }
 
-describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
-  it('preserves an existing webhook-shaped channel row, backfilling type: webhook and target: null', () => {
+describe('migration upgrade from a pre-0002 (0000+0001) db', () => {
+  it('ends with the legacy channel tables gone and the per-project ones in their place', () => {
     const dbPath = tmpDbPath();
     const client = build0001StateDb(dbPath);
 
-    // Raw insert against the pre-0002 shape (no type/target columns exist yet on disk).
-    client.prepare("INSERT INTO notification_channels (name, url, created_at) VALUES (?, ?, ?)").run('legacy-slack', 'https://hooks.slack.com/services/legacy', Date.now());
+    // Raw insert against the pre-0002 shape (no type/target columns exist yet on disk). Migration
+    // 0005 later drops this table outright — a v2 install's channels do not survive the move to
+    // per-project notifications, and cannot: a channel has no project to belong to.
+    client.prepare('INSERT INTO notification_channels (name, url, created_at) VALUES (?, ?, ?)').run('legacy-slack', 'https://hooks.slack.com/services/legacy', Date.now());
     client.close();
 
-    // Production path: applies the pending 0002 migration.
+    // Production path: applies every pending migration, 0002 through 0006.
     const db = openDb(dbPath);
-    const row = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'legacy-slack')).get();
-    expect(row).toBeDefined();
-    expect(row?.url).toBe('https://hooks.slack.com/services/legacy');
-    expect(row?.type).toBe('webhook');
-    expect(row?.target).toBeNull();
+
+    const tableNames = new Set(db.all<{ name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'table'`).map((row) => row.name));
+    expect(tableNames.has('notification_channels')).toBe(false);
+    expect(tableNames.has('notification_subscriptions')).toBe(false);
+    expect(tableNames.has('project_notification_recipients')).toBe(true);
+    expect(tableNames.has('project_notification_events')).toBe(true);
   });
 
   /**
@@ -145,7 +198,7 @@ describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
    * `openDb` by toggling the pragma OUTSIDE the transaction `migrate()` opens (the only place it
    * actually takes effect), restored in a `finally`.
    */
-  it('BLOCKER regression: preserves notification_subscriptions (and other FK-referencing rows) across the 0002 table-rebuild', () => {
+  it('BLOCKER regression: preserves FK-referencing rows across the 0002 table-rebuild', () => {
     const dbPath = tmpDbPath();
     const client = build0001StateDb(dbPath);
 
@@ -179,19 +232,13 @@ describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
     // cascade-deleted every notification_subscriptions row).
     const db = openDb(dbPath);
 
-    const channel = db.select().from(notificationChannels).where(eq(notificationChannels.name, 'ops')).get();
-    expect(channel).toBeDefined();
+    // The channel/subscription rows themselves are gone by the end of the chain — migration 0005
+    // drops those tables. What this test still pins down is the pragma handling: the FK-referencing
+    // rows in every OTHER table have to survive 0002's rebuild untouched. Before the fix they did
+    // not, because FK enforcement stayed on for the whole migration transaction.
+    const tableNames = new Set(db.all<{ name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'table'`).map((row) => row.name));
+    expect(tableNames.has('notification_channels')).toBe(false);
 
-    const subs = db.select().from(notificationSubscriptions).all();
-    expect(subs).toHaveLength(2);
-    expect(subs.map((s) => ({ event: s.event, channelId: s.channelId })).sort((a, b) => a.event.localeCompare(b.event))).toEqual(
-      [
-        { event: 'deploy_failed', channelId: channel!.id },
-        { event: 'deploy_succeeded', channelId: channel!.id },
-      ].sort((a, b) => a.event.localeCompare(b.event)),
-    );
-
-    // Unrelated rows survived too.
     expect(db.select().from(projects).where(eq(projects.slug, 'shop')).get()).toBeDefined();
     expect(db.select().from(deployments).where(eq(deployments.projectId, projectId.id)).all()).toHaveLength(1);
     const auditRow = db.select().from(auditEvents).where(eq(auditEvents.targetName, 'n')).get();
@@ -209,10 +256,25 @@ describe('migration 0002 — upgrade from a pre-0002 (0000+0001) db', () => {
   });
 
   it('running the full migration set fresh matches applying it on top of an existing db (no schema divergence)', () => {
-    const freshPath = tmpDbPath();
-    const fresh = openDb(freshPath);
-    const freshColumns = fresh.all<{ name: string }>(sql`PRAGMA table_info(notification_channels)`).map((c) => c.name).sort();
-    expect(freshColumns).toEqual(['created_at', 'id', 'name', 'target', 'type', 'url'].sort());
+    // Every table/index definition, normalized, for a db built two different ways: straight through
+    // on an empty file, versus the 0001-state db above with 0002..0006 applied on top. An upgraded
+    // install that ends up with even a slightly different schema than a fresh one is the bug this
+    // catches — it's what makes a query work on one host and fail on another.
+    const schemaOf = (db: ReturnType<typeof openDb>): string[] =>
+      db
+        .all<{ type: string; name: string; sql: string | null }>(
+          sql`SELECT type, name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name != '__drizzle_migrations'`,
+        )
+        .map((row) => `${row.type} ${row.name}: ${(row.sql ?? '').replace(/\s+/g, ' ').trim()}`)
+        .sort();
+
+    const fresh = openDb(tmpDbPath());
+
+    const upgradedPath = tmpDbPath();
+    build0001StateDb(upgradedPath).close();
+    const upgraded = openDb(upgradedPath);
+
+    expect(schemaOf(upgraded)).toEqual(schemaOf(fresh));
   });
 });
 
@@ -223,7 +285,10 @@ describe('migration 0001 — fresh install', () => {
     const tableNames = new Set(
       db.all<{ name: string }>(sql`SELECT name FROM sqlite_master WHERE type = 'table'`).map((row) => row.name),
     );
-    for (const table of ['notification_channels', 'notification_subscriptions', 'audit_events']) {
+    // notification_channels/notification_subscriptions are created by 0001 too, but dropped again by
+    // 0005 — `openDb` applies the whole chain, so they're deliberately absent here. Their
+    // replacements are asserted in the migrations 0005/0006 block above.
+    for (const table of ['audit_events', 'project_notification_recipients', 'project_notification_events']) {
       expect(tableNames.has(table)).toBe(true);
     }
 
@@ -253,26 +318,6 @@ describe('migration 0001 — fresh install', () => {
 
     const row = db.select().from(projects).where(eq(projects.slug, 'git-url-app')).get();
     expect(row?.repoUrl).toBe('https://example.com/acme/app.git');
-  });
-
-  it('notification_subscriptions rejects a duplicate (event, channelId) pair', () => {
-    const db = openDb(tmpDbPath());
-    db.insert(notificationChannels).values({ name: 'Default', url: 'https://hooks.example.com/x' }).run();
-    const channel = db.select({ id: notificationChannels.id }).from(notificationChannels).get()!;
-
-    db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: channel.id }).run();
-    expect(() => db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: channel.id }).run()).toThrow();
-  });
-
-  it('notification_subscriptions cascades on channel delete', () => {
-    const db = openDb(tmpDbPath());
-    db.insert(notificationChannels).values({ name: 'Default', url: 'https://hooks.example.com/x' }).run();
-    const channel = db.select({ id: notificationChannels.id }).from(notificationChannels).get()!;
-    db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: channel.id }).run();
-
-    db.delete(notificationChannels).where(eq(notificationChannels.id, channel.id)).run();
-
-    expect(db.select().from(notificationSubscriptions).all()).toHaveLength(0);
   });
 
   it('audit_events.actorId is set null (not cascade-deleted) when the actor user is removed', () => {

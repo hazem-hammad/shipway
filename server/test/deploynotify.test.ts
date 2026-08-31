@@ -2,11 +2,13 @@
  * `services/deploynotify.ts` is the exact function wired into `PipelineDeps.notify` (app.ts): it
  * preserves v1's legacy webhook behavior (per-project `notifyWebhookUrl` override / global
  * `notify_webhook_url` fallback, gated by `notify_on_success`) AND additionally — always, regardless
- * of that gate — emits the matching Task 4 bus event. `notifyDeployCanceled` covers the one terminal
- * status the pipeline's own `notify` hook never calls (cancellation).
+ * of that gate — emails the deploying project's own notification recipients (`services/notifybus.ts`)
+ * for the matching event. `notifyDeployCanceled` covers the one terminal status the pipeline's own
+ * `notify` hook never calls (cancellation).
  *
- * Tested directly against a real (tmp) db + a fake fetch, independent of the full pipeline/app —
- * see server/src/app.ts for the thin wiring that calls these.
+ * Tested directly against a real (tmp) db, a fake fetch (legacy webhook) and a fake mail transport
+ * (project notifications), independent of the full pipeline/app — see server/src/app.ts for the thin
+ * wiring that calls these.
  */
 import { describe, expect, it } from 'vitest';
 import { eq } from 'drizzle-orm';
@@ -14,7 +16,9 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { openDb, type ShipwayDb } from '../src/db/index.js';
-import { deployments, notificationChannels, notificationSubscriptions, projects } from '../src/db/schema.js';
+import { deployments, projectNotificationEvents, projectNotificationRecipients, projects } from '../src/db/schema.js';
+import { SecretBox } from '../src/lib/secretbox.js';
+import { saveMailConfig, type MailTransport } from '../src/services/mailer.js';
 import { setSetting } from '../src/db/settings.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from '../src/services/deploynotify.js';
 
@@ -32,25 +36,48 @@ function insertProject(db: ShipwayDb, slug: string, notifyWebhookUrl: string | n
   return row.id;
 }
 
-function insertDeployment(db: ShipwayDb, projectId: number, commitSha: string | null = null): number {
-  db.insert(deployments).values({ projectId, status: 'running', trigger: 'push', commitSha }).run();
+function insertDeployment(db: ShipwayDb, projectId: number, commitSha: string | null = null, commitMessage: string | null = null): number {
+  db.insert(deployments).values({ projectId, status: 'running', trigger: 'push', commitSha, commitMessage }).run();
   const rows = db.select({ id: deployments.id }).from(deployments).where(eq(deployments.projectId, projectId)).all();
   const last = rows[rows.length - 1];
   if (!last) throw new Error('failed to insert test deployment');
   return last.id;
 }
 
-function insertChannel(db: ShipwayDb, name: string, url: string): number {
-  db.insert(notificationChannels).values({ name, url }).run();
-  const row = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, name)).get();
-  if (!row) throw new Error('failed to insert test channel');
-  return row.id;
+/** Gives `projectId` a recipient list and an event subscription, and configures instance mail so the
+ * notification can actually be delivered. Returns the `SecretBox` the mail config was written with
+ * (both `notifyDeploy*` functions need it) plus a recording transport factory. */
+function setUpNotifications(
+  db: ShipwayDb,
+  projectId: number,
+  events: string[],
+  emails: string[] = ['ops@example.com'],
+): { secretBox: SecretBox; factory: () => MailTransport; sent: SentMail[] } {
+  for (const email of emails) {
+    db.insert(projectNotificationRecipients).values({ projectId, email }).run();
+  }
+  for (const event of events) {
+    db.insert(projectNotificationEvents).values({ projectId, event }).run();
+  }
+
+  const secretBox = SecretBox.load(path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'shipway-deploynotify-key-')), 'secret.key'));
+  saveMailConfig(db, secretBox, { driver: 'smtp', host: 'smtp.example.com', port: 587, secure: false, fromAddress: 'shipway@example.com' });
+
+  const sent: SentMail[] = [];
+  const transport: MailTransport = {
+    sendMail(options) {
+      sent.push({ to: options.to, subject: options.subject, text: options.text, html: options.html });
+      return Promise.resolve({});
+    },
+  };
+  return { secretBox, factory: () => transport, sent };
 }
 
-function subscribeAll(db: ShipwayDb, channelId: number, events: string[]): void {
-  for (const event of events) {
-    db.insert(notificationSubscriptions).values({ event, channelId }).run();
-  }
+interface SentMail {
+  to: string;
+  subject: string;
+  text: string;
+  html: string | undefined;
 }
 
 interface RecordedCall {
@@ -137,124 +164,160 @@ describe('notifyDeployTerminal — legacy webhook (unchanged v1 behavior)', () =
   });
 });
 
-describe('notifyDeployTerminal — bus events (additive, no notify_on_success coupling)', () => {
-  it('emits deploy_succeeded to a subscribed channel even when notify_on_success is not set (legacy send skipped)', async () => {
+describe('notifyDeployTerminal — project notifications (additive, no notify_on_success coupling)', () => {
+  it('emails the project\'s recipients on deploy_succeeded even when notify_on_success is not set (legacy webhook skipped)', async () => {
     const db = tmpDb();
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId);
-    const channelId = insertChannel(db, 'bus-channel', 'https://hooks.slack.com/services/bus');
-    subscribeAll(db, channelId, ['deploy_succeeded']);
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_succeeded']);
     const { fetchImpl, calls } = fakeFetch();
 
-    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'deployed cleanly' });
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'deployed cleanly' }, secretBox, factory);
 
-    const busCall = calls.find((c) => c.url === 'https://hooks.slack.com/services/bus');
-    expect(busCall).toBeDefined();
-    expect(bodyText(busCall)).toContain('Deploy succeeded');
-    expect(bodyText(busCall)).toContain('deployed cleanly');
+    expect(calls).toHaveLength(0); // notify_on_success unset — the legacy webhook stays silent
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.to).toBe('ops@example.com');
+    expect(sent[0]?.subject).toBe('[shop] Deploy succeeded (#' + String(deploymentId) + ')');
+    expect(sent[0]?.text).toContain('deployed cleanly');
   });
 
   it('emits deploy_failed for a plain failure (rolledBack not set)', async () => {
     const db = tmpDb();
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId);
-    const channelId = insertChannel(db, 'failed-channel', 'https://hooks.slack.com/services/failed');
-    subscribeAll(db, channelId, ['deploy_failed', 'deploy_rolled_back']);
-    const { fetchImpl, calls } = fakeFetch();
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_failed', 'deploy_rolled_back']);
+    const { fetchImpl } = fakeFetch();
 
-    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'build failed' });
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'build failed' }, secretBox, factory);
 
-    expect(bodyText(calls[0])).toContain('Deploy failed');
-    expect(bodyText(calls[0])).not.toContain('Deploy rolled back');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.subject).toContain('Deploy failed');
+    // A failure summary is NOT the commit message: it belongs in its own block.
+    expect(sent[0]?.text).toContain('What went wrong');
+    expect(sent[0]?.text).toContain('build failed');
   });
 
   it('emits deploy_rolled_back instead of deploy_failed when rolledBack is true', async () => {
     const db = tmpDb();
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId);
-    const channelId = insertChannel(db, 'rollback-channel', 'https://hooks.slack.com/services/rollback');
-    subscribeAll(db, channelId, ['deploy_failed', 'deploy_rolled_back']);
-    const { fetchImpl, calls } = fakeFetch();
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_failed', 'deploy_rolled_back']);
+    const { fetchImpl } = fakeFetch();
 
-    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'health check failed', rolledBack: true });
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'health check failed', rolledBack: true }, secretBox, factory);
 
-    expect(bodyText(calls[0])).toContain('Deploy rolled back');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.subject).toContain('Deploy rolled back');
   });
 
-  it('formats the bus message as "[slug] deploy #id <sha> detail", short sha included when the deployment has one', async () => {
+  it('goes only to the deploying project\'s recipients, never another project\'s', async () => {
+    const db = tmpDb();
+    const shop = insertProject(db, 'shop');
+    const blog = insertProject(db, 'blog');
+    const deploymentId = insertDeployment(db, shop);
+    const { secretBox, factory, sent } = setUpNotifications(db, shop, ['deploy_failed'], ['shop@example.com']);
+    // The other project is configured identically and must stay untouched.
+    db.insert(projectNotificationRecipients).values({ projectId: blog, email: 'blog@example.com' }).run();
+    db.insert(projectNotificationEvents).values({ projectId: blog, event: 'deploy_failed' }).run();
+    const { fetchImpl } = fakeFetch();
+
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'build failed' }, secretBox, factory);
+
+    expect(sent.map((m) => m.to)).toEqual(['shop@example.com']);
+  });
+
+  it('carries the project, deployment number and short sha into the email', async () => {
     const db = tmpDb();
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId, 'abcdef1234567890');
-    const channelId = insertChannel(db, 'fmt-channel', 'https://hooks.slack.com/services/fmt');
-    subscribeAll(db, channelId, ['deploy_succeeded']);
-    const { fetchImpl, calls } = fakeFetch();
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_succeeded']);
+    const { fetchImpl } = fakeFetch();
 
-    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'first commit' });
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'first commit' }, secretBox, factory);
 
-    const text = bodyText(calls[0]);
-    expect(text).toContain(`[shop] deploy #${String(deploymentId)} abcdef1`);
-    expect(text).toContain('first commit');
+    expect(sent[0]?.text).toContain('shop');
+    expect(sent[0]?.text).toContain(`#${String(deploymentId)}`);
+    expect(sent[0]?.text).toContain('abcdef1');
+    expect(sent[0]?.text).not.toContain('abcdef1234567890'); // abbreviated, not the full sha
   });
 
-  it('omits the sha segment when the deployment has none', async () => {
+  it('omits the commit line entirely when the deployment has no sha', async () => {
     const db = tmpDb();
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId, null);
-    const channelId = insertChannel(db, 'nosha-channel', 'https://hooks.slack.com/services/nosha');
-    subscribeAll(db, channelId, ['deploy_succeeded']);
-    const { fetchImpl, calls } = fakeFetch();
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_succeeded']);
+    const { fetchImpl } = fakeFetch();
 
-    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'first commit' });
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'first commit' }, secretBox, factory);
 
-    expect(bodyText(calls[0])).toContain(`[shop] deploy #${String(deploymentId)} first commit`);
+    expect(sent[0]?.text).not.toContain('Commit:');
   });
 
-  it('a bus delivery failure does not throw and does not prevent the legacy webhook from having been sent', async () => {
+  it('highlights the stored commit message, preferring it over the payload message', async () => {
+    const db = tmpDb();
+    const projectId = insertProject(db, 'shop');
+    const deploymentId = insertDeployment(db, projectId, 'abcdef1234567890', 'Add checkout summary');
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_failed']);
+    const { fetchImpl } = fakeFetch();
+
+    // A FAILED deploy still shows what was being deployed — that's usually the first question.
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'npm run build exited 1' }, secretBox, factory);
+
+    expect(sent[0]?.text).toContain('Commit message:');
+    expect(sent[0]?.text).toContain('Add checkout summary');
+    expect(sent[0]?.text).toContain('npm run build exited 1');
+  });
+
+  it('links to the deploy log when a base domain is configured, and omits the link when not', async () => {
+    const db = tmpDb();
+    const projectId = insertProject(db, 'shop');
+    const deploymentId = insertDeployment(db, projectId);
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_succeeded']);
+    const { fetchImpl } = fakeFetch();
+
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'x' }, secretBox, factory);
+    expect(sent[0]?.text).not.toContain('https://');
+
+    setSetting(db, 'base_domain', 'example.com');
+    await notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'success', deploymentId, message: 'x' }, secretBox, factory);
+    expect(sent[1]?.text).toContain(`https://ship.example.com/projects/${String(projectId)}/deployments/${String(deploymentId)}`);
+  });
+
+  it('a failed notification send does not throw and does not prevent the legacy webhook from having been sent', async () => {
     const db = tmpDb();
     setSetting(db, 'notify_webhook_url', 'https://hooks.slack.com/services/legacy-still-works');
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId);
-    const channelId = insertChannel(db, 'flaky-bus-channel', 'https://hooks.slack.com/services/flaky-bus');
-    subscribeAll(db, channelId, ['deploy_failed']);
-
-    const calls: RecordedCall[] = [];
-    const fetchImpl = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
-      const url = input.toString();
-      calls.push({ url, init });
-      if (url.includes('flaky-bus')) return Promise.reject(new Error('network down'));
-      return Promise.resolve({ ok: true, status: 200 } as Response);
-    }) as typeof fetch;
+    const { secretBox } = setUpNotifications(db, projectId, ['deploy_failed']);
+    const failing: MailTransport = { sendMail: () => Promise.reject(new Error('smtp down')) };
+    const { fetchImpl, calls } = fakeFetch();
 
     await expect(
-      notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'build failed' }),
-    ).resolves.toBeUndefined();
+      notifyDeployTerminal(db, fetchImpl, { project: 'shop', status: 'failed', deploymentId, message: 'build failed' }, secretBox, () => failing),
+    ).resolves.toMatchObject({ status: 'failed' });
 
     expect(calls.some((c) => c.url === 'https://hooks.slack.com/services/legacy-still-works')).toBe(true);
   });
 });
 
 describe('notifyDeployCanceled', () => {
-  it('emits deploy_canceled with the project slug + deployment id in the message', async () => {
+  it('emails deploy_canceled with the project slug + deployment id in the message', async () => {
     const db = tmpDb();
     const projectId = insertProject(db, 'shop');
     const deploymentId = insertDeployment(db, projectId);
-    const channelId = insertChannel(db, 'cancel-channel', 'https://hooks.slack.com/services/cancel');
-    subscribeAll(db, channelId, ['deploy_canceled']);
-    const { fetchImpl, calls } = fakeFetch();
+    const { secretBox, factory, sent } = setUpNotifications(db, projectId, ['deploy_canceled']);
 
-    await notifyDeployCanceled(db, fetchImpl, deploymentId);
+    await notifyDeployCanceled(db, deploymentId, secretBox, factory);
 
-    expect(calls).toHaveLength(1);
-    const text = bodyText(calls[0]);
-    expect(text).toContain('Deploy canceled');
-    expect(text).toContain(`[shop] deploy #${String(deploymentId)}`);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]?.subject).toBe(`[shop] Deploy canceled (#${String(deploymentId)})`);
+    expect(sent[0]?.text).toContain('shop');
+    expect(sent[0]?.text).toContain(`#${String(deploymentId)}`);
   });
 
   it('is a silent no-op for an unknown deployment id', async () => {
     const db = tmpDb();
-    const { fetchImpl, calls } = fakeFetch();
 
-    await expect(notifyDeployCanceled(db, fetchImpl, 999999)).resolves.toBeUndefined();
-    expect(calls).toHaveLength(0);
+    await expect(notifyDeployCanceled(db, 999999)).resolves.toMatchObject({ status: 'skipped' });
   });
 });

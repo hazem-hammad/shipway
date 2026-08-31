@@ -10,6 +10,7 @@ import { PlayCircle, Rocket } from 'lucide-react';
 import { ApiError, patchProject, type Project } from '../../api';
 import { useProject } from '../../hooks';
 import { Button, Card, CardHeader, ICON_STROKE, Skeleton, Textarea } from '../../components/ui';
+import { LARAVEL_POST_DEPLOY_SCRIPT, LARAVEL_PRE_DEPLOY_SCRIPT } from '../../../../server/src/deploy/laravel.js';
 
 export default function ScriptsTab({ projectId }: { projectId: number }) {
   const projectQuery = useProject(projectId);
@@ -36,6 +37,10 @@ export default function ScriptsTab({ projectId }: { projectId: number }) {
 function ScriptsForm({ project }: { project: Project }) {
   const [preDeployScript, setPreDeployScript] = useState(project.preDeployScript ?? '');
   const [postDeployScript, setPostDeployScript] = useState(project.postDeployScript ?? '');
+  // Offered only for php, and only into an empty box: these are the same defaults New Project
+  // prefills (see deploy/laravel.ts), for a project created before they existed — never something
+  // that can overwrite a script someone already wrote.
+  const isPhp = project.type === 'php';
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -72,6 +77,13 @@ function ScriptsForm({ project }: { project: Project }) {
           icon={<PlayCircle size={20} strokeWidth={ICON_STROKE} />}
           title="Pre-deploy script"
           description="Runs after export and env write, before install/build. A non-zero exit fails the deploy."
+          action={
+            isPhp && preDeployScript.trim() === '' ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => change(setPreDeployScript)(LARAVEL_PRE_DEPLOY_SCRIPT)}>
+                Insert Laravel defaults
+              </Button>
+            ) : undefined
+          }
         />
         <Textarea
           mono
@@ -89,6 +101,13 @@ function ScriptsForm({ project }: { project: Project }) {
           icon={<Rocket size={20} strokeWidth={ICON_STROKE} />}
           title="Post-deploy script"
           description="Runs once the release is live and healthy. A failure here does not roll back."
+          action={
+            isPhp && postDeployScript.trim() === '' ? (
+              <Button type="button" variant="outline" size="sm" onClick={() => change(setPostDeployScript)(LARAVEL_POST_DEPLOY_SCRIPT)}>
+                Insert Laravel defaults
+              </Button>
+            ) : undefined
+          }
         />
         <Textarea
           mono

@@ -9,9 +9,10 @@
  * as down — so `servicesDown` naturally comes back `[]` there, matching the spec's "in devMode all
  * 'unknown' -> empty".
  */
-import { count, desc, eq } from 'drizzle-orm';
+import { count, desc, eq, inArray } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { deployments, projects, users } from '../db/schema.js';
+import { accessibleProjectIds } from '../lib/projectaccess.js';
 import { isDown } from '../services/servicewatch.js';
 import { SERVICE_NAMES } from '../services/stats.js';
 import { SYSTEM_UNITS } from '../sysops/types.js';
@@ -37,8 +38,15 @@ export async function overviewRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(401).send({ error: 'unauthorized' });
     }
 
-    const projectsCount = app.db.select({ n: count() }).from(projects).get()?.n ?? 0;
-    const deploymentsCount = app.db.select({ n: count() }).from(deployments).get()?.n ?? 0;
+    // Every count and list below is scoped to the projects this user can actually open (see
+    // `lib/projectaccess.ts`) — a Home dashboard that counted projects a member can't reach would
+    // send them clicking at 404s. `null` is unscoped and counts everything, as before.
+    const allowed = accessibleProjectIds(app.db, userId);
+    const projectScope = allowed === null ? undefined : inArray(projects.id, allowed.size > 0 ? [...allowed] : [-1]);
+    const deploymentScope = allowed === null ? undefined : inArray(deployments.projectId, allowed.size > 0 ? [...allowed] : [-1]);
+
+    const projectsCount = app.db.select({ n: count() }).from(projects).where(projectScope).get()?.n ?? 0;
+    const deploymentsCount = app.db.select({ n: count() }).from(deployments).where(deploymentScope).get()?.n ?? 0;
 
     const servicesDown: string[] = [];
     for (const unit of SYSTEM_UNITS) {
@@ -53,7 +61,7 @@ export async function overviewRoutes(app: FastifyInstance): Promise<void> {
     // see e.g. `routes/deployments.ts`'s global list, also ordered `desc(deployments.id)`); a
     // project with no deployment at all sorts after every project that has one, falling back to
     // `createdAt` both as that fallback ordering and as the tiebreak within it.
-    const allProjects = app.db.select().from(projects).all();
+    const allProjects = app.db.select().from(projects).where(projectScope).all();
     const withLastDeployment: { project: ProjectRow; last: LastDeployment | null }[] = allProjects.map((project) => {
       const last =
         app.db

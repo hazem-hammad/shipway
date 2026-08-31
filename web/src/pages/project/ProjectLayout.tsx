@@ -11,18 +11,20 @@ import { useState } from 'react';
 import { Link, Route, Switch, useLocation, useParams } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import { ArrowLeft, ExternalLink, GitBranch } from 'lucide-react';
-import { ApiError, deployProject, type DeploymentStatus, type Project } from '../../api';
+import { ApiError, deployProject, type DeploymentStatus, type Project, type ProjectType } from '../../api';
 import { useDeployments, useProject, useSettings } from '../../hooks';
 import { Button, Card, EmptyState, ICON_STROKE, Skeleton, StatusDot, type StatusDotStatus } from '../../components/ui';
 import DeploymentsTab from './Deployments';
 import DeploymentLogPage from './DeploymentLog';
 import SettingsTab from './Settings';
 import EnvEditorTab from './EnvEditor';
+import DatabaseTab from './Database';
 import ScriptsTab from './Scripts';
 import WorkersTab from './Workers';
 import CronTab from './Cron';
 import SmtpTab from './Smtp';
 import DangerTab from './Danger';
+import { projectDomain, projectHost } from '../../../../server/src/lib/domain.js';
 
 const DOT_STATUS_BY_DEPLOY: Record<DeploymentStatus, StatusDotStatus> = {
   queued: 'warn',
@@ -33,8 +35,10 @@ const DOT_STATUS_BY_DEPLOY: Record<DeploymentStatus, StatusDotStatus> = {
   canceled: 'idle',
 };
 
+type TabKey = 'deployments' | 'settings' | 'environment' | 'database' | 'scripts' | 'workers' | 'cron' | 'smtp' | 'danger';
+
 interface TabDef {
-  key: string;
+  key: TabKey;
   href: string;
   label: string;
 }
@@ -43,12 +47,32 @@ const TABS: TabDef[] = [
   { key: 'deployments', href: '/', label: 'Deployments' },
   { key: 'settings', href: '/settings', label: 'Settings' },
   { key: 'environment', href: '/environment', label: 'Environment' },
+  { key: 'database', href: '/database', label: 'Database' },
   { key: 'scripts', href: '/scripts', label: 'Scripts' },
   { key: 'workers', href: '/workers', label: 'Workers' },
   { key: 'cron', href: '/cron', label: 'Cron' },
   { key: 'smtp', href: '/smtp', label: 'SMTP' },
   { key: 'danger', href: '/danger', label: 'Danger' },
 ];
+
+/**
+ * Sections a given project type has no use for. Keyed by type rather than expressed as a condition
+ * on each tab, so what a type does and doesn't get is one list to read.
+ *
+ * `TabKey` is a union rather than `string` specifically so an entry here cannot drift: rename a tab
+ * and this stops compiling, instead of quietly hiding nothing.
+ */
+const HIDDEN_TABS: Partial<Record<ProjectType, readonly TabKey[]>> = {
+  nextjs: ['database', 'smtp', 'workers', 'cron'],
+};
+
+function hasSection(type: ProjectType, key: TabKey): boolean {
+  return !(HIDDEN_TABS[type] ?? []).includes(key);
+}
+
+function tabsForType(type: ProjectType): TabDef[] {
+  return TABS.filter((tab) => hasSection(type, tab.key));
+}
 
 /** For a GitHub-App project, the repo full name; for a Git-URL project, just the host. */
 function repoChipLabel(project: Project): string {
@@ -135,16 +159,16 @@ export default function ProjectLayout() {
 
             {baseDomain ? (
               <a
-                href={`https://${project.slug}.${baseDomain}`}
+                href={`https://${projectDomain(project, baseDomain)}`}
                 target="_blank"
                 rel="noreferrer noopener"
                 className="mt-1.5 inline-flex w-fit items-center gap-1.5 font-mono text-sm text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
               >
-                {project.slug}.{baseDomain}
+                {projectDomain(project, baseDomain)}
                 <ExternalLink size={13} strokeWidth={ICON_STROKE} aria-hidden />
               </a>
             ) : (
-              <span className="mt-1.5 block font-mono text-sm text-soft">{project.slug}</span>
+              <span className="mt-1.5 block font-mono text-sm text-soft">{projectHost(project)}</span>
             )}
 
             <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -171,7 +195,7 @@ export default function ProjectLayout() {
         )}
       </Card>
 
-      <ProjectTabs location={location} />
+      <ProjectTabs location={location} type={project.type} />
 
       <div className="mt-6">
         <Switch>
@@ -184,18 +208,29 @@ export default function ProjectLayout() {
           <Route path="/environment">
             <EnvEditorTab projectId={projectId} />
           </Route>
+          {hasSection(project.type, 'database') && (
+            <Route path="/database">
+              <DatabaseTab projectId={projectId} />
+            </Route>
+          )}
           <Route path="/scripts">
             <ScriptsTab projectId={projectId} />
           </Route>
-          <Route path="/workers">
-            <WorkersTab projectId={projectId} />
-          </Route>
-          <Route path="/cron">
-            <CronTab projectId={projectId} />
-          </Route>
-          <Route path="/smtp">
-            <SmtpTab projectId={projectId} />
-          </Route>
+          {hasSection(project.type, 'workers') && (
+            <Route path="/workers">
+              <WorkersTab projectId={projectId} />
+            </Route>
+          )}
+          {hasSection(project.type, 'cron') && (
+            <Route path="/cron">
+              <CronTab projectId={projectId} />
+            </Route>
+          )}
+          {hasSection(project.type, 'smtp') && (
+            <Route path="/smtp">
+              <SmtpTab projectId={projectId} />
+            </Route>
+          )}
           <Route path="/danger">
             <DangerTab projectId={projectId} />
           </Route>
@@ -211,10 +246,10 @@ export default function ProjectLayout() {
   );
 }
 
-function ProjectTabs({ location }: { location: string }) {
+function ProjectTabs({ location, type }: { location: string; type: ProjectType }) {
   return (
     <div role="tablist" aria-label="Project sections" className="flex flex-wrap items-center gap-1.5">
-      {TABS.map((tab) => {
+      {tabsForType(type).map((tab) => {
         const active = tab.key === 'deployments' ? location === '/' || location.startsWith('/deployments') : location === tab.href;
         return (
           <Link

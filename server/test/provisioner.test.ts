@@ -12,6 +12,8 @@ import { FakeDnsClient, type DnsClient } from '../src/services/cloudflare.js';
 import { syncCrontab } from '../src/services/cron.js';
 import { workerInstances } from '../src/services/workers.js';
 import {
+  changeProjectSubdomain,
+  ensureDefaultVhost,
   ProvisionError,
   deprovisionProject,
   nodeBinDir,
@@ -143,6 +145,16 @@ class FailingDnsClient implements DnsClient {
   }
 }
 
+/** Creates and finds records normally but refuses to DELETE — the one DNS failure
+ * `changeProjectSubdomain` reports instead of throwing, since the project is already live on its
+ * new domain by the time the old record is cleaned up. */
+class UndeletableDnsClient extends RecordingDnsClient {
+  override async deleteARecord(fqdn: string): Promise<void> {
+    this.calls.push(`deleteARecord ${fqdn} (refused)`);
+    throw new Error('Cloudflare deleteARecord failed: 403 Forbidden');
+  }
+}
+
 class FailingNginxTestSysOps extends DevSysOps {
   async nginxTest(): Promise<{ ok: boolean; output: string }> {
     this.calls.push('nginxTest');
@@ -263,6 +275,7 @@ describe('provisionProject — node/nextjs', () => {
     const { sysops } = await provisionNodeProject();
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-api.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-api.conf',
       'installFile /etc/nginx/sites-enabled/shipway-api.conf',
       'nginxTest',
@@ -294,6 +307,7 @@ describe('provisionProject — php', () => {
     await provisionProject({ db, cfg, sysops, dns }, id);
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-shop.conf',
       'installFile /etc/nginx/sites-enabled/shipway-shop.conf',
       'nginxTest',
@@ -316,6 +330,7 @@ describe('provisionProject — static', () => {
     await provisionProject({ db, cfg, sysops, dns }, id);
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-docs.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-docs.conf',
       'installFile /etc/nginx/sites-enabled/shipway-docs.conf',
       'nginxTest',
@@ -457,6 +472,7 @@ describe('provisionProject — nginxTest failure', () => {
     expect(caught).toBeInstanceOf(ProvisionError);
     expect((caught as ProvisionError).message).toContain('unexpected "}"');
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-broken.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-broken.conf',
       'installFile /etc/nginx/sites-enabled/shipway-broken.conf',
       'nginxTest',
@@ -486,6 +502,7 @@ describe('refreshProjectConfig', () => {
 
     expect(dns.calls).toEqual([]);
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-shop.conf',
       'installFile /etc/nginx/sites-enabled/shipway-shop.conf',
       'nginxTest',
@@ -510,6 +527,7 @@ describe('refreshProjectConfig', () => {
     await refreshProjectConfig({ db, cfg, sysops, dns }, id, previous);
 
     expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-api.htpasswd',
       'installFile /etc/nginx/sites-available/shipway-api.conf',
       'installFile /etc/nginx/sites-enabled/shipway-api.conf',
       'nginxTest',
@@ -574,6 +592,7 @@ describe('deprovisionProject', () => {
       'removeFile /etc/systemd/system/shipway-app-api.service',
       'removeFile /etc/nginx/sites-available/shipway-api.conf',
       'removeFile /etc/nginx/sites-enabled/shipway-api.conf',
+      'removeFile /etc/nginx/shipway-auth/shipway-api.htpasswd',
       'reloadNginx',
       'readCrontab',
       'writeCrontab',
@@ -600,6 +619,7 @@ describe('deprovisionProject', () => {
     expect(callNames(sysops)).toEqual([
       'removeFile /etc/nginx/sites-available/shipway-shop.conf',
       'removeFile /etc/nginx/sites-enabled/shipway-shop.conf',
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
       'reloadNginx',
       'readCrontab',
       'writeCrontab',
@@ -612,7 +632,7 @@ describe('deprovisionProject', () => {
     const sysops = new DevSysOps(sysopsRoot(cfg));
     const dns = new RecordingDnsClient();
 
-    await expect(deprovisionProject({ db, cfg, sysops, dns }, 999999)).resolves.toBeUndefined();
+    await expect(deprovisionProject({ db, cfg, sysops, dns }, 999999)).resolves.toEqual({ databasesDropped: [], databasesFailed: [] });
   });
 
   it('best-effort: continues past a failing step (e.g. reloadNginx) and still deletes the row, DNS record, and dirs', async () => {
@@ -626,7 +646,7 @@ describe('deprovisionProject', () => {
 
     const failingSysops = new ReloadNginxFailsSysOps(sysopsRoot(cfg));
 
-    await expect(deprovisionProject({ db, cfg, sysops: failingSysops, dns }, id)).resolves.toBeUndefined();
+    await expect(deprovisionProject({ db, cfg, sysops: failingSysops, dns }, id)).resolves.toEqual({ databasesDropped: [], databasesFailed: [] });
 
     expect(dns.records.has('shop.apps.example.com')).toBe(false);
     expect(fs.existsSync(path.join(cfg.appsDir, 'shop'))).toBe(false);
@@ -711,5 +731,302 @@ describe('deprovisionProject', () => {
     expect(sysops.calls).toEqual([]);
     expect(dns.calls).toEqual([]);
     expect(db.select().from(projects).where(eq(projects.id, row.id)).get()).toBeDefined();
+  });
+});
+
+/**
+ * The catch-all vhost, installed at boot. Without it nginx has no `default_server` on 443 and serves
+ * an unmatched Host from whichever project block sorts first — which is how a deleted project's
+ * still-resolving wildcard subdomain ended up showing an unrelated project's site.
+ */
+describe('ensureDefaultVhost', () => {
+  function deps(): { deps: ProvisionDeps; sysops: DevSysOps; db: ShipwayDb; cfg: Config } {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    return { deps: { db, cfg, sysops, dns: null }, sysops, db, cfg };
+  }
+
+  it('installs the catch-all to both sites-available and sites-enabled, then reloads nginx', async () => {
+    const h = deps();
+    setSetting(h.db, 'base_domain', 'intcore.dev');
+
+    const result = await ensureDefaultVhost(h.deps);
+
+    expect(result.ok).toBe(true);
+    expect(h.sysops.calls.some((c) => c.startsWith('installFile /etc/nginx/sites-available/shipway-default.conf'))).toBe(true);
+    expect(h.sysops.calls.some((c) => c.startsWith('installFile /etc/nginx/sites-enabled/shipway-default.conf'))).toBe(true);
+    expect(h.sysops.calls).toContain('reloadNginx');
+
+    const conf = fs.readFileSync(path.join(sysopsRoot(h.cfg), '/etc/nginx/sites-enabled/shipway-default.conf'), 'utf8');
+    expect(conf).toContain('listen 443 ssl default_server;');
+    expect(conf).toContain('return 404;');
+  });
+
+  it('is a no-op on a host that has not been set up yet, rather than throwing at boot', async () => {
+    const h = deps(); // no base_domain
+
+    const result = await ensureDefaultVhost(h.deps);
+
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('base_domain');
+    expect(h.sysops.calls).toEqual([]);
+  });
+
+  it('is idempotent — running it again just rewrites the same config', async () => {
+    const h = deps();
+    setSetting(h.db, 'base_domain', 'intcore.dev');
+
+    await ensureDefaultVhost(h.deps);
+    const first = fs.readFileSync(path.join(sysopsRoot(h.cfg), '/etc/nginx/sites-enabled/shipway-default.conf'), 'utf8');
+    const result = await ensureDefaultVhost(h.deps);
+    const second = fs.readFileSync(path.join(sysopsRoot(h.cfg), '/etc/nginx/sites-enabled/shipway-default.conf'), 'utf8');
+
+    expect(result.ok).toBe(true);
+    expect(second).toBe(first);
+  });
+
+  it('backs the files out when nginx rejects the config, rather than leaving nginx unable to reload', async () => {
+    const h = deps();
+    setSetting(h.db, 'base_domain', 'intcore.dev');
+    // Simulates another `default_server` on 443 already existing (a hand-edited config).
+    h.sysops.nginxTest = () => Promise.resolve({ ok: false, output: 'duplicate default server' });
+
+    const result = await ensureDefaultVhost(h.deps);
+
+    expect(result.ok).toBe(false);
+    expect(result.detail).toContain('duplicate default server');
+    expect(h.sysops.calls).toContain('removeFile /etc/nginx/sites-available/shipway-default.conf');
+    expect(h.sysops.calls).toContain('removeFile /etc/nginx/sites-enabled/shipway-default.conf');
+    expect(h.sysops.calls).not.toContain('reloadNginx');
+  });
+});
+
+describe('changeProjectSubdomain', () => {
+  it('points the new domain at this server, re-renders the vhost under it, and removes the old record', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3', publicDir: 'public' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    sysops.calls.length = 0;
+    dns.calls.length = 0;
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+    const result = await changeProjectSubdomain({ db, cfg, sysops, dns }, id, previous);
+
+    expect(result).toEqual({
+      domain: 'store.apps.example.com',
+      previousDomain: 'shop.apps.example.com',
+      dnsAttempted: true,
+      created: true,
+      oldRecordRemoved: true,
+    });
+    expect(dns.calls).toEqual([
+      'findARecord store.apps.example.com',
+      'createARecord store.apps.example.com 203.0.113.10',
+      'findARecord shop.apps.example.com',
+      'deleteARecord shop.apps.example.com',
+    ]);
+    expect([...dns.records.keys()]).toEqual(['store.apps.example.com']);
+
+    // The vhost answers on the new name — but the FILE, the log paths and the app directory are all
+    // still named after the slug, which does not move.
+    const vhost = readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf');
+    expect(vhost).toContain('server_name store.apps.example.com;');
+    expect(vhost).not.toContain('shop.apps.example.com');
+    expect(vhost).toContain('access_log /var/log/nginx/shipway-shop.access.log;');
+    expect(callNames(sysops)).toEqual([
+      'removeFile /etc/nginx/shipway-auth/shipway-shop.htpasswd',
+      'installFile /etc/nginx/sites-available/shipway-shop.conf',
+      'installFile /etc/nginx/sites-enabled/shipway-shop.conf',
+      'nginxTest',
+      'reloadNginx',
+    ]);
+  });
+
+  it('moves a project back to its slug when `subdomain` is cleared', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    expect([...dns.records.keys()]).toEqual(['store.apps.example.com']);
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: null }).where(eq(projects.id, id)).run();
+    const result = await changeProjectSubdomain({ db, cfg, sysops, dns }, id, previous);
+
+    expect(result.domain).toBe('shop.apps.example.com');
+    expect(result.previousDomain).toBe('store.apps.example.com');
+    expect([...dns.records.keys()]).toEqual(['shop.apps.example.com']);
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toContain('server_name shop.apps.example.com;');
+  });
+
+  it('reports `existed` without creating a second record when the new domain already has one', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    await dns.createARecord('store.apps.example.com', '203.0.113.10');
+    dns.calls.length = 0;
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+    const result = await changeProjectSubdomain({ db, cfg, sysops, dns }, id, previous);
+
+    expect(result.created).toBe(false);
+    expect(dns.calls).not.toContain('createARecord store.apps.example.com 203.0.113.10');
+    expect(result.oldRecordRemoved).toBe(true);
+  });
+
+  it('throws step "dns" and leaves the vhost alone when the DNS step fails', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns: new RecordingDnsClient() }, id);
+    const before = readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf');
+    sysops.calls.length = 0;
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+
+    let caught: unknown;
+    try {
+      await changeProjectSubdomain({ db, cfg, sysops, dns: new FailingDnsClient() }, id, previous);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ProvisionError);
+    expect((caught as ProvisionError).step).toBe('dns');
+    expect(callNames(sysops)).toEqual([]);
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toBe(before);
+  });
+
+  it('restores the old vhost AND deletes the record it just created when nginx -t fails', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    // Provision with a working sysops, then swap in one whose `nginx -t` fails, sharing the sandbox
+    // root so the restore is asserted against the file the first one actually wrote.
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    const before = readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf');
+    dns.calls.length = 0;
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+
+    let caught: unknown;
+    try {
+      await changeProjectSubdomain({ db, cfg, sysops: new FailingNginxTestSysOps(sysopsRoot(cfg)), dns }, id, previous);
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(ProvisionError);
+    expect((caught as ProvisionError).step).toBe('nginx-test');
+    // Both halves of the rollback: the site is still served on its old name, and the record for the
+    // domain nginx never learned about is gone again.
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toBe(before);
+    expect(readSandboxed(cfg, '/etc/nginx/sites-enabled/shipway-shop.conf')).toBe(before);
+    expect([...dns.records.keys()]).toEqual(['shop.apps.example.com']);
+    expect(dns.calls).toContain('deleteARecord store.apps.example.com');
+  });
+
+  it('leaves a pre-existing record for the new domain in place when nginx -t fails — it did not create it', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    await dns.createARecord('store.apps.example.com', '198.51.100.7');
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+
+    await expect(
+      changeProjectSubdomain({ db, cfg, sysops: new FailingNginxTestSysOps(sysopsRoot(cfg)), dns }, id, previous),
+    ).rejects.toThrow(ProvisionError);
+
+    expect(dns.records.get('store.apps.example.com')).toBe('198.51.100.7');
+  });
+
+  it('succeeds with a staleRecordWarning when the OLD record cannot be deleted', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new UndeletableDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+    const result = await changeProjectSubdomain({ db, cfg, sysops, dns }, id, previous);
+
+    // The move itself is a success — the project IS being served on its new domain.
+    expect(result.domain).toBe('store.apps.example.com');
+    expect(result.created).toBe(true);
+    expect(result.oldRecordRemoved).toBe(false);
+    expect(result.staleRecordWarning).toContain('shop.apps.example.com');
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toContain('server_name store.apps.example.com;');
+  });
+
+  it('still moves the vhost with no DNS client configured, reporting dnsAttempted: false', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns: null }, id);
+
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+    const result = await changeProjectSubdomain({ db, cfg, sysops, dns: null }, id, previous);
+
+    expect(result).toEqual({
+      domain: 'store.apps.example.com',
+      previousDomain: 'shop.apps.example.com',
+      dnsAttempted: false,
+      created: false,
+      oldRecordRemoved: false,
+    });
+    expect(readSandboxed(cfg, '/etc/nginx/sites-available/shipway-shop.conf')).toContain('server_name store.apps.example.com;');
+  });
+
+  it('deprovisioning a moved project deletes the record for the domain it actually serves', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    configureSettings(db);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const dns = new RecordingDnsClient();
+    const id = insertProject(db, { slug: 'shop', type: 'static' });
+    await provisionProject({ db, cfg, sysops, dns }, id);
+    const previous = getProjectRow(db, id);
+    db.update(projects).set({ subdomain: 'store' }).where(eq(projects.id, id)).run();
+    await changeProjectSubdomain({ db, cfg, sysops, dns }, id, previous);
+    dns.calls.length = 0;
+
+    await deprovisionProject({ db, cfg, sysops, dns }, id);
+
+    expect(dns.calls).toContain('deleteARecord store.apps.example.com');
+    expect([...dns.records.keys()]).toEqual([]);
   });
 });

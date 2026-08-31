@@ -73,13 +73,14 @@ Typically **10 to 20 minutes**, mostly apt package installs and the Shipway buil
 2. Installs MySQL, PostgreSQL, and Redis, and sets a random Redis password.
 3. Installs Node 18, 20, and 22 side by side under `/opt/node/<version>`, verifying each download's checksum against the official `SHASUMS256.txt` first.
 4. Installs Mailpit (the shared catch-all SMTP inbox) as its own systemd service, and protects its web UI with HTTP basic auth (random password, printed in the final summary).
-5. Installs certbot and requests one wildcard certificate for `*.<base-domain>` and `<base-domain>` via Cloudflare DNS-01. This does not need ports 80/443 open to the world, since it's a DNS challenge, not an HTTP one.
-6. Creates the `deployer` system user, its directories, the `shipway-sysops` root helper, and a sudoers policy that lets `deployer` run exactly the handful of commands Shipway needs (reload nginx/php-fpm, manage its own `shipway-*` systemd units) and nothing else. Also installs and enables the `cron` service, since project cron schedules (Projects > a project > Cron) are written with the bare `crontab` command.
-7. Creates a `shipway_admin` MySQL user and Postgres role with random passwords.
-8. Builds Shipway itself into `/opt/shipway` and starts it as `shipway.service`.
-9. Renders the nginx vhosts for the dashboard and Mailpit's web UI, and reloads nginx.
-10. Creates the `ship.` and `mail.` DNS `A` records at Cloudflare.
-11. Runs a postflight check: confirms shipway, nginx, mysql, postgresql, redis-server, and mailpit are all active, then polls `https://ship.<base-domain>/api/health` (up to a minute) before printing a final summary with the dashboard URL, the Mailpit credentials, and where everything lives on disk.
+5. Installs the two database consoles, both served under paths on the dashboard host so the Shipway session is what gates them: phpMyAdmin at `ship.<base-domain>/db/phpmyadmin` (extracted from a tarball checksummed against a pinned sha256) and pgAdmin 4 at `ship.<base-domain>/db/pgadmin`, running as its own `pgadmin.service` behind gunicorn. Both are wired to sign you in as the Shipway user you already are — see **Managing a database's contents** below. pgAdmin also keeps a login of its own for direct use; its admin credentials are printed in the final summary.
+6. Installs certbot and requests one wildcard certificate for `*.<base-domain>` and `<base-domain>` via Cloudflare DNS-01. This does not need ports 80/443 open to the world, since it's a DNS challenge, not an HTTP one.
+7. Creates the `deployer` system user, its directories, the `shipway-sysops` root helper, and a sudoers policy that lets `deployer` run exactly the handful of commands Shipway needs (reload nginx/php-fpm, manage its own `shipway-*` systemd units) and nothing else. Also installs and enables the `cron` service, since project cron schedules (Projects > a project > Cron) are written with the bare `crontab` command.
+8. Creates a `shipway_admin` MySQL user and Postgres role with random passwords.
+9. Builds Shipway itself into `/opt/shipway` and starts it as `shipway.service`.
+10. Renders the nginx vhosts for the dashboard and Mailpit's web UI, and reloads nginx.
+11. Creates the `ship.` and `mail.` DNS `A` records at Cloudflare.
+12. Runs a postflight check: confirms shipway, nginx, mysql, postgresql, redis-server, and mailpit are all active, then polls `https://ship.<base-domain>/api/health` (up to a minute) before printing a final summary with the dashboard URL, the Mailpit and database-console credentials, and where everything lives on disk.
 
 Re-running `install.sh` is safe: every step checks whether its work is already done before repeating it, generated passwords are cached in `/root/.shipway-install-secrets` so a re-run never rotates a credential something already depends on, and DNS records are looked up before being created so nothing gets duplicated. The one case that needs a deliberate decision instead of a silent one: if `/root/.shipway-install-secrets` itself is lost on a server that's already live, the installer refuses to guess — see "Lost `/root/.shipway-install-secrets` on an already-live server" under Troubleshooting.
 
@@ -103,11 +104,32 @@ Once the App is created, go to GitHub and **install it** on your org (or just th
 
 ## Updating
 
+Which script you use depends on how the host was installed, because the two cases differ in whether `/opt/shipway` is a git clone at all.
+
+**Installed from a git remote** (`SHIPWAY_REPO_URL`):
+
 ```bash
 sudo /opt/shipway/setup/update.sh
 ```
 
-Pulls the latest commit as `deployer`, rebuilds (`npm ci && npm run build`), and restarts `shipway.service`. Database migrations run automatically the next time the process starts, there is no separate migrate step.
+Pulls the latest commit as `deployer`, rebuilds (`npm ci && npm run build`), and restarts `shipway.service`.
+
+**Installed from a local checkout** (the installer was run from a clone on the box, so `/opt/shipway` is an rsync of it and has no `.git`): update from that checkout instead.
+
+```bash
+sudo ./setup/deploy-local.sh            # sync, build, restart if needed, verify
+sudo ./setup/deploy-local.sh --check    # show what would change, touch nothing
+```
+
+`update.sh` refuses in this case rather than failing halfway through a `git pull` that was never going to work.
+
+`deploy-local.sh` finishes by fetching the live site over HTTPS and comparing the fingerprinted bundle it serves against the one just built, so "deployed" means the site is actually serving this source — a sync that silently didn't take is reported as a failure. It restarts the service only when the compiled server actually differs from the build the running process was started with (a fingerprint recorded at each restart, not a guess from which files rsync moved) — so a tree that was synced by some other means and never restarted is caught, while a rebuild that produces identical output doesn't cause a pointless restart. A web-only change needs no restart at all, because static files are read from disk per request. When it does restart, it stops the service and backs up `shipway.db` **with its `-wal` and `-shm` files** first — in WAL mode the `.db` alone can be nearly empty, so copying just that file yields a backup that looks fine and restores nothing. It also installs the pgAdmin helper scripts when they differ from the checkout, and reports (without installing) drift in the other root-owned files — see [Troubleshooting](#troubleshooting) for why those two are treated differently.
+
+Database migrations run automatically the next time the process starts, there is no separate migrate step.
+
+### If a change doesn't show up in the browser
+
+The dashboard's `index.html` is served `no-cache` and every fingerprinted asset under `assets/` is served `immutable` (`server/src/app.ts`, pinned by tests in `server/test/spa-fallback.test.ts`). That combination is what makes a deploy appear on the next reload: the one file whose name never changes is always revalidated, and the files that never change under one name are never re-fetched. If a page still looks stale after a deploy that verified, reload once — and if that fixes it, the headers regressed and the tests above should have caught it.
 
 ## Where everything lives
 
@@ -124,6 +146,11 @@ Pulls the latest commit as `deployer`, rebuilds (`npm ci && npm run build`), and
 | `/etc/nginx/sites-available/shipway-*.conf`, `sites-enabled/` | Project (and the dashboard/Mailpit) vhosts |
 | `/etc/systemd/system/shipway-*.service` | Per-project app/worker units |
 | `/etc/systemd/system/shipway.service` | Shipway itself |
+| `/opt/phpmyadmin/` | phpMyAdmin, the MySQL console served at `ship.<base-domain>/db/phpmyadmin` |
+| `/opt/shipway-db-signon/signon.php` | The shim behind `ship.<base-domain>/db/signon.php` that opens phpMyAdmin already signed in to one database |
+| `/opt/pgadmin/venv/`, `/var/lib/pgadmin/` | pgAdmin 4's venv and its config database, served at `ship.<base-domain>/db/pgadmin` |
+| `/opt/pgadmin/sync-servers.py` | Registers Shipway's Postgres databases as pgAdmin connections; run by the root helper on every create/drop |
+| `/etc/nginx/shipway-auth/` | Per-project HTTP basic-auth files (Mailpit's lives at `/etc/nginx/shipway-mailpit.htpasswd`) |
 | `/usr/local/bin/shipway-sysops` | The whitelisted root helper the `deployer` user's sudo rules allow |
 | `/etc/letsencrypt/live/<base-domain>/` | The wildcard certificate |
 | `/root/.shipway-install-secrets` | Cached install-time secrets (MySQL/Postgres/Redis/Mailpit passwords), root-only |
@@ -179,6 +206,27 @@ Certbot's systemd timer handles renewal on its own; `/etc/letsencrypt/renewal-ho
 ```bash
 sudo certbot renew --dry-run
 ```
+
+**Using an external database server (RDS and friends).**
+Databases > **Connections** lists every server a database can be created on. The two engines on this host are always there (the installer configured them and they aren't editable); **Add connection** registers another one — name, engine, host, port, an admin user that can create databases and roles, and TLS, which most managed instances require. **Test connection** tries the credentials on the spot, and saving tries them again, so a typo fails here rather than during a deploy. The admin password is stored encrypted with the same key as every other secret and is never shown again.
+
+From then on, Databases > **New database** and Projects > New both ask which connection to use before anything else, and a database created on an external connection gets `DB_HOST`/`DB_PORT` pointed at that server in the project's env. The **Manage** console link only appears for databases on this host, since phpMyAdmin and pgAdmin are installed here and configured against these engines. Removing a connection only makes Shipway forget how to reach that server — nothing on the remote server is touched — and is refused while Shipway still has databases on it.
+
+**PHP file permissions.**
+Deploys run as `deployer`, but nginx serves PHP through php-fpm as `www-data`, so an app that writes at runtime (Laravel's `storage/`, above all) needs both users to have access. After the build and before the release goes live, Shipway grants `www-data` read/write on every shared path and on the release's `bootstrap/cache`, using POSIX ACLs with `default:` entries so files created later — by `www-data` at runtime, or by `deployer` on the next deploy — stay accessible to the other. It shows up in the deploy log as the `permissions` stage. If `setfacl` fails the deploy still goes out, with a warning in that log; an app that turns out to need it will otherwise fail its first request with `Failed to open stream: Permission denied`.
+
+**Managing a database's contents.**
+Databases > that database > **Manage** opens the console for that database's engine, signed in as you. Both consoles sit on the dashboard host behind the Shipway session, so there is no second browser prompt to get in — and no database password to type either.
+
+For **MySQL**, the link goes to `ship.<base-domain>/db/signon.php?id=<database>`, a small shim that reads that database's credentials back from Shipway's own API using your session cookie and hands them to phpMyAdmin's signon authentication. You land on the database's table list, connected as that database's own user, so what you can reach is bounded by that account's grants exactly as before. Opening `ship.<base-domain>/db/phpmyadmin/` directly still shows the ordinary login form for any other MySQL account.
+
+For **Postgres**, the link goes to `ship.<base-domain>/db/pgadmin/`. pgAdmin signs you in from the user nginx passes it (no pgAdmin password), and the server for each of Shipway's Postgres databases is already registered under a **Shipway** group in its browser tree, restricted to that one database and connecting through a passfile — so it opens without asking for anything. pgAdmin has no way to be sent to a specific database by URL, which is why this stops one click short of the MySQL experience. That registration is rebuilt whenever a database is created or dropped, whenever a user is added, and on every Shipway restart. pgAdmin's own login (the admin account from the install summary, re-readable in `/root/.shipway-install-secrets`) still works for reaching it directly.
+
+pgAdmin's server list is also where **per-project access** reaches the console: a member scoped to specific projects (Settings > Team) gets only their own Postgres databases registered, rather than every database on the host with its password already in a passfile. That narrowing is applied by `/opt/pgadmin/sync-servers.py`, so it needs that script to be current — see below.
+
+Because these consoles are host-side wiring rather than application code, most of a change to them is not picked up by `update.sh` or `deploy-local.sh`. Reapply it with `sudo /opt/shipway/setup/install.sh --consoles-only`, which redoes exactly that wiring (both consoles' config, the shim, the root helper, the dashboard vhost) and nothing else — no apt, no certbot, no DNS.
+
+The two exceptions are `/opt/pgadmin/sync-servers.py` and `/opt/pgadmin/set-password.py`, which `deploy-local.sh` now installs itself when they differ from the checkout, restarting the service afterwards so the boot-time sync re-registers every account against the new script. They are singled out because server code can depend on a newer helper: shipping the server half of a change and leaving the old script in place produces no error anywhere, just behaviour that silently doesn't happen. Every other root-owned file (`shipway-sysops`, `shipway.service`, the signon shim, the nginx templates) is only ever published by `install.sh` — `deploy-local.sh` reports drift in them and refuses to install them, because each needs something more than a copy (a matching sudoers whitelist, a daemon-reload, per-project rendering).
 
 **Database credentials.**
 Reveal a project's database credentials from the dashboard (Databases > that database > reveal). The `shipway_admin` MySQL/Postgres credentials the installer created live only in Shipway's settings after the one-time bootstrap import; they are not written anywhere else on disk (the file the installer wrote them to, `bootstrap.json`, is deleted right after Shipway imports it on first boot) — except the install-time cache at `/root/.shipway-install-secrets`, which `install.sh` itself reads on every re-run (see below).

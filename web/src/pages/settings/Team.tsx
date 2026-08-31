@@ -13,22 +13,30 @@
  * reinvite response) — there's no "view the link again" for an already-issued invite, only
  * "Regenerate link" (`POST /api/users/:id/reinvite`), which rotates the token and returns a fresh
  * one-time link.
+ *
+ * Project access (`server/src/lib/projectaccess.ts`) is chosen at invite time and editable
+ * afterwards per row. It is a MEMBER-only control: an admin reaches every project by role, so the
+ * picker is replaced with a plain "All projects" label for them rather than offering a selection the
+ * server would just normalize away.
  */
 import { type FormEvent, type ReactNode, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, RefreshCw, Shield, UserPlus, Users as UsersIcon } from 'lucide-react';
+import { Check, Copy, FolderGit2, Globe, RefreshCw, Shield, UserPlus, Users as UsersIcon } from 'lucide-react';
 import {
   ApiError,
   changeUserRole,
   deleteUser,
   inviteUser,
   reinviteUser,
+  setUserProjects,
   type InvitableRole,
   type InviteResult,
+  type ProjectAccessMode,
+  type ProjectListItem,
   type User,
 } from '../../api';
-import { useIsOwner, useMe, useUsers } from '../../hooks';
-import { Avatar, Button, Card, CardHeader, Field, ICON_STROKE, Input, Select, Skeleton } from '../../components/ui';
+import { useIsOwner, useMe, useProjects, useUsers } from '../../hooks';
+import { Avatar, Button, Card, CardHeader, Checkbox, Field, ICON_STROKE, Input, ReadOnlyNotice, Select, Skeleton } from '../../components/ui';
 import { formatRelativeTime } from '../../lib/format';
 
 function errorMessage(err: unknown, fallback: string): string {
@@ -45,7 +53,14 @@ export default function TeamSection() {
 
   return (
     <div className="flex flex-col gap-5">
-      {canManage && <InviteCard />}
+      {canManage ? (
+        <InviteCard />
+      ) : (
+        // The roster below stays visible — who you work with is not a secret — but the invite card
+        // and every per-row control are already hidden for a member, so this is what explains the
+        // absence instead of leaving it looking like a page that failed to finish loading.
+        <ReadOnlyNotice can="invite or manage members" />
+      )}
 
       {usersQuery.isPending ? (
         <Card>
@@ -85,8 +100,11 @@ export default function TeamSection() {
 function InviteCard() {
   const queryClient = useQueryClient();
   const isOwner = useIsOwner();
+  const projectsQuery = useProjects();
   const [email, setEmail] = useState('');
   const [role, setRole] = useState<InvitableRole>('member');
+  const [access, setAccess] = useState<ProjectAccessMode>('all');
+  const [projectIds, setProjectIds] = useState<number[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<InviteResult | null>(null);
@@ -95,6 +113,8 @@ function InviteCard() {
     setResult(null);
     setEmail('');
     setRole('member');
+    setAccess('all');
+    setProjectIds([]);
     setError(null);
   }
 
@@ -103,7 +123,12 @@ function InviteCard() {
     setSubmitting(true);
     setError(null);
     try {
-      const created = await inviteUser({ email, role });
+      // An admin invite never carries a selection — the server pins them to every project anyway,
+      // and sending one would only make the confirmation below disagree with reality.
+      const created =
+        role === 'admin'
+          ? await inviteUser({ email, role })
+          : await inviteUser({ email, role, projectAccess: access, projectIds: access === 'selected' ? projectIds : [] });
       await queryClient.invalidateQueries({ queryKey: ['users'] });
       setResult(created);
     } catch (err) {
@@ -120,6 +145,9 @@ function InviteCard() {
         {result ? (
           <div className="max-w-[560px]">
             <p className="text-sm text-ink">{result.emailed ? `Invite emailed to ${result.email}.` : `Invite sent to ${result.email}.`}</p>
+            <p className="mt-1 text-[13px] text-soft">
+              Access: {describeAccess(result.projectAccess, result.projectIds, projectsQuery.data)}
+            </p>
             <div className="mt-2">
               <CopyLinkRow inviteUrl={result.inviteUrl} />
             </div>
@@ -158,6 +186,21 @@ function InviteCard() {
               />
             </div>
 
+            {role === 'admin' ? (
+              <p className="text-[13px] text-soft">Admins can reach every project, including ones created later.</p>
+            ) : (
+              <ProjectAccessPicker
+                idPrefix="invite"
+                projects={projectsQuery.data}
+                loading={projectsQuery.isPending}
+                mode={access}
+                projectIds={projectIds}
+                onModeChange={setAccess}
+                onProjectIdsChange={setProjectIds}
+                disabled={submitting}
+              />
+            )}
+
             {error && (
               <p role="alert" className="text-sm text-danger">
                 {error}
@@ -179,6 +222,146 @@ function InviteCard() {
   );
 }
 
+/**
+ * One-line description of a user's project access, for the row summaries and the post-invite
+ * confirmation. Names the projects while there are few enough to read at a glance, and falls back
+ * to a count past that — a member on twelve projects is better served by "12 projects" than by a
+ * wrapped list. `projects` may be undefined while the list is still loading, in which case only the
+ * count is known.
+ */
+function describeAccess(mode: ProjectAccessMode, projectIds: number[], projects: ProjectListItem[] | undefined): string {
+  if (mode === 'all') return 'All projects';
+  if (projectIds.length === 0) return 'No projects';
+
+  const MAX_NAMED = 3;
+  const names = projects
+    ? projectIds.map((id) => projects.find((project) => project.id === id)?.name).filter((name): name is string => name !== undefined)
+    : [];
+
+  const plural = `${String(projectIds.length)} project${projectIds.length === 1 ? '' : 's'}`;
+  if (names.length !== projectIds.length || names.length > MAX_NAMED) return plural;
+  return names.join(', ');
+}
+
+/**
+ * The "which projects" control, shared by the invite form and each row's inline access editor: an
+ * All/Selected radio pair over a checkbox list of every project.
+ *
+ * `idPrefix` namespaces the radio group's `name`, since several of these can be mounted at once
+ * (the invite card plus any number of open row editors) and same-named radios in one document form
+ * a single group — without it, choosing "Selected" in one row would clear the choice in another.
+ *
+ * A `'selected'` scope with nothing checked is a legitimate, submittable state ("no projects yet"),
+ * not an error — the server accepts it, and it's how you park an invite before deciding.
+ */
+function ProjectAccessPicker({
+  idPrefix,
+  projects,
+  loading,
+  mode,
+  projectIds,
+  onModeChange,
+  onProjectIdsChange,
+  disabled,
+}: {
+  idPrefix: string;
+  projects: ProjectListItem[] | undefined;
+  loading: boolean;
+  mode: ProjectAccessMode;
+  projectIds: number[];
+  onModeChange: (mode: ProjectAccessMode) => void;
+  onProjectIdsChange: (projectIds: number[]) => void;
+  disabled?: boolean;
+}) {
+  const all = projects ?? [];
+
+  function toggle(id: number, checked: boolean) {
+    onProjectIdsChange(checked ? [...projectIds, id] : projectIds.filter((existing) => existing !== id));
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <div role="radiogroup" aria-label="Project access" className="flex flex-col gap-3 sm:flex-row">
+        <RoleCard
+          name={`${idPrefix}-access`}
+          icon={<Globe size={18} strokeWidth={ICON_STROKE} />}
+          label="All projects"
+          description="Including any project created later."
+          selected={mode === 'all'}
+          disabled={disabled}
+          onSelect={() => onModeChange('all')}
+        />
+        <RoleCard
+          name={`${idPrefix}-access`}
+          icon={<FolderGit2 size={18} strokeWidth={ICON_STROKE} />}
+          label="Specific projects"
+          description="Only the projects you pick below."
+          selected={mode === 'selected'}
+          disabled={disabled}
+          onSelect={() => onModeChange('selected')}
+        />
+      </div>
+
+      {mode === 'selected' &&
+        (loading ? (
+          <div className="flex flex-col gap-2 rounded-xl border border-line p-3">
+            <Skeleton className="h-4 w-40" />
+            <Skeleton className="h-4 w-32" />
+          </div>
+        ) : all.length === 0 ? (
+          <p className="rounded-xl bg-surface-2 px-4 py-3 text-[13px] text-soft">
+            There are no projects yet. You can grant access once one exists.
+          </p>
+        ) : (
+          <div className="rounded-xl border border-line">
+            <div className="flex items-center justify-between border-b border-line px-3 py-2">
+              <span className="text-[13px] text-soft">
+                {String(projectIds.length)} of {String(all.length)} selected
+              </span>
+              <div className="flex items-center gap-3">
+                <PickerAction
+                  label="Select all"
+                  disabled={disabled === true || projectIds.length === all.length}
+                  onClick={() => onProjectIdsChange(all.map((project) => project.id))}
+                />
+                <PickerAction label="Clear" disabled={disabled === true || projectIds.length === 0} onClick={() => onProjectIdsChange([])} />
+              </div>
+            </div>
+            <div className="flex max-h-56 flex-col gap-2.5 overflow-y-auto p-3">
+              {all.map((project) => (
+                <Checkbox
+                  key={project.id}
+                  checked={projectIds.includes(project.id)}
+                  disabled={disabled}
+                  onChange={(checked) => toggle(project.id, checked)}
+                  label={
+                    <span className="flex min-w-0 items-baseline gap-2">
+                      <span className="truncate text-sm text-ink">{project.name}</span>
+                      <span className="truncate font-mono text-xs text-soft">{project.slug}</span>
+                    </span>
+                  }
+                />
+              ))}
+            </div>
+          </div>
+        ))}
+    </div>
+  );
+}
+
+function PickerAction({ label, disabled, onClick }: { label: string; disabled?: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={disabled}
+      className="text-[13px] font-medium text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus disabled:cursor-not-allowed disabled:opacity-45 disabled:hover:text-soft"
+    >
+      {label}
+    </button>
+  );
+}
+
 function RoleCard({
   icon,
   label,
@@ -186,6 +369,7 @@ function RoleCard({
   selected,
   disabled,
   title,
+  name = 'invite-role',
   onSelect,
 }: {
   icon: ReactNode;
@@ -194,6 +378,9 @@ function RoleCard({
   selected: boolean;
   disabled?: boolean;
   title?: string;
+  /** The radio group this card belongs to. Defaults to the invite form's role group; every other
+   * group must pass a distinct one, or same-named radios across the page merge into one group. */
+  name?: string;
   onSelect: () => void;
 }) {
   return (
@@ -203,7 +390,7 @@ function RoleCard({
         disabled ? 'cursor-not-allowed opacity-45' : 'cursor-pointer'
       } ${selected && !disabled ? 'border-focus bg-surface-2' : 'border-line bg-surface hover:bg-surface-2'}`}
     >
-      <input type="radio" name="invite-role" checked={selected} disabled={disabled} onChange={onSelect} className="sr-only" />
+      <input type="radio" name={name} checked={selected} disabled={disabled} onChange={onSelect} className="sr-only" />
       <span aria-hidden className="mt-0.5 shrink-0 text-icon">
         {icon}
       </span>
@@ -276,6 +463,93 @@ function InviteEmailHint({ result }: { result: InviteResult }) {
   );
 }
 
+/**
+ * A row's project-access line: the current scope as text, plus (for a member, when the viewer can
+ * manage the team) a toggle that opens the same picker the invite form uses and saves it with
+ * `PUT /api/users/:id/projects`.
+ *
+ * Draft state is seeded from the user row each time the editor is OPENED, not held across closes,
+ * so cancelling really does discard and re-opening always starts from what the server currently
+ * says. Admins and the owner get the text only — they reach every project by role, so there is
+ * nothing here to edit.
+ */
+function MemberAccessLine({ user, canManage }: { user: User; canManage: boolean }) {
+  const queryClient = useQueryClient();
+  const projectsQuery = useProjects();
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<ProjectAccessMode>(user.projectAccess);
+  const [projectIds, setProjectIds] = useState<number[]>(user.projectIds);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const editable = canManage && user.role === 'member';
+
+  function openEditor() {
+    setMode(user.projectAccess);
+    setProjectIds(user.projectIds);
+    setError(null);
+    setOpen(true);
+  }
+
+  async function handleSave() {
+    setError(null);
+    setSaving(true);
+    try {
+      await setUserProjects(user.id, mode, mode === 'selected' ? projectIds : []);
+      await queryClient.invalidateQueries({ queryKey: ['users'] });
+      setOpen(false);
+    } catch (err) {
+      setError(errorMessage(err, 'Could not update project access. Try again.'));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="mb-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="inline-flex items-center gap-1.5 text-[13px] text-soft">
+          <FolderGit2 size={14} strokeWidth={ICON_STROKE} aria-hidden />
+          {describeAccess(user.projectAccess, user.projectIds, projectsQuery.data)}
+        </span>
+        {editable && !open && (
+          <PickerAction label="Change" onClick={openEditor} />
+        )}
+      </div>
+
+      {open && (
+        <div className="mt-3 max-w-[560px] rounded-xl bg-surface-2 p-3">
+          <ProjectAccessPicker
+            idPrefix={`user-${String(user.id)}`}
+            projects={projectsQuery.data}
+            loading={projectsQuery.isPending}
+            mode={mode}
+            projectIds={projectIds}
+            onModeChange={setMode}
+            onProjectIdsChange={setProjectIds}
+            disabled={saving}
+          />
+
+          {error && (
+            <p role="alert" className="mt-2 text-sm text-danger">
+              {error}
+            </p>
+          )}
+
+          <div className="mt-3 flex items-center gap-2">
+            <Button size="sm" loading={saving} onClick={() => void handleSave()}>
+              Save access
+            </Button>
+            <Button size="sm" variant="outline" onClick={() => setOpen(false)} disabled={saving}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function PendingInviteRow({ user, canManage }: { user: User; canManage: boolean }) {
   const queryClient = useQueryClient();
   const [regenerated, setRegenerated] = useState<InviteResult | null>(null);
@@ -335,6 +609,8 @@ function PendingInviteRow({ user, canManage }: { user: User; canManage: boolean 
           </div>
         )}
       </div>
+
+      <MemberAccessLine user={user} canManage={canManage} />
 
       {regenerated && (
         <div className="mb-3 max-w-[560px] rounded-xl bg-surface-2 p-3">
@@ -444,6 +720,8 @@ function ActiveMemberRow({ user, isSelf, canManage }: { user: User; isSelf: bool
           <span className="shrink-0 text-xs font-semibold tracking-wide text-soft uppercase">{user.role}</span>
         )}
       </div>
+
+      <MemberAccessLine user={user} canManage={canManage} />
 
       {error && (
         <p role="alert" className="mb-2 text-sm text-danger">

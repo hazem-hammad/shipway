@@ -64,6 +64,37 @@ readonly SHIPWAY_DIR=/opt/shipway
 readonly NODE_VERSIONS=(18 20 22)
 readonly PHP_VERSIONS=(8.1 8.2 8.3 8.4)
 readonly PHP_EXTENSIONS=(fpm cli mysql pgsql sqlite3 redis mbstring xml curl zip gd bcmath intl)
+# phpMyAdmin, served at ship.<base-domain>/db/phpmyadmin. Checksum is the one phpmyadmin.net
+# publishes alongside the tarball, verified before anything is extracted.
+#
+# NOTE the PHP ceiling: 5.2.3 declares php_versions ">=7.2,<8.4", so this must run on the 8.3 FPM
+# socket. Pointing it at 8.4 (also installed on this box) is not merely unsupported — phpMyAdmin
+# refuses to start on an untested major.
+readonly PMA_VERSION=5.2.3
+readonly PMA_SHA256=03de2640bb25c9a6f96bc94eae316080b5fd5bd58d769e1318ba9dd94c83364c
+readonly PMA_PHP_VERSION=8.3
+# pgAdmin 4, served at ship.<base-domain>/db/pgadmin. Installed from PyPI into its own venv rather
+# than from the pgadmin4-web Debian package: that package depends on apache2, which would contend
+# with nginx for ports 80/443 on this box. Version is pinned; pip verifies the wheel's hash against
+# PyPI's index, which is why there is no separate sha256 here as there is for the two PHP tools.
+readonly PGADMIN_VERSION=9.17
+readonly PGADMIN_PORT=5050
+readonly PGADMIN_ADMIN_EMAIL_LOCALPART=admin
+# Flask-Security-Too must be held at 5.8.1. pgAdmin 9.17 declares `Flask-Security-Too==5.8.*`, so
+# pip resolves 5.8.2 — and 5.8.2 inverted the meaning of UserMixin.is_locked():
+#
+#   5.8.1  LoginForm.validate():  if not self.user.is_locked(errors): return False
+#   5.8.2  LoginForm.validate():  if     self.user.is_locked(errors): return False
+#
+# pgAdmin's own User.is_locked() returns True to mean "not locked, proceed" (see its comment in
+# pgadmin/model/__init__.py), which matches 5.8.1. Under 5.8.2 an UNLOCKED account is read as
+# locked, so validate() fails for everyone — and it fails *silently*, because pgAdmin only appends
+# the "account is locked" message on its other branch. The visible symptom is a correct password
+# bouncing straight back to the login page with no error at all, which looks exactly like a broken
+# session. Verified by tracing flask_security/forms.py to the failing line.
+#
+# Drop this pin only after confirming pgAdmin's is_locked() convention matches the release.
+readonly PGADMIN_FLASK_SECURITY_VERSION=5.8.1
 
 log() {
   echo "install.sh: $*"
@@ -242,7 +273,7 @@ install_base_packages() {
 
   log "installing base packages"
   apt-get install -y \
-    nginx git curl acl unzip \
+    nginx git curl acl unzip build-essential \
     software-properties-common rsync jq ca-certificates cron
 
   # Ubuntu's `cron` package normally enables and starts itself on install via its postinst script,
@@ -473,6 +504,225 @@ configure_mailpit_auth() {
   chmod 0644 "$htpasswd_file"
 }
 
+# Extracts phpMyAdmin to /opt/phpmyadmin and writes its config. Served under a path on the
+# dashboard vhost (ship.<base-domain>/db/phpmyadmin), gated by the Shipway session — see the
+# auth_request block in templates/nginx-dashboard.conf — so it has no login of its own to guard and
+# no basic-auth prompt in front of it.
+#
+# Idempotent via a version stamp: an existing install of the same version is left alone rather than
+# re-extracted, so a re-run never disturbs a working console.
+install_phpmyadmin() {
+  local dest=/opt/phpmyadmin
+  local stamp="${dest}/.shipway-version"
+
+  if [[ -f "$stamp" ]] && [[ "$(cat "$stamp")" == "$PMA_VERSION" ]]; then
+    log "phpMyAdmin ${PMA_VERSION} already installed, skipping"
+    # The config is still rewritten: it is where the signon server entry lives, and an install that
+    # predates a change to it would otherwise keep the old one forever.
+    configure_phpmyadmin
+    return
+  fi
+
+  log "installing phpMyAdmin ${PMA_VERSION}"
+  local tmp tarball
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" RETURN
+  tarball="${tmp}/pma.tar.gz"
+
+  curl -fsSL --retry 3 -o "$tarball" \
+    "https://files.phpmyadmin.net/phpMyAdmin/${PMA_VERSION}/phpMyAdmin-${PMA_VERSION}-english.tar.gz" \
+    || die "failed to download phpMyAdmin ${PMA_VERSION}"
+  echo "${PMA_SHA256}  ${tarball}" | sha256sum --check --status \
+    || die "phpMyAdmin checksum mismatch: expected ${PMA_SHA256}, got $(sha256sum "$tarball" | cut -d' ' -f1). Refusing to extract PHP that will run with database access."
+
+  tar -xzf "$tarball" -C "$tmp"
+  rm -rf "$dest"
+  mv "${tmp}/phpMyAdmin-${PMA_VERSION}-english" "$dest"
+  chown -R root:root "$dest"
+  # www-data only ever reads the application itself; the one writable path is TempDir below.
+  find "$dest" -type d -exec chmod 0755 {} +
+  find "$dest" -type f -exec chmod 0644 {} +
+
+  # Templates are compiled at runtime, and TempDir is the only place phpMyAdmin needs to write.
+  install -d -m 0750 -o www-data -g www-data /var/lib/phpmyadmin/tmp
+
+  configure_phpmyadmin
+  echo "$PMA_VERSION" > "$stamp"
+}
+
+# Writes /opt/phpmyadmin/config.inc.php. The blowfish secret encrypts the cookie holding the
+# database password in the browser, so it is generated once and cached like every other secret —
+# rotating it on a re-run would silently invalidate every open session.
+configure_phpmyadmin() {
+  local secret
+  secret="$(get_or_create_secret PMA_BLOWFISH_SECRET)"
+
+  log "writing phpMyAdmin config.inc.php"
+  cat > /opt/phpmyadmin/config.inc.php <<PMACONF
+<?php
+// Written by setup/install.sh — edits here are overwritten on the next install.
+\$cfg['blowfish_secret'] = '${secret}';
+
+// Two entries for the same server, differing only in how you get in.
+//
+// 1 is signon: credentials arrive in a PHP session written by /db/signon.php (setup/db-signon.php),
+// which is where the dashboard's Manage button points. That is what makes the button land inside a
+// database instead of on a login form. There is no form to fall back to on this entry — phpMyAdmin
+// sends anyone who arrives without a signon session to SignonURL, the Databases page.
+//
+// 2 is the ordinary cookie login, and is the default, so opening the console directly behaves
+// exactly as it did before signon existed: a form, any MySQL account, that account's own grants.
+\$i = 0;
+\$i++;
+// 127.0.0.1 rather than 'localhost': a TCP connection is what Shipway's own connection strings use
+// (see server/src/services/dbprovision.ts), so grants that work for a project also work here.
+\$cfg['Servers'][\$i]['host'] = '127.0.0.1';
+\$cfg['Servers'][\$i]['port'] = 3306;
+\$cfg['Servers'][\$i]['verbose'] = 'Shipway (signed in)';
+\$cfg['Servers'][\$i]['auth_type'] = 'signon';
+// Must match SIGNON_SESSION and SIGNON_COOKIE_PARAMS in setup/db-signon.php, or phpMyAdmin opens a
+// different session than the shim wrote and finds no credentials in it.
+\$cfg['Servers'][\$i]['SignonSession'] = 'ShipwaySignon';
+\$cfg['Servers'][\$i]['SignonCookieParams'] = ['path' => '/db/', 'secure' => true, 'httponly' => true, 'samesite' => 'Lax'];
+\$cfg['Servers'][\$i]['SignonURL'] = 'https://ship.${BASE_DOMAIN}/databases';
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
+\$cfg['Servers'][\$i]['AllowRoot'] = false;
+
+\$i++;
+\$cfg['Servers'][\$i]['host'] = '127.0.0.1';
+\$cfg['Servers'][\$i]['port'] = 3306;
+\$cfg['Servers'][\$i]['verbose'] = 'MySQL on this server';
+\$cfg['Servers'][\$i]['auth_type'] = 'cookie';
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
+// No root/passwordless shortcut: whoever opens this supplies a database account, so what they can
+// reach is bounded by that account's own grants.
+\$cfg['Servers'][\$i]['AllowRoot'] = false;
+\$cfg['ServerDefault'] = \$i;
+
+\$cfg['TempDir'] = '/var/lib/phpmyadmin/tmp';
+// Served under a path, not at a host root — phpMyAdmin needs to know its own base URL to build
+// redirects correctly behind the reverse proxy.
+\$cfg['PmaAbsoluteUri'] = 'https://ship.${BASE_DOMAIN}/db/phpmyadmin/';
+PMACONF
+
+  chown root:root /opt/phpmyadmin/config.inc.php
+  # Readable by the FPM worker, not by other local users: it carries the blowfish secret.
+  chmod 0640 /opt/phpmyadmin/config.inc.php
+  chgrp www-data /opt/phpmyadmin/config.inc.php
+}
+
+# Installs the signon shim served at ship.<base-domain>/db/signon.php — the target of the
+# dashboard's Manage button on a MySQL database, which trades that database's id for a phpMyAdmin
+# session already connected to it. Kept in its own directory rather than inside /opt/phpmyadmin so
+# the nginx rule for it cannot reach anything else, and so a phpMyAdmin upgrade (which replaces that
+# directory wholesale) never deletes it.
+install_db_signon() {
+  log "installing the database signon shim at /opt/shipway-db-signon"
+  install -d -m 0755 -o root -g root /opt/shipway-db-signon
+  install -m 0644 -o root -g root "${SCRIPT_DIR}/db-signon.php" /opt/shipway-db-signon/signon.php
+}
+
+PGADMIN_ADMIN_PASSWORD=""
+PGADMIN_ADMIN_EMAIL=""
+
+# Installs pgAdmin 4 into a self-contained venv, initialises its config database with one
+# Administrator account, and runs it under gunicorn as pgadmin.service. Reachability is gated by
+# nginx's auth_request against the Shipway session (see templates/nginx-dashboard.conf), and
+# pgAdmin's own login sits behind that.
+#
+# Runs as its own `pgadmin` system user, not www-data: its SQLite database holds any connection
+# passwords a user chooses to save, and a php-fpm compromise should not be able to read them.
+install_pgadmin() {
+  PGADMIN_ADMIN_EMAIL="${PGADMIN_ADMIN_EMAIL_LOCALPART}@${BASE_DOMAIN}"
+  PGADMIN_ADMIN_PASSWORD="$(get_or_create_secret PGADMIN_ADMIN_PASSWORD)"
+
+  local venv=/opt/pgadmin/venv
+  local pkg
+
+  if [[ ! -x "${venv}/bin/python" ]]; then
+    log "creating pgAdmin venv"
+    apt-get install -y python3-venv python3-dev
+    install -d -m 0755 -o root -g root /opt/pgadmin
+    python3 -m venv "$venv"
+    "${venv}/bin/pip" install --quiet --upgrade pip wheel
+  fi
+
+  # `gevent` is not a pgAdmin dependency but is required by the worker class the service uses:
+  # pgAdmin's query tool and ERD talk over SocketIO, which the default sync worker cannot serve.
+  if ! "${venv}/bin/pip" show "pgadmin4" >/dev/null 2>&1 \
+    || [[ "$("${venv}/bin/pip" show pgadmin4 2>/dev/null | awk '/^Version:/{print $2}')" != "$PGADMIN_VERSION" ]]; then
+    log "installing pgAdmin ${PGADMIN_VERSION} (large — a few minutes)"
+    "${venv}/bin/pip" install --quiet "pgadmin4==${PGADMIN_VERSION}" gunicorn gevent \
+      || die "pip failed to install pgadmin4==${PGADMIN_VERSION}"
+  else
+    log "pgAdmin ${PGADMIN_VERSION} already installed, skipping"
+  fi
+
+  # Applied on every run, not just a fresh install: pgAdmin's own dependency range lets pip pull the
+  # incompatible 5.8.2 on any later reinstall or upgrade. See the note on
+  # PGADMIN_FLASK_SECURITY_VERSION above for what breaks.
+  local fs_installed
+  fs_installed="$("${venv}/bin/pip" show flask-security-too 2>/dev/null | awk '/^Version:/{print $2}')"
+  if [[ "$fs_installed" != "$PGADMIN_FLASK_SECURITY_VERSION" ]]; then
+    log "pinning Flask-Security-Too to ${PGADMIN_FLASK_SECURITY_VERSION} (found ${fs_installed:-none}; 5.8.2 breaks pgAdmin login)"
+    "${venv}/bin/pip" install --quiet "Flask-Security-Too==${PGADMIN_FLASK_SECURITY_VERSION}" \
+      || die "failed to pin Flask-Security-Too==${PGADMIN_FLASK_SECURITY_VERSION}; pgAdmin login would silently reject every password."
+  fi
+
+  # Ask the venv's own interpreter where site-packages is, so this does not break on a different
+  # python minor version than the one that happened to be current when this was written.
+  pkg="$("${venv}/bin/python" -c 'import os, sysconfig; print(os.path.join(sysconfig.get_paths()["purelib"], "pgadmin4"))')"
+  [[ -f "${pkg}/pgAdmin4.py" ]] || die "pgAdmin install looks wrong: ${pkg}/pgAdmin4.py not found"
+
+  if ! id -u pgadmin >/dev/null 2>&1; then
+    log "creating pgadmin system user"
+    useradd --system --home-dir /var/lib/pgadmin --shell /usr/sbin/nologin pgadmin
+  fi
+  install -d -m 0700 -o pgadmin -g pgadmin /var/lib/pgadmin
+  install -d -m 0750 -o pgadmin -g pgadmin /var/log/pgadmin
+
+  install -m 0644 -o root -g root "${SCRIPT_DIR}/pgadmin-config-local.py" "${pkg}/config_local.py"
+
+  # setup-db is idempotent-ish but only creates the first user when the database does not exist;
+  # skipping it on an existing database is what keeps a re-run from touching live accounts.
+  if [[ ! -f /var/lib/pgadmin/pgadmin4.db ]]; then
+    log "initialising pgAdmin config database (admin: ${PGADMIN_ADMIN_EMAIL})"
+    ( cd "$pkg" && PGADMIN_SETUP_EMAIL="$PGADMIN_ADMIN_EMAIL" PGADMIN_SETUP_PASSWORD="$PGADMIN_ADMIN_PASSWORD" \
+      sudo -u pgadmin -E "${venv}/bin/python" setup.py setup-db ) \
+      || die "pgAdmin setup-db failed"
+  else
+    log "pgAdmin config database already exists, skipping setup-db"
+  fi
+
+  # Set the password explicitly, every run, and verify it. setup-db's
+  # PGADMIN_SETUP_PASSWORD and `setup.py update-user --password` both reported success on 9.17
+  # while leaving the stored hash unchanged, producing an account whose password nobody knew —
+  # and pgAdmin's login view fails that case with a bare redirect back to the login form, no
+  # message, so it looks like a broken session rather than a bad credential. This script hashes
+  # through Flask-Security (which peppers with SECURITY_PASSWORD_SALT, so it cannot be done
+  # outside the app context) and re-reads the row to confirm before returning.
+  # Copied out of the checkout first: the checkout normally lives under /root, which the pgadmin
+  # user cannot read. The password goes over stdin, not argv, so it never shows up in ps.
+  install -m 0755 -o root -g root "${SCRIPT_DIR}/pgadmin-set-password.py" /opt/pgadmin/set-password.py
+  # The server-sync script the root helper runs (shipway-sysops pgadmin-sync) whenever Shipway
+  # creates or drops a Postgres database. Same reason it is copied out of the checkout: /root is
+  # unreadable to the pgadmin user that ends up executing it.
+  install -m 0755 -o root -g root "${SCRIPT_DIR}/pgadmin-sync-servers.py" /opt/pgadmin/sync-servers.py
+  log "setting pgAdmin admin password for ${PGADMIN_ADMIN_EMAIL}"
+  ( cd "$pkg" && printf '%s\n' "$PGADMIN_ADMIN_PASSWORD" \
+      | sudo -u pgadmin "${venv}/bin/python" /opt/pgadmin/set-password.py "$PGADMIN_ADMIN_EMAIL" >/dev/null ) \
+    || die "failed to set the pgAdmin admin password — the account would be unusable, so stopping here rather than finishing with a console nobody can log into."
+
+  log "installing pgadmin.service"
+  sed "s|\${PGADMIN_DIR}|${pkg}|g; s|127.0.0.1:5050|127.0.0.1:${PGADMIN_PORT}|g" \
+    "${SCRIPT_DIR}/pgadmin.service" > /etc/systemd/system/pgadmin.service
+  chmod 0644 /etc/systemd/system/pgadmin.service
+  systemctl daemon-reload
+  systemctl enable pgadmin
+  systemctl restart pgadmin
+}
+
 # ---------------------------------------------------------------------------
 # 5. certbot
 # ---------------------------------------------------------------------------
@@ -494,9 +744,21 @@ create_deployer_user() {
     useradd --system --create-home --home-dir "$DEPLOYER_HOME" --shell /bin/bash deployer
   fi
 
-  install -d -m 0750 -o deployer -g deployer /var/deploy/apps
+  install -d -m 0751 -o deployer -g deployer /var/deploy/apps
   install -d -m 0750 -o deployer -g deployer /var/deploy/logs
   install -d -m 0750 -o deployer -g deployer /var/lib/shipway
+
+  # Per-project basic-auth files (auth_basic_user_file) live here — root-owned, written only via
+  # shipway-sysops' whitelist. 0755 so nginx's worker can read a file it is pointed at.
+  install -d -m 0755 -o root -g root /etc/nginx/shipway-auth
+
+  # nginx runs as www-data and has to traverse $DEPLOYER_HOME and apps/ to serve a project's
+  # files, which sit at 0755 under apps/<slug>/releases/. 0750 on either directory makes every
+  # static vhost fail with "stat() failed (13: Permission denied)" no matter how the release
+  # itself is permissioned. 0751 is traverse-but-not-list: www-data can walk a path it already
+  # knows from the vhost's `root`, but cannot enumerate these directories, and logs/ plus
+  # /var/lib/shipway (secret.key, the SQLite database) stay 0750 — unreadable by www-data.
+  chmod 0751 "$DEPLOYER_HOME" /var/deploy/apps
 
   # deployer needs to read the systemd journal (no sudo) for `journalctl -u`
   # log tailing (see server/src/sysops/real.ts's journalTail).
@@ -974,6 +1236,14 @@ postflight() {
   echo " Deployed apps:  /var/deploy/apps/<slug>"
   echo " Deploy logs:    /var/deploy/logs/<slug>/<deployment-id>.log"
   echo " Mailpit web UI: https://mail.${BASE_DOMAIN}  (user: intcore, password: ${MAILPIT_WEB_PASSWORD})"
+  echo " MySQL console:  https://ship.${BASE_DOMAIN}/db/phpmyadmin/"
+  echo "                 phpMyAdmin ${PMA_VERSION} on PHP ${PMA_PHP_VERSION}. No login of its own:"
+  echo "                 nginx only lets a logged-in Shipway user through, then you supply a"
+  echo "                 database account (Databases > Credentials reveals one)."
+  echo " PG console:     https://ship.${BASE_DOMAIN}/db/pgadmin/"
+  echo "                 pgAdmin ${PGADMIN_VERSION} (pgadmin.service). Same Shipway-session gate,"
+  echo "                 then pgAdmin's own login:"
+  echo "                 ${PGADMIN_ADMIN_EMAIL} / ${PGADMIN_ADMIN_PASSWORD}"
   echo "==============================================================="
 
   if [[ "$core_ok" != "1" ]]; then
@@ -985,8 +1255,41 @@ postflight() {
 # main
 # ---------------------------------------------------------------------------
 
+# Reapplies just the database-console wiring on a host that is already installed: phpMyAdmin's
+# config (which is where the signon server entry lives), the signon shim, pgAdmin's config and its
+# server-sync script, the root helper, and the dashboard vhost that ties them together. Everything
+# it calls is idempotent and already runs on a normal install; this is the way to pick up a change
+# to one of them without re-running apt, certbot and DNS. Needs the base domain and nothing else.
+consoles_only() {
+  BASE_DOMAIN="${SHIPWAY_BASE_DOMAIN:-}"
+  if [[ -z "$BASE_DOMAIN" ]]; then
+    read -r -p "Base domain (e.g. intcore.dev): " BASE_DOMAIN
+  fi
+  [[ -n "$BASE_DOMAIN" ]] || die "a base domain is required"
+
+  install_phpmyadmin
+  install_db_signon
+  install_pgadmin
+  install_sysops_helper
+  install_vhosts
+
+  log "database consoles reapplied for ship.${BASE_DOMAIN}"
+}
+
 main() {
   check_root
+
+  # A targeted re-run for an already-installed host. Deliberately before preflight: none of the
+  # checks there (ports, DNS, the Cloudflare token) have anything to say about rewriting config on
+  # a host that is already serving.
+  if [[ "${1:-}" == "--consoles-only" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    touch "$SECRETS_FILE"
+    chmod 0600 "$SECRETS_FILE"
+    consoles_only
+    return
+  fi
+
   preflight
   export DEBIAN_FRONTEND=noninteractive
 
@@ -1006,6 +1309,10 @@ main() {
   install_mailpit_binary
   install_mailpit_unit
   configure_mailpit_auth
+
+  install_phpmyadmin
+  install_db_signon
+  install_pgadmin
 
   install_certbot
 

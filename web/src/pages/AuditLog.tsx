@@ -4,6 +4,20 @@
  * pagination ("Load more"). Right rail: admin-gated recording toggle + retention window
  * (`GET`/`PUT /api/audit/config`).
  *
+ * Presented as a timeline grouped by day rather than a flat list, because the questions this page
+ * gets asked are temporal — "what happened on Tuesday", "what changed just before it broke" — and a
+ * flat run of "3 days ago" rows cannot answer either. Each day is its own heading; each entry
+ * carries the wall-clock time it happened at, with the exact timestamp to the second on hover.
+ *
+ * Colour is spent on one thing only, per DESIGN.md's grayscale-first rule: destructive and
+ * security-relevant actions (drops, deletes, cancels, rollbacks, failed sign-ins) get a danger-toned
+ * chip. Everything else is neutral. An audit log that tints every category equally is decorative;
+ * one that marks the entries worth a second look is doing its job.
+ *
+ * Filters live in the query string, so a narrowed view ("failed sign-ins, last 24 hours") is a link
+ * that can be sent to someone else and survives a reload — the same contract the Projects and
+ * Deployments lists use.
+ *
  * `ACTION_SENTENCES` below has one entry per action string any `recordAudit` call site in the server
  * currently emits (see `server/src/routes/audit.ts`'s own module doc comment for the authoritative
  * namespace list this must stay in sync with). An action introduced later without an entry here still
@@ -11,6 +25,7 @@
  * read as a proper sentence until this map is extended.
  */
 import { type ComponentType, useEffect, useMemo, useState } from 'react';
+import { useLocation, useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import {
   Activity,
@@ -27,8 +42,27 @@ import {
 } from 'lucide-react';
 import { ApiError, fetchAudit, putAuditConfig, type AuditCategory, type AuditConfig, type AuditEvent } from '../api';
 import { useAuditConfig, useIsAdmin, useUsers } from '../hooks';
-import { Button, Card, CardHeader, Chip, EmptyState, ICON_STROKE, IconChip, Input, PageHeader, PageWithRail, Select, Skeleton, Tabs, Toggle } from '../components/ui';
-import { formatRelativeTime } from '../lib/format';
+import {
+  Avatar,
+  Button,
+  Card,
+  CardHeader,
+  Chip,
+  EmptyState,
+  ICON_STROKE,
+  IconChip,
+  Input,
+  PageHeader,
+  PageWithRail,
+  ReadOnlyNotice,
+  SectionLabel,
+  Select,
+  Skeleton,
+  Tabs,
+  Toggle,
+  type IconChipTone,
+} from '../components/ui';
+import { dayKey, formatDayHeading, formatTimeOfDay, formatTimestamp } from '../lib/format';
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
@@ -82,6 +116,41 @@ function iconForAction(action: string): ComponentType<{ size?: number; strokeWid
   return NAMESPACE_ICON[namespace] ?? Activity;
 }
 
+/**
+ * Actions worth a second look: something was destroyed, undone, or someone failed to get in.
+ * Matched on the verb after the last dot rather than by listing every action string, so an action
+ * added to the server later (`worker.delete`, say) is marked without this file being touched —
+ * getting a new destructive action tinted by default is the safe direction to be wrong in.
+ */
+const DESTRUCTIVE_VERBS = new Set(['delete', 'drop', 'cancel', 'rollback', 'remove', 'revoke']);
+
+function isNoteworthy(action: string): boolean {
+  if (action === 'auth.login_failed') return true;
+  const verb = action.split('.').pop() ?? '';
+  return DESTRUCTIVE_VERBS.has(verb);
+}
+
+function toneForAction(action: string): IconChipTone {
+  return isNoteworthy(action) ? 'danger' : 'neutral';
+}
+
+/** Consecutive entries sharing a local calendar day, in the order the server returned them
+ * (newest first). Server order is preserved rather than re-sorted: the cursor pagination below
+ * appends older pages, and re-sorting would fight it. */
+function groupByDay(events: AuditEvent[]): { key: string; heading: string; events: AuditEvent[] }[] {
+  const groups: { key: string; heading: string; events: AuditEvent[] }[] = [];
+  for (const event of events) {
+    const key = dayKey(event.createdAt);
+    const last = groups.at(-1);
+    if (last && last.key === key) {
+      last.events.push(event);
+    } else {
+      groups.push({ key, heading: formatDayHeading(event.createdAt), events: [event] });
+    }
+  }
+  return groups;
+}
+
 // ---------------------------------------------------------------------------
 // "<actor> <humanized action> <target>" sentences.
 // ---------------------------------------------------------------------------
@@ -107,6 +176,7 @@ const ACTION_SENTENCES: Record<string, (row: AuditEvent) => string> = {
   'cron.delete': (row) => `${row.actorName} deleted a cron job on ${metaStr(row.meta, 'project') ?? 'a project'}`,
   'database.create': (row) => `${row.actorName} created database ${row.targetName}`,
   'database.drop': (row) => `${row.actorName} dropped database ${row.targetName}`,
+  'database.import': (row) => `${row.actorName} imported a SQL file into database ${row.targetName}`,
   'database.inject': (row) => `${row.actorName} added database ${row.targetName} to a project's environment`,
   'deploy.trigger': (row) => `${row.actorName} triggered a deploy of ${row.targetName}`,
   'deploy.rollback': (row) => `${row.actorName} rolled back ${row.targetName}`,
@@ -121,6 +191,13 @@ const ACTION_SENTENCES: Record<string, (row: AuditEvent) => string> = {
   'project.create': (row) => `${row.actorName} created project ${row.targetName}`,
   'project.update': (row) => `${row.actorName} updated project ${row.targetName}`,
   'project.scripts.update': (row) => `${row.actorName} updated the deploy scripts for ${row.targetName}`,
+  'project.subdomain.update': (row) => {
+    const from = metaStr(row.meta, 'from');
+    const to = metaStr(row.meta, 'to');
+    return from && to
+      ? `${row.actorName} moved ${row.targetName} from ${from} to ${to}`
+      : `${row.actorName} moved ${row.targetName} to another subdomain`;
+  },
   'project.delete': (row) => `${row.actorName} deleted project ${row.targetName}`,
   'project.env.update': (row) => `${row.actorName} updated the environment variables for ${row.targetName}`,
   'project.smtp.update': (row) => `${row.actorName} updated the email settings for ${row.targetName}`,
@@ -171,12 +248,60 @@ function metaChips(row: AuditEvent): string[] {
 // Page
 // ---------------------------------------------------------------------------
 
+interface Filters {
+  category: AuditCategory;
+  q: string;
+  actorId: string;
+  preset: TimePreset;
+}
+
+const DEFAULT_FILTERS: Filters = { category: 'all', q: '', actorId: '', preset: 'all' };
+
+function isCategory(value: string): value is AuditCategory {
+  return CATEGORY_TABS.some((tab) => tab.id === value);
+}
+
+function isPreset(value: string): value is TimePreset {
+  return TIME_PRESETS.some((preset) => preset.id === value);
+}
+
+function parseFilters(search: string): Filters {
+  const params = new URLSearchParams(search);
+  const category = params.get('category') ?? '';
+  const preset = params.get('since') ?? '';
+  return {
+    category: isCategory(category) ? category : DEFAULT_FILTERS.category,
+    q: params.get('q') ?? '',
+    actorId: params.get('actor') ?? '',
+    preset: isPreset(preset) ? preset : DEFAULT_FILTERS.preset,
+  };
+}
+
+function filtersToSearch(filters: Filters): string {
+  const params = new URLSearchParams();
+  if (filters.category !== DEFAULT_FILTERS.category) params.set('category', filters.category);
+  if (filters.q !== '') params.set('q', filters.q);
+  if (filters.actorId !== '') params.set('actor', filters.actorId);
+  if (filters.preset !== DEFAULT_FILTERS.preset) params.set('since', filters.preset);
+  const query = params.toString();
+  return query === '' ? '' : `?${query}`;
+}
+
+function filtersNarrow(filters: Filters): boolean {
+  return (
+    filters.category !== DEFAULT_FILTERS.category ||
+    filters.q !== DEFAULT_FILTERS.q ||
+    filters.actorId !== DEFAULT_FILTERS.actorId ||
+    filters.preset !== DEFAULT_FILTERS.preset
+  );
+}
+
 export default function AuditLogPage() {
-  const [category, setCategory] = useState<AuditCategory>('all');
-  const [search, setSearch] = useState('');
-  const [debouncedSearch, setDebouncedSearch] = useState('');
-  const [actorId, setActorId] = useState('');
-  const [timePreset, setTimePreset] = useState<TimePreset>('all');
+  const [, navigate] = useLocation();
+  const search = useSearch();
+  const filters = parseFilters(search);
+
+  const [debouncedSearch, setDebouncedSearch] = useState(filters.q);
 
   const [events, setEvents] = useState<AuditEvent[]>([]);
   const [counts, setCounts] = useState<Record<AuditCategory, number>>(EMPTY_COUNTS);
@@ -185,14 +310,29 @@ export default function AuditLogPage() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Debounce the free-text search 300ms before it drives a fetch.
+  function setFilters(next: Partial<Filters>): void {
+    // `replace`, so typing a search doesn't leave one history entry per keystroke behind.
+    navigate(`/audit${filtersToSearch({ ...filters, ...next })}`, { replace: true });
+  }
+
+  // Debounce the free-text search 300ms before it drives a fetch. The URL updates on every
+  // keystroke (it is the input's value); only the request waits.
   useEffect(() => {
-    const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300);
-    return () => clearTimeout(timer);
-  }, [search]);
+    const timer = setTimeout(() => {
+      setDebouncedSearch(filters.q.trim());
+    }, 300);
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [filters.q]);
 
   // Computed once per preset change (not on every render) — a session-scoped "now", not a ticking one.
-  const since = useMemo(() => (timePreset === 'all' ? undefined : Date.now() - PRESET_MS[timePreset]), [timePreset]);
+  const since = useMemo(
+    () => (filters.preset === 'all' ? undefined : Date.now() - PRESET_MS[filters.preset]),
+    [filters.preset],
+  );
+
+  const { category, actorId } = filters;
 
   useEffect(() => {
     let cancelled = false;
@@ -239,54 +379,136 @@ export default function AuditLogPage() {
     }
   }
 
+  const days = useMemo(() => groupByDay(events), [events]);
+
   return (
     <div>
       <PageHeader title="Audit log" subtitle="Everything that happened in this workspace, who did it, and when" />
 
       <PageWithRail rail={<RecordActivityCard />}>
-        <Tabs tabs={CATEGORY_TABS.map((tab) => ({ id: tab.id, label: tab.label, count: counts[tab.id] }))} value={category} onChange={(id) => setCategory(id as AuditCategory)} />
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <Tabs
+            tabs={CATEGORY_TABS.map((tab) => ({ id: tab.id, label: tab.label, count: counts[tab.id] }))}
+            value={filters.category}
+            onChange={(id) => {
+              setFilters({ category: id as AuditCategory });
+            }}
+          />
 
-        <div className="flex flex-wrap items-center gap-3">
-          <span className="relative block min-w-[220px] flex-1">
-            <Search size={16} strokeWidth={ICON_STROKE} aria-hidden className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-icon" />
-            <Input type="search" placeholder="Search" aria-label="Search the audit log" value={search} onChange={(event) => setSearch(event.target.value)} className="pl-10" />
-          </span>
-          <ActorSelect value={actorId} onChange={setActorId} />
-          <Select aria-label="Time range" value={timePreset} onChange={(event) => setTimePreset(event.target.value as TimePreset)} className="w-44">
-            {TIME_PRESETS.map((preset) => (
-              <option key={preset.id} value={preset.id}>
-                {preset.label}
-              </option>
-            ))}
-          </Select>
+          {filtersNarrow(filters) && (
+            <button
+              type="button"
+              onClick={() => {
+                setFilters(DEFAULT_FILTERS);
+              }}
+              className="rounded text-sm font-medium text-link transition-colors duration-150 ease-out hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+            >
+              Clear filters
+            </button>
+          )}
         </div>
 
-        <Card>
-          {loading ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="relative block min-w-[200px] flex-1">
+            <Search
+              size={16}
+              strokeWidth={ICON_STROKE}
+              aria-hidden
+              className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-icon"
+            />
+            <Input
+              type="search"
+              placeholder="Search"
+              aria-label="Search the audit log"
+              value={filters.q}
+              onChange={(event) => {
+                setFilters({ q: event.target.value });
+              }}
+              onKeyDown={(event) => {
+                if (event.key === 'Escape' && filters.q !== '') {
+                  event.preventDefault();
+                  setFilters({ q: '' });
+                }
+              }}
+              className="pl-10"
+            />
+          </span>
+          <div className="w-40 shrink-0">
+            <ActorSelect
+              value={filters.actorId}
+              onChange={(value) => {
+                setFilters({ actorId: value });
+              }}
+            />
+          </div>
+          <div className="w-40 shrink-0">
+            <Select
+              aria-label="Time range"
+              value={filters.preset}
+              onChange={(event) => {
+                setFilters({ preset: event.target.value as TimePreset });
+              }}
+            >
+              {TIME_PRESETS.map((preset) => (
+                <option key={preset.id} value={preset.id}>
+                  {preset.label}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+
+        {loading ? (
+          <Card>
             <AuditSkeletonRows />
-          ) : error ? (
-            <p role="alert" className="text-sm text-danger">
-              {error}
-            </p>
-          ) : events.length === 0 ? (
-            <EmptyState message="Nothing has been recorded yet." />
-          ) : (
-            <>
-              <div className="divide-y divide-line">
-                {events.map((event) => (
-                  <AuditRow key={event.id} event={event} />
-                ))}
+          </Card>
+        ) : error ? (
+          <p role="alert" className="text-sm text-danger">
+            {error}
+          </p>
+        ) : events.length === 0 ? (
+          <EmptyState
+            title={filtersNarrow(filters) ? 'No matching activity' : 'Nothing recorded yet'}
+            message={
+              filtersNarrow(filters)
+                ? 'No entries match the current filters.'
+                : 'Actions taken in this workspace will appear here as they happen.'
+            }
+            {...(filtersNarrow(filters)
+              ? {
+                  action: {
+                    label: 'Clear filters',
+                    onClick: () => {
+                      setFilters(DEFAULT_FILTERS);
+                    },
+                  },
+                }
+              : {})}
+          />
+        ) : (
+          <div className="flex flex-col gap-5">
+            {days.map((day) => (
+              <div key={day.key} className="flex flex-col gap-2">
+                <SectionLabel>{day.heading}</SectionLabel>
+                <Card className="p-2">
+                  <div className="divide-y divide-line">
+                    {day.events.map((event) => (
+                      <AuditRow key={event.id} event={event} />
+                    ))}
+                  </div>
+                </Card>
               </div>
-              {nextCursor !== null && (
-                <div className="mt-4 flex justify-center">
-                  <Button variant="outline" loading={loadingMore} onClick={() => void loadMore()}>
-                    Load more
-                  </Button>
-                </div>
-              )}
-            </>
-          )}
-        </Card>
+            ))}
+
+            {nextCursor !== null && (
+              <div className="flex justify-center">
+                <Button variant="outline" loading={loadingMore} onClick={() => void loadMore()}>
+                  Load more
+                </Button>
+              </div>
+            )}
+          </div>
+        )}
       </PageWithRail>
     </div>
   );
@@ -295,7 +517,7 @@ export default function AuditLogPage() {
 function ActorSelect({ value, onChange }: { value: string; onChange: (value: string) => void }) {
   const usersQuery = useUsers();
   return (
-    <Select aria-label="Actor" value={value} onChange={(event) => onChange(event.target.value)} className="w-44">
+    <Select aria-label="Actor" value={value} onChange={(event) => onChange(event.target.value)}>
       <option value="">Anyone</option>
       {(usersQuery.data ?? []).map((user) => (
         <option key={user.id} value={user.id}>
@@ -306,17 +528,31 @@ function ActorSelect({ value, onChange }: { value: string; onChange: (value: str
   );
 }
 
+/**
+ * One entry: who, what, and the wall-clock time it happened at.
+ *
+ * The avatar carries *who* so a column of entries can be scanned by person without reading every
+ * sentence — the actor's name is still in the sentence, where it reads naturally, but it is no
+ * longer the only place that information lives. The action icon keeps its chip, tinted only when
+ * the entry is destructive (see `toneForAction`).
+ *
+ * Time is shown as the clock time within its day group, with the full timestamp to the second on
+ * hover: the group heading already says which day, so repeating "3 days ago" on every row would
+ * spend a column saying what the heading above it just said.
+ */
 function AuditRow({ event }: { event: AuditEvent }) {
   const Icon = iconForAction(event.action);
   const chips = metaChips(event);
+  const noteworthy = isNoteworthy(event.action);
 
   return (
-    <div className="flex items-start gap-3 py-3">
-      <IconChip size={36}>
+    <div className="flex items-start gap-3 rounded-xl px-2 py-3 transition-colors duration-150 ease-out hover:bg-surface-2">
+      <IconChip size={36} tone={toneForAction(event.action)}>
         <Icon size={18} strokeWidth={ICON_STROKE} />
       </IconChip>
+
       <div className="min-w-0 flex-1">
-        <p className="text-sm text-ink">{actionSentence(event)}</p>
+        <p className={`text-sm ${noteworthy ? 'font-medium text-ink' : 'text-ink'}`}>{actionSentence(event)}</p>
         {chips.length > 0 && (
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {chips.map((chip) => (
@@ -325,7 +561,15 @@ function AuditRow({ event }: { event: AuditEvent }) {
           </div>
         )}
       </div>
-      <span className="shrink-0 text-xs text-soft">{formatRelativeTime(event.createdAt)}</span>
+
+      <Avatar name={event.actorName} size={24} className="mt-0.5 hidden shrink-0 sm:grid" />
+
+      <span
+        className="mt-0.5 shrink-0 font-mono text-xs text-soft tabular-nums"
+        title={formatTimestamp(event.createdAt)}
+      >
+        {formatTimeOfDay(event.createdAt)}
+      </span>
     </div>
   );
 }
@@ -334,12 +578,13 @@ function AuditSkeletonRows() {
   return (
     <div className="divide-y divide-line">
       {[0, 1, 2, 3].map((row) => (
-        <div key={row} className="flex items-center gap-3 py-3">
+        <div key={row} className="flex items-center gap-3 px-2 py-3">
           <Skeleton className="h-9 w-9 rounded-xl" />
           <div className="min-w-0 flex-1">
             <Skeleton className="h-4 w-64" />
           </div>
-          <Skeleton className="h-3 w-16" />
+          <Skeleton className="hidden h-6 w-6 rounded-full sm:block" />
+          <Skeleton className="h-3 w-10" />
         </div>
       ))}
     </div>
@@ -404,6 +649,11 @@ function RecordActivityCard() {
               </Select>
               <span className="text-[13px] text-soft">Older entries are deleted automatically.</span>
             </label>
+
+            {/* The `disabled` attributes above are what actually prevent the write (and are kept for
+                exactly that reason); this only says WHY, matching the wording every Settings section
+                uses rather than leaving the rule to be discovered by hovering for a tooltip. */}
+            {!isAdmin && <ReadOnlyNotice can="change activity recording" />}
 
             {error && (
               <p role="alert" className="text-sm text-danger">

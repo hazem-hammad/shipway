@@ -9,8 +9,8 @@ import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Cloud } from 'lucide-react';
 import { ApiError, putSettings, verifyCloudflare, type CloudflareVerifyResult, type Settings, type SettingsUpdate } from '../../api';
-import { useSettings } from '../../hooks';
-import { Badge, Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
+import { useIsAdmin, useSettings } from '../../hooks';
+import { Badge, Button, Card, CardHeader, Field, ICON_STROKE, Input, ReadOnlyNotice, Skeleton } from '../../components/ui';
 
 export default function CloudflareSection() {
   const settingsQuery = useSettings();
@@ -40,6 +40,7 @@ export default function CloudflareSection() {
 
 function CloudflareForm({ settings }: { settings: Settings }) {
   const queryClient = useQueryClient();
+  const canEdit = useIsAdmin();
 
   const [token, setToken] = useState('');
   const [zoneId, setZoneId] = useState(settings.cloudflare_zone_id ?? '');
@@ -100,6 +101,7 @@ function CloudflareForm({ settings }: { settings: Settings }) {
         <Input
           mono
           type="password"
+          disabled={!canEdit}
           placeholder={settings.cloudflare_token ?? undefined}
           value={token}
           onChange={(event) => {
@@ -111,6 +113,7 @@ function CloudflareForm({ settings }: { settings: Settings }) {
       <Field label="Zone ID">
         <Input
           mono
+          disabled={!canEdit}
           value={zoneId}
           onChange={(event) => {
             setZoneId(event.target.value);
@@ -127,12 +130,21 @@ function CloudflareForm({ settings }: { settings: Settings }) {
 
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap items-center gap-3">
-          <Button type="submit" loading={saving} disabled={!dirty || saving}>
-            Save
-          </Button>
-          <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!canTest}>
-            Test connection
-          </Button>
+          {canEdit ? (
+            <>
+              <Button type="submit" loading={saving} disabled={!dirty || saving}>
+                Save
+              </Button>
+              {/* Verifying is harmless in itself, but it is an admin's diagnostic for credentials
+                  only an admin can change — a lone Test button under fields a member cannot edit
+                  would be an action without a purpose. */}
+              <Button type="button" variant="secondary" onClick={() => void handleTest()} loading={testing} disabled={!canTest}>
+                Test connection
+              </Button>
+            </>
+          ) : (
+            <ReadOnlyNotice can="change the Cloudflare credentials" />
+          )}
           {/* Four honest states, driven entirely by the last verify result's `reason` — never
               inferred from credentials merely being present (that was the bug: dev mode used to
               report "Connected" unconditionally). Cleared to unknown on any field edit above.

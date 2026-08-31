@@ -22,5 +22,14 @@
     "composite": true,
     "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.app.tsbuildinfo"
   },
-  "include": ["src", "../server/src/deploy/envparse.ts"]
+  "include": [
+    "src",
+    "../server/src/deploy/envparse.ts",
+    "../server/src/deploy/laravel.ts",
+    "../server/src/deploy/node.ts",
+    "../server/src/deploy/envfile.ts",
+    "../server/src/lib/domain.ts",
+    "../server/src/lib/ses.ts",
+    "../server/src/services/dbconn.ts"
+  ]
 }

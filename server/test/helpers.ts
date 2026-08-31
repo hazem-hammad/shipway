@@ -13,6 +13,7 @@ import * as path from 'node:path';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
 import { users } from '../src/db/schema.js';
+import { setSetting } from '../src/db/settings.js';
 import { hashPassword } from '../src/lib/passwords.js';
 
 export type BuildAppDeps = Parameters<typeof buildApp>[1];
@@ -34,10 +35,21 @@ export function sessionCookie(res: LightMyRequestResponse): string {
 
 export const OWNER_CREDENTIALS = { name: 'Ada Lovelace', email: 'ada@example.com', password: 'correct-horse-battery' };
 
-/** Builds a `buildApp()` instance against a fresh temp data dir/dev-mode config. */
+/**
+ * Builds a `buildApp()` instance against a fresh temp data dir/dev-mode config, with the host's own
+ * database engines configured the way `install.sh` leaves a real one.
+ *
+ * Those two settings are what make `local:mysql` / `local:postgres` exist as connections
+ * (`services/dbconnections.ts`), and without them the database routes correctly refuse to provision
+ * anything. A host that can't take a database is a specific thing to test, not the baseline — the
+ * suites that want it set their own settings instead of using this helper.
+ */
 export async function buildTestApp(deps: BuildAppDeps = {}): Promise<FastifyInstance> {
   const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: tmpDataDir() });
-  return buildApp(cfg, deps);
+  const app = await buildApp(cfg, deps);
+  setSetting(app.db, 'mysql_admin_url', 'mysql://shipway_admin:test-only@127.0.0.1:3306');
+  setSetting(app.db, 'postgres_admin_url', 'postgres://shipway_admin:test-only@127.0.0.1:5432/postgres');
+  return app;
 }
 
 export interface AuthedApp {

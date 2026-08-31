@@ -3,15 +3,17 @@
  * composes these instead of reinventing them: buttons, fields, toggles, cards with icon-squircle
  * headers, badges, status dots, tabs, skeletons, empty states.
  */
+import { useState } from 'react';
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
   ReactNode,
+  Ref,
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from 'react';
 import { Link } from 'wouter';
-import { Check, ChevronDown, LoaderCircle } from 'lucide-react';
+import { Check, ChevronDown, Copy, GitBranch, LoaderCircle, Lock } from 'lucide-react';
 
 /** DESIGN.md iconography: lucide, strokeWidth 1.75, size 20 (18 in dense rows). */
 export const ICON_STROKE = 1.75;
@@ -137,6 +139,13 @@ const FIELD_CLASSES =
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> {
   /** Machine-ish values (domains, IPs, tokens, slugs) render in IBM Plex Mono per DESIGN.md. */
   mono?: boolean;
+  /**
+   * Declared explicitly because `InputHTMLAttributes` doesn't carry it. Under React 19 a ref is an
+   * ordinary prop on a function component, so it needs no `forwardRef` — it just has to be part of
+   * the type to be passed at all. Used where a page has to move focus into a field it doesn't own
+   * (the Projects list's `/` shortcut, for one).
+   */
+  ref?: Ref<HTMLInputElement>;
 }
 
 export function Input({ mono = false, className = '', ...rest }: InputProps) {
@@ -293,13 +302,16 @@ export function Badge({ tone = 'neutral', className = '', children }: { tone?: B
 // Icon chip — the 40px squircle behind section-header icons (DESIGN.md Iconography).
 // ---------------------------------------------------------------------------
 
-export type IconChipTone = 'neutral' | 'orange' | 'purple' | 'green';
+export type IconChipTone = 'neutral' | 'orange' | 'purple' | 'green' | 'danger';
 
 const CHIP_TONES: Record<IconChipTone, string> = {
   neutral: 'bg-surface-2 text-icon',
   orange: 'bg-tint-orange text-tint-orange-fg',
   purple: 'bg-tint-purple text-tint-purple-fg',
   green: 'bg-tint-green text-tint-green-fg',
+  // Same treatment `Badge`'s danger tone uses, so a destructive thing looks the same whichever
+  // shape it is wearing. Used by the audit log to mark drops, deletes and failed sign-ins.
+  danger: 'bg-danger/10 text-danger',
 };
 
 export function IconChip({
@@ -550,6 +562,97 @@ export function EmptyState({ title, message, action, secondaryAction, icon, clas
 // ---------------------------------------------------------------------------
 
 /** A mono chip for inline machine-ish values: slugs, SHAs, ports. */
+/**
+ * The branch a deployment built from, as shown in both deployment tables.
+ *
+ * `null` renders an em dash rather than falling back to the project's current branch: a row from
+ * before the column existed, or a rollback to a release that can't be attributed, genuinely doesn't
+ * know — and guessing there would make the column untrustworthy for every row that does know.
+ */
+export function BranchLabel({ branch, className = '' }: { branch: string | null; className?: string }) {
+  if (branch === null) {
+    return <span className={`text-sm text-faint ${className}`}>&mdash;</span>;
+  }
+  return (
+    <span className={`inline-flex min-w-0 items-center gap-1.5 ${className}`} title={branch}>
+      <GitBranch size={13} strokeWidth={ICON_STROKE} aria-hidden className="shrink-0 text-icon" />
+      <span className="truncate font-mono text-xs text-soft">{branch}</span>
+    </span>
+  );
+}
+
 export function Chip({ children }: { children: ReactNode }) {
   return <span className="inline-flex items-center rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-xs text-soft">{children}</span>;
+}
+
+// ---------------------------------------------------------------------------
+// Copy row — a labelled value with a copy button (database credentials, service info).
+// ---------------------------------------------------------------------------
+
+/**
+ * One `label: value` line on a `--surface` tile, with a copy button that confirms for 1.5s. A
+ * `multiline` value keeps its line breaks on screen (an `.env` block); anything else is a single
+ * truncated line.
+ */
+export function CopyRow({ label, value, multiline = false }: { label: string; value: string; multiline?: boolean }) {
+  const [copied, setCopied] = useState(false);
+
+  async function handleCopy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard API unavailable or denied — the value is still visible to copy by hand.
+    }
+  }
+
+  return (
+    <div className={`flex justify-between gap-3 rounded-lg bg-surface px-3 py-2.5 ${multiline ? 'items-start' : 'items-center'}`}>
+      <div className="min-w-0">
+        <p className="text-xs text-soft">{label}</p>
+        {multiline ? (
+          <pre className="mt-0.5 overflow-x-auto font-mono text-sm text-ink">{value}</pre>
+        ) : (
+          <p className="truncate font-mono text-sm text-ink">{value}</p>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={() => void handleCopy()}
+        className="inline-flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-xs font-medium text-soft transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      >
+        {copied ? <Check size={14} strokeWidth={ICON_STROKE} aria-hidden /> : <Copy size={14} strokeWidth={ICON_STROKE} aria-hidden />}
+        {copied ? 'Copied' : 'Copy'}
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ReadOnlyNotice — why a settings section's controls are inert for this viewer.
+// ---------------------------------------------------------------------------
+
+/**
+ * The one line every Settings section shows a member in place of its Save button. Members can SEE
+ * every section (that is the product decision — the instance's configuration is not a secret from
+ * the people deploying on it) but can change nothing, and the server enforces that independently:
+ * every settings write is admin-gated in `server/src/routes/*`, so this notice explains a boundary
+ * rather than creating one.
+ *
+ * It exists because the alternative — leaving the inputs live and letting Save return 403 — teaches
+ * someone the rule only by failing at them, after they have typed. Disabling the controls and
+ * saying why up front is the same information delivered before the work instead of after it.
+ *
+ * `can` is the whole predicate, not just a noun — "change mail settings", "delete this project" —
+ * so the sentence reads specifically on each page AND stays grammatical for the sections whose
+ * restricted action isn't a change at all.
+ */
+export function ReadOnlyNotice({ can = 'change these settings' }: { can?: string }) {
+  return (
+    <p className="flex items-center gap-2 text-[13px] text-soft">
+      <Lock size={14} strokeWidth={ICON_STROKE} aria-hidden className="shrink-0 text-icon" />
+      Only admins can {can}.
+    </p>
+  );
 }

@@ -4,16 +4,19 @@ import {
   fetchAuditConfig,
   fetchCronJobs,
   fetchDatabases,
+  fetchDbConnections,
   fetchDeployment,
   fetchDeployments,
+  fetchGitBranches,
   fetchGithubBranches,
+  fetchGithubDirs,
   fetchGithubRepos,
   fetchGithubStatus,
   fetchGlobalDeployments,
   fetchInvite,
   fetchMailConfig,
   fetchMe,
-  fetchNotifications,
+  fetchProjectNotifications,
   fetchOverview,
   fetchProject,
   fetchProjectEnv,
@@ -29,16 +32,18 @@ import {
   verifyCloudflare,
   type AuditConfig,
   type CloudflareVerifyResult,
-  type CronJob,
+  type CronJobsResponse,
   type DatabaseListItem,
+  type DbConnection,
   type Deployment,
+  type GitRemoteBranches,
   type GithubRepo,
   type GithubStatus,
   type GlobalDeployment,
   type InvitePreview,
   type MailConfig,
   type Me,
-  type NotificationsMatrix,
+  type ProjectNotifications,
   type Overview,
   type Project,
   type ProjectListItem,
@@ -127,14 +132,22 @@ export function useProjects(): UseQueryResult<ProjectListItem[]> {
 }
 
 /**
- * The global Deployments page's list (`GET /api/deployments`, Task 5/7). Polls every 10s while any
- * row is queued/running, else every 30s.
+ * The global Deployments page's list (`GET /api/deployments`, Task 5/7).
+ *
+ * Two speeds, because the page has two jobs. While something is queued or running it is a live
+ * view of work in flight — a deploy moves through resolve/build/activate in seconds, so a 10s poll
+ * showed a stage that had already finished — hence 2s. With everything settled it is a history
+ * list that only changes when someone pushes, so it drops to 30s.
+ *
+ * `refetchOnWindowFocus` covers the case polling can't: a tab left in the background for an hour
+ * shows the truth the moment it is looked at again, rather than up to 30s later.
  */
 export function useGlobalDeployments(): UseQueryResult<GlobalDeployment[]> {
   return useQuery({
     queryKey: ['deployments-global'],
     queryFn: () => fetchGlobalDeployments(),
-    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 10_000 : 30_000),
+    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 2_000 : 30_000),
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -162,6 +175,30 @@ export function useGithubBranches(repo: string | null): UseQueryResult<string[]>
     queryKey: ['github-branches', repo],
     queryFn: () => fetchGithubBranches(repo ?? ''),
     enabled: repo !== null,
+  });
+}
+
+/**
+ * Branches of a pasted git URL (`git ls-remote` server-side), so a non-GitHub source gets the same
+ * branch dropdown a GitHub repo does. Never retried: a failure here is usually a wrong URL or
+ * missing credentials, and hammering an unreachable remote three times just makes the form feel
+ * stuck — the field falls back to free text instead.
+ */
+export function useGitBranches(url: string | null): UseQueryResult<GitRemoteBranches> {
+  return useQuery({
+    queryKey: ['git-branches', url],
+    queryFn: () => fetchGitBranches(url ?? ''),
+    enabled: url !== null && url !== '',
+    retry: false,
+  });
+}
+
+/** Top-level directories of a GitHub repo at a branch — public-directory suggestions. */
+export function useGithubDirs(repo: string | null, branch: string | null): UseQueryResult<string[]> {
+  return useQuery({
+    queryKey: ['github-dirs', repo, branch],
+    queryFn: () => fetchGithubDirs(repo ?? '', branch ?? ''),
+    enabled: repo !== null && branch !== null && branch !== '',
   });
 }
 
@@ -206,8 +243,8 @@ export function useWorkers(projectId: number): UseQueryResult<WorkerListItem[]> 
   return useQuery({ queryKey: ['workers', projectId], queryFn: () => fetchWorkers(projectId) });
 }
 
-/** A project's cron jobs (Cron tab). */
-export function useCronJobs(projectId: number): UseQueryResult<CronJob[]> {
+/** A project's cron jobs (Cron tab), plus the host timezone and paths the tab explains them with. */
+export function useCronJobs(projectId: number): UseQueryResult<CronJobsResponse> {
   return useQuery({ queryKey: ['cron', projectId], queryFn: () => fetchCronJobs(projectId) });
 }
 
@@ -215,6 +252,12 @@ export function useCronJobs(projectId: number): UseQueryResult<CronJob[]> {
 
 export function useDatabases(): UseQueryResult<DatabaseListItem[]> {
   return useQuery({ queryKey: ['databases'], queryFn: fetchDatabases });
+}
+
+/** The database servers a database can be created on — the host's own engines plus every registered
+ * external one. Feeds both the Databases page's connection list and the new-project picker. */
+export function useDbConnections(): UseQueryResult<DbConnection[]> {
+  return useQuery({ queryKey: ['db-connections'], queryFn: fetchDbConnections });
 }
 
 /** Redis/Mailpit connection info for the info panels at the bottom of the Databases page. */
@@ -242,10 +285,11 @@ export function useUsers(): UseQueryResult<User[]> {
   return useQuery({ queryKey: ['users'], queryFn: fetchUsers });
 }
 
-// ---- Settings > Notifications ----
+// ---- Project > Settings > Notifications ----
 
-export function useNotifications(): UseQueryResult<NotificationsMatrix> {
-  return useQuery({ queryKey: ['notifications'], queryFn: fetchNotifications });
+/** Keyed per project, so switching projects never shows the previous one's recipient list. */
+export function useProjectNotifications(projectId: number): UseQueryResult<ProjectNotifications> {
+  return useQuery({ queryKey: ['project-notifications', projectId], queryFn: () => fetchProjectNotifications(projectId) });
 }
 
 // ---- Audit log ----

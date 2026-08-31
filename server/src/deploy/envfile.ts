@@ -7,6 +7,7 @@
  * text, pass it through `buildEnvFile`, and write the result back via
  * `SysOps.installFile`.
  */
+import { isValidSesRegion, SES_SMTP_ENCRYPTION, SES_SMTP_PORT, sesSmtpHost } from '../lib/ses.js';
 
 /** SMTP connection details for `smtpMode: 'custom'`. */
 export interface SmtpConfig {
@@ -18,14 +19,50 @@ export interface SmtpConfig {
   encryption?: string;
 }
 
+/**
+ * Connection details for `smtpMode: 'ses'`. No host or port: those are DERIVED from `region`
+ * (`lib/ses.ts`), so a project's stored config can never point the app at a host that isn't SES.
+ * The credentials are the SES *SMTP* username/password minted in the SES console — not a raw AWS
+ * access key/secret, which SMTP auth rejects. `fromAddress` must be an identity verified in SES,
+ * which is why it's required here where `SmtpConfig` leaves it optional.
+ */
+export interface SesSmtpConfig {
+  region: string;
+  username: string;
+  password: string;
+  fromAddress: string;
+}
+
 export interface BuildManagedVarsInput {
-  smtpMode: 'mailpit' | 'custom' | 'none';
+  smtpMode: 'mailpit' | 'custom' | 'ses' | 'none';
+  /** Required for `smtpMode: 'custom'`, ignored otherwise. */
   smtpConfig?: SmtpConfig;
+  /** Required for `smtpMode: 'ses'`, ignored otherwise. */
+  sesConfig?: SesSmtpConfig;
+  /**
+   * Absolute path of the SQLite file a database-less Laravel project falls back to, or `undefined`
+   * when the project has a real database (or isn't php at all).
+   *
+   * Managed rather than written into the env template because the path depends on the host's apps
+   * directory, which the browser-rendered template can't know — and because it must follow the
+   * project if that directory ever changes. Like every managed var, a user-defined `DB_DATABASE`
+   * suppresses it, so attaching a real database later just works.
+   */
+  sqliteDatabasePath?: string;
 }
 
 /** SMTP + injected DB creds, already resolved. */
 export interface ManagedVars {
   vars: Record<string, string>;
+}
+
+/**
+ * Where a database-less Laravel project's SQLite file lives: the project's SHARED directory, not the
+ * release. Releases are rotated and deleted, so a file under `current/database/` would take the
+ * project's data with it on the next deploy or prune.
+ */
+export function sqlitePath(appsDir: string, slug: string): string {
+  return `${appsDir}/${slug}/shared/database.sqlite`;
 }
 
 const MARKER_START = '# >>> shipway managed — do not edit below >>>';
@@ -38,9 +75,34 @@ const MARKER_END = '# <<< shipway managed <<<';
  * - `custom` → maps `smtpConfig` onto `MAIL_*` (omitting keys whose source
  *   field is `undefined`) plus `SMTP_HOST`/`SMTP_PORT` aliases. Throws if
  *   `smtpConfig` is missing.
+ * - `ses` → the same `MAIL_*` shape, but host/port/encryption are derived from
+ *   the region rather than supplied, so the app can only ever be pointed at a
+ *   real SES endpoint. Throws if `sesConfig` is missing or its region is
+ *   malformed — writing a bogus host into a project's `.env` would fail at
+ *   send time, far from the cause.
  * - `none` → no managed vars at all.
  */
 export function buildManagedVars(p: BuildManagedVarsInput): Record<string, string> {
+  return { ...smtpManagedVars(p), ...sqliteManagedVars(p.sqliteDatabasePath) };
+}
+
+/**
+ * The SQLite fallback pair. `DB_CONNECTION` is managed alongside the path deliberately: writing a
+ * path that only means anything under the sqlite driver, while leaving the driver to whatever
+ * `config/database.php` defaults to, is incoherent — it works on a Laravel version that defaults to
+ * sqlite and silently doesn't on one that defaults to mysql. Managing both also fixes projects
+ * created before this existed, whose stored env has no `DB_CONNECTION` at all.
+ *
+ * Both are ordinary managed vars, so a user-defined `DB_CONNECTION` (a project pointed at a real
+ * database) suppresses them exactly as it suppresses any other.
+ */
+function sqliteManagedVars(sqliteDatabasePath: string | undefined): Record<string, string> {
+  if (sqliteDatabasePath === undefined) return {};
+  return { DB_CONNECTION: 'sqlite', DB_DATABASE: sqliteDatabasePath };
+}
+
+/** The `MAIL_*`/`SMTP_*` half of the managed block, by smtp mode. */
+function smtpManagedVars(p: BuildManagedVarsInput): Record<string, string> {
   switch (p.smtpMode) {
     case 'mailpit':
       return {
@@ -71,6 +133,31 @@ export function buildManagedVars(p: BuildManagedVarsInput): Record<string, strin
       vars.SMTP_PORT = String(port);
 
       return vars;
+    }
+
+    case 'ses': {
+      if (!p.sesConfig) {
+        throw new Error('sesConfig is required when smtpMode is "ses"');
+      }
+      const { region, username, password, fromAddress } = p.sesConfig;
+      if (!isValidSesRegion(region)) {
+        throw new Error(`"${region}" is not a valid AWS region`);
+      }
+
+      const host = sesSmtpHost(region);
+      const port = String(SES_SMTP_PORT);
+
+      return {
+        MAIL_MAILER: 'smtp',
+        MAIL_HOST: host,
+        MAIL_PORT: port,
+        MAIL_USERNAME: username,
+        MAIL_PASSWORD: password,
+        MAIL_FROM_ADDRESS: fromAddress,
+        MAIL_ENCRYPTION: SES_SMTP_ENCRYPTION,
+        SMTP_HOST: host,
+        SMTP_PORT: port,
+      };
     }
 
     case 'none':

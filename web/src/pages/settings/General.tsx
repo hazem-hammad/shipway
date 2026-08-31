@@ -7,8 +7,8 @@ import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Settings as SettingsIcon } from 'lucide-react';
 import { ApiError, putSettings, type Settings } from '../../api';
-import { useSettings } from '../../hooks';
-import { Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
+import { useIsAdmin, useSettings } from '../../hooks';
+import { Button, Card, CardHeader, Field, ICON_STROKE, Input, ReadOnlyNotice, Skeleton } from '../../components/ui';
 
 export default function GeneralSection() {
   const settingsQuery = useSettings();
@@ -42,6 +42,9 @@ export default function GeneralSection() {
 
 function GeneralForm({ settings }: { settings: Settings }) {
   const queryClient = useQueryClient();
+  // `false` while the session's role is still loading, so the fields never flash editable for a
+  // member who is about to be told they aren't (see `useIsAdmin`).
+  const canEdit = useIsAdmin();
   const [baseDomain, setBaseDomain] = useState(settings.base_domain ?? '');
   const [serverIp, setServerIp] = useState(settings.server_ip ?? '');
   const [acmeEmail, setAcmeEmail] = useState(settings.acme_email ?? '');
@@ -84,13 +87,13 @@ function GeneralForm({ settings }: { settings: Settings }) {
   return (
     <form onSubmit={(event) => void handleSubmit(event)} className="flex max-w-[640px] flex-col gap-6" noValidate>
       <Field label="Base domain" hint="Projects deploy to <slug>.<this domain>.">
-        <Input mono required value={baseDomain} onChange={(event) => change(setBaseDomain)(event.target.value)} />
+        <Input mono required disabled={!canEdit} value={baseDomain} onChange={(event) => change(setBaseDomain)(event.target.value)} />
       </Field>
       <Field label="Server IP" hint="The public IPv4 address this server is reachable at.">
-        <Input mono required value={serverIp} onChange={(event) => change(setServerIp)(event.target.value)} />
+        <Input mono required disabled={!canEdit} value={serverIp} onChange={(event) => change(setServerIp)(event.target.value)} />
       </Field>
       <Field label="ACME email" hint="Used for Let's Encrypt certificate notices.">
-        <Input type="email" required value={acmeEmail} onChange={(event) => change(setAcmeEmail)(event.target.value)} />
+        <Input type="email" required disabled={!canEdit} value={acmeEmail} onChange={(event) => change(setAcmeEmail)(event.target.value)} />
       </Field>
 
       {error && (
@@ -100,9 +103,13 @@ function GeneralForm({ settings }: { settings: Settings }) {
       )}
 
       <div>
-        <Button type="submit" loading={saving} disabled={!dirty || saving}>
-          Save
-        </Button>
+        {canEdit ? (
+          <Button type="submit" loading={saving} disabled={!dirty || saving}>
+            Save
+          </Button>
+        ) : (
+          <ReadOnlyNotice can="change the server's domain settings" />
+        )}
       </div>
     </form>
   );

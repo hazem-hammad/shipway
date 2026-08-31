@@ -172,6 +172,11 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(401).send({ error: 'unauthorized' });
     }
 
+    // Echoed for nginx's `auth_request`, which uses this route as its subrequest target on the
+    // dashboard vhost (setup/templates/nginx-dashboard.conf). `auth_request_set` copies this header
+    // out of the subrequest response and forwards it to pgAdmin as the remote user, which is how
+    // pgAdmin knows who is signed in without a login of its own. Harmless to every other caller.
+    reply.header('X-Shipway-User', user.email);
     return { id: user.id, name: user.name, email: user.email, role: user.role };
   });
 }

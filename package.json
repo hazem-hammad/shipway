@@ -2,13 +2,13 @@
   "name": "shipway",
   "version": "1.0.0",
   "private": true,
-  "description": "Shipway — a fast, native-process deployment dashboard",
+  "description": "Shipway \u2014 a fast, native-process deployment dashboard",
   "workspaces": [
     "server",
     "web"
   ],
   "scripts": {
-    "test": "npm run test -w server",
+    "test": "npm run test -w server && npm run test -w web",
     "typecheck": "npm run typecheck -w server && npm run typecheck -w web",
     "build": "npm run build -w server && npm run build -w web"
   },

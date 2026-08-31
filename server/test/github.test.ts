@@ -250,6 +250,40 @@ describe('GET /api/github/manifest', () => {
     await app.close();
   });
 
+  it('posts to the organization app-creation endpoint when org is given — the personal endpoint can only ever produce a user-owned app, which a private manifest can only install on that same user', async () => {
+    const { app, cookie } = await buildAuthedApp();
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/github/manifest?baseUrl=https://deploy.example.com&org=acme-inc',
+      headers: { cookie },
+    });
+    expect(res.statusCode).toBe(200);
+
+    const body = res.json() as { postUrl: string; manifestJson: string };
+    expect(body.postUrl).toMatch(/^https:\/\/github\.com\/organizations\/acme-inc\/settings\/apps\/new\?state=[0-9a-f]{32}$/);
+
+    // The manifest body itself is unchanged — only the account the app is created under differs.
+    const manifest = JSON.parse(body.manifestJson) as Record<string, unknown>;
+    expect(manifest.public).toBe(false);
+    expect(manifest.default_permissions).toEqual({ contents: 'read', metadata: 'read' });
+
+    await app.close();
+  });
+
+  it('400s on an org login that is not a valid GitHub login, rather than interpolating it into the github.com URL', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    for (const org of ['bad/org', 'has space', '-leading', 'trailing-', 'a'.repeat(40), 'double--hyphen-ok'.replace('ok', '/')]) {
+      const res = await app.inject({
+        method: 'GET',
+        url: `/api/github/manifest?baseUrl=https://deploy.example.com&org=${encodeURIComponent(org)}`,
+        headers: { cookie },
+      });
+      expect(res.statusCode, `org=${org}`).toBe(400);
+    }
+    await app.close();
+  });
+
   it('is 401 without a session', async () => {
     const app = await buildTestApp();
     const res = await app.inject({ method: 'GET', url: '/api/github/manifest?baseUrl=https://deploy.example.com' });
@@ -457,6 +491,51 @@ describe('POST /api/github/resolve-installation', () => {
     expect(res.statusCode).toBe(401);
     await app.close();
   });
+
+  it('400s on a malformed explicit installationId before any network call', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    setSettingGithubApp(app, { appId: 123456, privateKey: 'not-a-valid-pem', webhookSecret: 'whsec_test' });
+
+    for (const installationId of [-5, 0, 'abc']) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/github/resolve-installation',
+        headers: { cookie },
+        payload: { installationId },
+      });
+      // 400 (validation), not 502 (auth failure) — proof the guard runs before GitHub is contacted.
+      expect(res.statusCode, `installationId=${String(installationId)}`).toBe(400);
+      expect(res.json()).toEqual({ error: 'invalid request' });
+    }
+
+    await app.close();
+  });
+});
+
+describe('GET /api/github/installations', () => {
+  it('503s "not configured" when no github_app setting exists', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    const res = await app.inject({ method: 'GET', url: '/api/github/installations', headers: { cookie } });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'github app not configured' });
+    await app.close();
+  });
+
+  it('502s (sanitized) when app-level auth fails', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    setSettingGithubApp(app, { appId: 123456, privateKey: 'not-a-valid-pem', webhookSecret: 'whsec_test' });
+    const res = await app.inject({ method: 'GET', url: '/api/github/installations', headers: { cookie } });
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toEqual({ error: 'failed to list installations' });
+    await app.close();
+  });
+
+  it('is 401 without a session', async () => {
+    const app = await buildTestApp();
+    const res = await app.inject({ method: 'GET', url: '/api/github/installations' });
+    expect(res.statusCode).toBe(401);
+    await app.close();
+  });
 });
 
 describe('GET /api/github/repos', () => {
@@ -481,6 +560,44 @@ describe('GET /api/github/repos', () => {
   it('is 401 without a session', async () => {
     const app = await buildTestApp();
     const res = await app.inject({ method: 'GET', url: '/api/github/repos' });
+    expect(res.statusCode).toBe(401);
+    await app.close();
+  });
+});
+
+describe('GET /api/github/dirs', () => {
+  it('503s "not configured" when no github_app setting exists', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    const res = await app.inject({ method: 'GET', url: '/api/github/dirs?repo=acme/widgets&branch=main', headers: { cookie } });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'github app not configured' });
+    await app.close();
+  });
+
+  it('503s "not installed" when github_app exists but has no installationId', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    setSettingGithubApp(app, GITHUB_APP_CFG);
+
+    const res = await app.inject({ method: 'GET', url: '/api/github/dirs?repo=acme/widgets&branch=main', headers: { cookie } });
+    expect(res.statusCode).toBe(503);
+    expect(res.json()).toEqual({ error: 'github app not installed' });
+    await app.close();
+  });
+
+  it('400s on a malformed repo, and on a missing branch', async () => {
+    const { app, cookie } = await buildAuthedApp();
+    setSettingGithubApp(app, { ...GITHUB_APP_CFG, installationId: 1 });
+
+    for (const url of ['/api/github/dirs?repo=not-owner-slash-repo&branch=main', '/api/github/dirs?repo=acme/widgets', '/api/github/dirs?repo=acme/widgets&branch=']) {
+      const res = await app.inject({ method: 'GET', url, headers: { cookie } });
+      expect(res.statusCode, url).toBe(400);
+    }
+    await app.close();
+  });
+
+  it('is 401 without a session', async () => {
+    const app = await buildTestApp();
+    const res = await app.inject({ method: 'GET', url: '/api/github/dirs?repo=acme/widgets&branch=main' });
     expect(res.statusCode).toBe(401);
     await app.close();
   });

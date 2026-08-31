@@ -4,13 +4,18 @@
  * SMTP config (`deploy/envfile.ts`'s `SmtpConfig`, which only ever writes `MAIL_*`/`SMTP_*` into a
  * project's `.env`). Stored under settings key `instance_mail` (see `db/settings.ts`), with the
  * password encrypted at rest via `SecretBox` (never stored, logged, or audited in plaintext).
+ *
+ * Drivers: `none` (disabled), `mailpit` (the local catch-all), `smtp` (a hand-entered server), and
+ * `ses` (Amazon SES's SMTP interface — same transport as `smtp`, but the endpoint is derived from a
+ * region rather than typed in; see `SES_SMTP_PORT` below).
  */
 import nodemailer from 'nodemailer';
 import { getSetting, setSetting } from '../db/settings.js';
 import type { ShipwayDb } from '../db/index.js';
 import type { SecretBox } from '../lib/secretbox.js';
+import { isValidSesRegion, SES_SMTP_PORT, sesSmtpHost } from '../lib/ses.js';
 
-export type MailDriver = 'none' | 'mailpit' | 'smtp';
+export type MailDriver = 'none' | 'mailpit' | 'smtp' | 'ses';
 
 /** Resolved instance mail config — always fully populated (never partial), so callers never have to
  * juggle "which fields matter for this driver" themselves. */
@@ -19,6 +24,10 @@ export interface InstanceMailConfig {
   host: string;
   port: number;
   secure: boolean;
+  /** `ses` only: the AWS region whose SES SMTP endpoint to send through. `host`/`port` are always
+   * DERIVED from this (see `sesSmtpHost`) rather than supplied by the user, so a caller never has
+   * to reconcile the two — for every other driver this is `undefined`. */
+  region?: string;
   username?: string;
   password?: string;
   fromAddress: string;
@@ -33,6 +42,11 @@ const MAILPIT_DEFAULT_HOST = '127.0.0.1';
 const MAILPIT_DEFAULT_PORT = 1025;
 const MAILPIT_DEFAULT_FROM = 'shipway@localhost';
 
+/** SES's endpoint derivation and region validation live in `lib/ses.ts`, shared with the per-project
+ * SMTP config in `deploy/envfile.ts`. Re-exported here because `routes/mail.ts` and the mailer tests
+ * have always reached for them through this module. */
+export { isValidSesRegion, sesSmtpHost } from '../lib/ses.js';
+
 /** Shape actually persisted under `instance_mail`: `password` is replaced with a base64-encoded
  * SecretBox ciphertext (never plaintext) so a raw dump of the settings table never leaks it. */
 interface StoredMailConfig {
@@ -40,6 +54,7 @@ interface StoredMailConfig {
   host?: string;
   port?: number;
   secure?: boolean;
+  region?: string;
   username?: string;
   passwordEncrypted?: string;
   fromAddress?: string;
@@ -56,7 +71,8 @@ interface MailpitInfo {
 /** Reads and decrypts the instance mail config. Unset → an inert `driver: 'none'` config. For
  * `driver: 'mailpit'`, `host`/`port` are always the local mailpit endpoint (overridden by the
  * `mailpit_info` bootstrap setting when present) rather than whatever was last stored — mailpit
- * never takes user-supplied connection details. */
+ * never takes user-supplied connection details. Likewise for `driver: 'ses'`, `host`/`port`/`secure`
+ * are always derived from the stored region, so a stored host can never override the SES endpoint. */
 export function getMailConfig(db: ShipwayDb, secretBox: SecretBox): InstanceMailConfig {
   const stored = getSetting<StoredMailConfig>(db, SETTINGS_KEY);
   if (!stored) {
@@ -73,6 +89,24 @@ export function getMailConfig(db: ShipwayDb, secretBox: SecretBox): InstanceMail
       port: mailpitInfo?.smtpPort ?? MAILPIT_DEFAULT_PORT,
       secure: false,
       fromAddress: stored.fromAddress && stored.fromAddress.trim() !== '' ? stored.fromAddress : MAILPIT_DEFAULT_FROM,
+      fromName: stored.fromName,
+    };
+  }
+
+  if (stored.driver === 'ses') {
+    const region = stored.region ?? '';
+    return {
+      driver: 'ses',
+      // A stored region that doesn't pass the guard yields an empty host rather than a fabricated
+      // one, so a send fails cleanly ("configured, but the endpoint won't resolve") instead of
+      // reaching somewhere unintended.
+      host: isValidSesRegion(region) ? sesSmtpHost(region) : '',
+      port: SES_SMTP_PORT,
+      secure: false,
+      region,
+      username: stored.username,
+      password,
+      fromAddress: stored.fromAddress ?? '',
       fromName: stored.fromName,
     };
   }
@@ -96,6 +130,7 @@ export function saveMailConfig(db: ShipwayDb, secretBox: SecretBox, cfg: Instanc
     host: cfg.host,
     port: cfg.port,
     secure: cfg.secure,
+    region: cfg.region,
     username: cfg.username,
     passwordEncrypted: cfg.password ? secretBox.encrypt(cfg.password).toString('base64') : undefined,
     fromAddress: cfg.fromAddress,
@@ -104,8 +139,9 @@ export function saveMailConfig(db: ShipwayDb, secretBox: SecretBox, cfg: Instanc
   setSetting(db, SETTINGS_KEY, stored);
 }
 
-/** `false` only for `driver: 'none'` — a `mailpit`/`smtp` config counts as configured even before a
- * successful test send (mailpit needs no credentials at all; smtp is validated at save time). */
+/** `false` only for `driver: 'none'` — a `mailpit`/`smtp`/`ses` config counts as configured even
+ * before a successful test send (mailpit needs no credentials at all; smtp and ses are validated at
+ * save time). */
 export function isMailConfigured(cfg: InstanceMailConfig): boolean {
   return cfg.driver !== 'none';
 }
@@ -117,13 +153,35 @@ export interface SendMailInput {
   html?: string;
 }
 
-export type SendMailResult = { ok: true } | { ok: false; error: string };
+/**
+ * `messageId` is the receiving server's own identifier for the accepted message — for SES, the id in
+ * its `250 Ok <id>` reply, which is exactly what you search for in SES's sending/bounce dashboard.
+ * Carried through (rather than discarded, as it was) because "Shipway says it sent, the inbox says
+ * otherwise" is only answerable if the handoff can be traced to a specific message on the provider's
+ * side. Optional: a transport isn't obliged to report one, and a test double generally won't.
+ */
+export type SendMailResult = { ok: true; messageId?: string } | { ok: false; error: string };
 
 /** The minimal shape `sendMail` needs from a transport — matches nodemailer's `Transporter`
  * structurally (so a real `nodemailer.createTransport(...)` satisfies it with no cast) while staying
  * easy to fake in tests. */
 export interface MailTransport {
   sendMail(options: { from: string; to: string; subject: string; text: string; html?: string }): Promise<unknown>;
+}
+
+/** Pulls the accepted-message id out of whatever a transport resolved with. Deliberately defensive:
+ * `MailTransport` promises only `unknown`, so anything that isn't a usable id becomes `undefined`
+ * rather than a crash on the notification path. Prefers SES's `250 Ok <id>` response id over
+ * nodemailer's locally-generated `messageId`, since the provider's id is the one you can look up. */
+function extractMessageId(info: unknown): string | undefined {
+  if (typeof info !== 'object' || info === null) return undefined;
+  const record = info as { response?: unknown; messageId?: unknown };
+
+  if (typeof record.response === 'string') {
+    const match = /^250 Ok (\S+)/.exec(record.response.trim());
+    if (match) return match[1];
+  }
+  return typeof record.messageId === 'string' ? record.messageId : undefined;
 }
 
 export type TransportFactory = (cfg: InstanceMailConfig) => MailTransport;
@@ -142,6 +200,11 @@ const defaultTransportFactory: TransportFactory = (cfg) =>
     port: cfg.port,
     secure: cfg.secure,
     auth: cfg.username ? { user: cfg.username, pass: cfg.password } : undefined,
+    // SES is always reached over the public internet with credentials attached, so its STARTTLS
+    // upgrade is REQUIRED rather than opportunistic — without this, `secure: false` lets nodemailer
+    // fall back to a plaintext session if the upgrade doesn't happen. The `smtp` driver keeps
+    // nodemailer's opportunistic default, since that can legitimately point at a local relay.
+    requireTLS: cfg.driver === 'ses',
     connectionTimeout: SMTP_STAGE_TIMEOUT_MS,
     greetingTimeout: SMTP_STAGE_TIMEOUT_MS,
     socketTimeout: SMTP_STAGE_TIMEOUT_MS,
@@ -223,11 +286,11 @@ export async function sendMail(
 
   try {
     const transport = transportFactory(cfg);
-    await withTimeout(
+    const info = await withTimeout(
       transport.sendMail({ from: formatFrom(cfg), to: input.to, subject: input.subject, text: input.text, html: input.html }),
       timeoutMs,
     );
-    return { ok: true };
+    return { ok: true, messageId: extractMessageId(info) };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'failed to send mail';
     return { ok: false, error: redactUsername(message, cfg.username) };
@@ -246,6 +309,15 @@ export interface InviteEmailInput {
   token: string;
   /** The `base_domain` setting, or `null`/unset when the instance hasn't configured one yet. */
   baseDomain: string | null;
+  /**
+   * The projects this invite grants access to, for the "You'll have access to:" line. `null` means
+   * unscoped — every project — which is what an admin invite and a `projectAccess: 'all'` member
+   * invite both are; the line is then phrased as "all projects" rather than enumerated. An empty
+   * array means scoped to nothing yet, and says so, so the invitee isn't surprised by an empty
+   * Projects page. Names only — never slugs or ids, since this is read by someone who has no
+   * account yet.
+   */
+  projectNames?: string[] | null;
 }
 
 export interface InviteEmailContent {
@@ -255,6 +327,26 @@ export interface InviteEmailContent {
 }
 
 const INVITE_EMAIL_SUBJECT = "You're invited to Shipway";
+
+/** Minimal HTML escaping for the one piece of the invite email built from user-controlled data (a
+ * project's name). Everything else in the template is a literal or a token/URL this module built
+ * itself. */
+function escapeHtml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** The invite email's access sentence. See `InviteEmailInput.projectNames` for what each case means.
+ * Long selections are truncated ("... and 3 more") rather than pasting a wall of names into an
+ * email — the invitee sees the full list on the Projects page the moment they accept. */
+function describeInviteAccess(projectNames: string[] | null): string {
+  if (projectNames === null) return "You'll have access to all projects.";
+  if (projectNames.length === 0) return "You don't have access to any projects yet — an admin can grant it once you've accepted.";
+
+  const MAX_LISTED = 8;
+  const listed = projectNames.slice(0, MAX_LISTED).join(', ');
+  const remaining = projectNames.length - MAX_LISTED;
+  return remaining > 0 ? `You'll have access to: ${listed}, and ${String(remaining)} more.` : `You'll have access to: ${listed}.`;
+}
 
 /**
  * Builds the invite email. The link is absolute (`https://ship.<baseDomain>/invite/<token>`)
@@ -268,7 +360,7 @@ const INVITE_EMAIL_SUBJECT = "You're invited to Shipway";
  * not a configurable one) — see `routes/projects.ts`'s `RESERVED_SLUGS` for the other half of that
  * convention (a project can never claim the `ship` subdomain out from under the dashboard).
  */
-export function buildInviteEmail({ token, baseDomain }: InviteEmailInput): InviteEmailContent {
+export function buildInviteEmail({ token, baseDomain, projectNames = null }: InviteEmailInput): InviteEmailContent {
   const invitePath = `/invite/${token}`;
   const domain = baseDomain && baseDomain.trim() !== '' ? baseDomain.trim() : null;
   const url = domain ? `https://ship.${domain}${invitePath}` : null;
@@ -277,7 +369,17 @@ export function buildInviteEmail({ token, baseDomain }: InviteEmailInput): Invit
     ? url
     : `${invitePath} (no base domain is configured yet, so this can't be a full link; open this path on your Shipway instance)`;
 
-  const text = ["You've been invited to join Shipway.", '', `Accept your invite: ${linkLine}`, '', 'This link expires in 7 days.'].join('\n');
+  const accessLine = describeInviteAccess(projectNames);
+
+  const text = [
+    "You've been invited to join Shipway.",
+    '',
+    accessLine,
+    '',
+    `Accept your invite: ${linkLine}`,
+    '',
+    'This link expires in 7 days.',
+  ].join('\n');
 
   const linkHtml = url
     ? `<a href="${url}" style="color: #141416; font-weight: 600;">Accept your invite</a>`
@@ -286,6 +388,7 @@ export function buildInviteEmail({ token, baseDomain }: InviteEmailInput): Invit
   const html = [
     '<div style="font-family: -apple-system, BlinkMacSystemFont, \'Segoe UI\', Helvetica, Arial, sans-serif; font-size: 14px; line-height: 1.5; color: #18181B;">',
     "  <p>You've been invited to join Shipway.</p>",
+    `  <p>${escapeHtml(accessLine)}</p>`,
     `  <p>${linkHtml}</p>`,
     '  <p style="color: #8E8E93; font-size: 13px;">This link expires in 7 days.</p>',
     '</div>',

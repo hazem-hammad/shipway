@@ -190,4 +190,105 @@ describe('makeGitOps (real git integration)', () => {
 
     await expect(gitOps.exportRelease(projectDir, sha, releaseDir)).rejects.toThrow(/invalid sha/);
   });
+
+  it('runs `git archive` with buffer:false — buffering the tar stream killed the whole process on a large repo', async () => {
+    // Regression test for a hard crash, not a slow path: execa buffers and UTF-8-decodes a
+    // subprocess's stdout by default even when it is piped onward, so a 364MB `git archive` stream
+    // built a string past V8's internal array limit and aborted the entire Shipway process with
+    // "Fatal JavaScript invalid size error" (SIGILL) — taking the dashboard and every concurrent
+    // deploy down, rather than failing the one deploy. Asserted at the options level because
+    // reproducing it for real needs a repo far too large for a fixture.
+    const calls: { file: string; args: string[]; opts: Record<string, unknown> }[] = [];
+    const fakeRun = ((file: string, args: string[], opts: Record<string, unknown>) => {
+      calls.push({ file, args, opts });
+      // Minimal stand-in for execa's return value: only `.pipe()` is used on the archive call.
+      return { pipe: () => Promise.resolve({ stdout: '' }) };
+    }) as unknown as typeof execa;
+
+    const gitOps = makeGitOps(fakeRun);
+    const releaseDir = path.join(tmpDir('shipway-git-release'), 'release-opts');
+    await gitOps.exportRelease('/tmp/does-not-matter', 'a'.repeat(40), releaseDir);
+
+    const archive = calls.find((c) => c.args.includes('archive'));
+    expect(archive, 'git archive should have been spawned').toBeDefined();
+    expect(archive?.opts.buffer).toBe(false);
+  });
+});
+
+describe('makeGitOps.listRemoteBranches', () => {
+  it('lists a remote\'s branches and the branch HEAD points at, without cloning', async () => {
+    const fixtureDir = tmpDir('shipway-git-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    await execa('git', ['branch', 'develop'], { cwd: fixtureDir });
+    await execa('git', ['branch', 'feature/nested-name'], { cwd: fixtureDir });
+    const gitOps = makeGitOps();
+
+    const result = await gitOps.listRemoteBranches(fileUrl(fixtureDir));
+
+    expect(result.defaultBranch).toBe('main');
+    expect(result.branches).toEqual(['develop', 'feature/nested-name', 'main']);
+    // Nothing was written anywhere: ls-remote is the whole implementation.
+    expect(fs.existsSync(path.join(fixtureDir, 'repo'))).toBe(false);
+  });
+
+  it('reports a repo with no branches as empty rather than failing', async () => {
+    const emptyDir = tmpDir('shipway-git-empty');
+    await execa('git', ['init', '-b', 'main', '--bare'], { cwd: emptyDir });
+    const gitOps = makeGitOps();
+
+    const result = await gitOps.listRemoteBranches(fileUrl(emptyDir));
+
+    expect(result.branches).toEqual([]);
+  });
+
+  it('fails with a clear error for a url that is not a git repository', async () => {
+    const notARepo = tmpDir('shipway-git-not-a-repo');
+    const gitOps = makeGitOps();
+
+    await expect(gitOps.listRemoteBranches(fileUrl(notARepo))).rejects.toThrow();
+  });
+
+  it('rejects a flag-like url instead of handing it to git as an option', async () => {
+    const gitOps = makeGitOps();
+
+    await expect(gitOps.listRemoteBranches('--upload-pack=touch /tmp/pwned')).rejects.toThrow(/invalid repository url/);
+  });
+
+  it('strips credentials embedded in the url out of the error text', async () => {
+    const url = 'https://user:s3cr3t-token@git.invalid/acme/app.git';
+    const failingRun = (() => Promise.reject(new Error(`fatal: could not read from ${url}`))) as unknown as typeof execa;
+    const gitOps = makeGitOps(failingRun);
+
+    await expect(gitOps.listRemoteBranches(url)).rejects.toThrow(/\/\/\*\*\*@git\.invalid/);
+    await expect(gitOps.listRemoteBranches(url)).rejects.not.toThrow(/s3cr3t-token/);
+  });
+
+  it('disables git\'s terminal prompt so a private url cannot block on a username prompt', async () => {
+    const calls: { args: string[]; opts: Record<string, unknown> }[] = [];
+    const fakeRun = ((_file: string, args: string[], opts: Record<string, unknown>) => {
+      calls.push({ args, opts });
+      return Promise.resolve({ stdout: '' });
+    }) as unknown as typeof execa;
+
+    await makeGitOps(fakeRun).listRemoteBranches('https://git.example.com/acme/app.git');
+
+    const env = calls[0]?.opts.env as Record<string, string> | undefined;
+    expect(calls[0]?.args).toContain('ls-remote');
+    expect(env?.GIT_TERMINAL_PROMPT).toBe('0');
+  });
+
+  it('reports a canceled listing as a cancellation, not a git failure', async () => {
+    const controller = new AbortController();
+    const hangingRun = ((_file: string, _args: string[], opts: { cancelSignal?: AbortSignal }) =>
+      new Promise((_resolve, reject) => {
+        opts.cancelSignal?.addEventListener('abort', () => {
+          reject(new Error('some raw execa cancellation error'));
+        });
+      })) as unknown as typeof execa;
+
+    const pending = makeGitOps(hangingRun).listRemoteBranches('https://git.example.com/acme/app.git', controller.signal);
+    controller.abort();
+
+    await expect(pending).rejects.toThrow(/canceled/);
+  });
 });
