@@ -1,8 +1,8 @@
 /**
- * app.ts's wiring of Task 4's service-status poller: disabled entirely under `NODE_ENV=test`
- * (vitest's default) unless a test explicitly injects `deps.serviceWatch`; when injected, it reaches
- * the real db/sysops/notifications-routes end to end, and `app.close()` stops it via an `onClose`
- * hook, leaving no open interval handle behind — otherwise a leaked `setInterval` would keep the
+ * app.ts's wiring of the service-status poller: disabled entirely under `NODE_ENV=test` (vitest's
+ * default) unless a test explicitly injects `deps.serviceWatch`; when injected, it reaches the real
+ * db/sysops end to end and records audit rows, and `app.close()` stops it via an `onClose` hook,
+ * leaving no open interval handle behind — otherwise a leaked `setInterval` would keep the
  * process (and vitest) alive after the test finishes. That every test in this whole suite exits
  * cleanly (see the end of a full `vitest run`) is itself the proof; the assertions below additionally
  * pin down the on/off wiring directly.
@@ -24,29 +24,25 @@ function tmpDataDir(): string {
 
 /** A `SysOps` double whose `systemUnitStatus` returns a freely-mutable per-unit status (default
  * `'active'`), same shape as servicewatch.test.ts's own double — here used to prove app.ts's wiring
- * (real db, real `notificationRoutes`-created subscription) reaches the real `startServiceWatch`. */
+ * (real db, real sysops) reaches the real `startServiceWatch`. */
 class MutableStatusSysOps extends DevSysOps {
   private readonly statuses = new Map<string, UnitStatus>();
+  /** How many times the poller has asked for a unit's status. With the webhook fan-out gone, this is
+   * the probe for "did a tick actually run" in the `onClose` test below — and unlike reading the db,
+   * it stays usable after `app.close()`. */
+  statusReads = 0;
 
   setStatus(unit: string, status: UnitStatus): void {
     this.statuses.set(unit, status);
   }
 
   override async systemUnitStatus(unit: string): Promise<UnitStatus> {
+    this.statusReads += 1;
     return this.statuses.get(unit) ?? 'active';
   }
 }
 
 const ADMIN = { name: 'Ada Lovelace', email: 'ada@example.com', password: 'correct-horse-battery' };
-
-function sessionCookie(res: { headers: Record<string, unknown> }): string {
-  const raw = res.headers['set-cookie'];
-  const value = Array.isArray(raw) ? raw[0] : raw;
-  if (!value || typeof value !== 'string') {
-    throw new Error('expected a set-cookie header in the response');
-  }
-  return value.split(';')[0]!;
-}
 
 describe('app.ts service-watch wiring', () => {
   it('does not start the poller under NODE_ENV=test unless deps.serviceWatch is injected', async () => {
@@ -58,48 +54,28 @@ describe('app.ts service-watch wiring', () => {
     await app.close();
   });
 
-  it('when injected, reaches the real db/sysops/subscribed channel end to end: seeds silently, then emits on a genuine transition', async () => {
+  it('when injected, reaches the real db/sysops end to end: seeds silently, then records an audit row on a genuine transition', async () => {
     const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: tmpDataDir() });
     const sysops = new MutableStatusSysOps(path.join(cfg.dataDir, 'system'));
-    const calls: string[] = [];
-    const fetchImpl = ((input: Parameters<typeof fetch>[0]) => {
-      calls.push(input.toString());
-      return Promise.resolve({ ok: true, status: 200 } as Response);
-    }) as typeof fetch;
 
     const app = await buildApp(cfg, {
       sysops,
       // A real (huge) interval — never fires on its own during the test; `.tick()` drives it instead.
-      serviceWatch: { intervalMs: 24 * 60 * 60 * 1000, fetchImpl },
+      serviceWatch: { intervalMs: 24 * 60 * 60 * 1000 },
     });
     expect(app.serviceWatch).toBeDefined();
 
-    const create = await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
-    const cookie = sessionCookie(create);
-    const channelRes = await app.inject({
-      method: 'POST',
-      url: '/api/notifications/channels',
-      headers: { cookie },
-      payload: { name: 'ops', url: 'https://hooks.slack.com/services/aaa' },
-    });
-    const channelId = (channelRes.json() as { id: number }).id;
-    await app.inject({
-      method: 'PUT',
-      url: '/api/notifications/subscriptions',
-      headers: { cookie },
-      payload: { event: 'service_down', channelId, enabled: true },
-    });
+    await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
 
     await app.serviceWatch!.tick(); // seed: nginx active, silent
-    expect(calls).toHaveLength(0);
+    expect(app.db.select().from(auditEvents).where(eq(auditEvents.action, 'service.down')).all()).toHaveLength(0);
 
     sysops.setStatus('nginx', 'failed');
-    await app.serviceWatch!.tick(); // transition: emits through the real subscribed channel
+    await app.serviceWatch!.tick(); // transition
 
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toBe('https://hooks.slack.com/services/aaa');
     const downAudits = app.db.select().from(auditEvents).where(eq(auditEvents.action, 'service.down')).all();
     expect(downAudits).toHaveLength(1);
+    expect(downAudits[0]?.targetName).toBe('nginx');
 
     await app.close();
   });
@@ -107,42 +83,22 @@ describe('app.ts service-watch wiring', () => {
   it('app.close() stops the injected poller (onClose hook): no further automatic tick fires afterward', async () => {
     const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: tmpDataDir() });
     const sysops = new MutableStatusSysOps(path.join(cfg.dataDir, 'system'));
-    const calls: string[] = [];
-    const fetchImpl = ((input: Parameters<typeof fetch>[0]) => {
-      calls.push(input.toString());
-      return Promise.resolve({ ok: true, status: 200 } as Response);
-    }) as typeof fetch;
 
-    const app = await buildApp(cfg, { sysops, serviceWatch: { intervalMs: 5, fetchImpl } });
+    const app = await buildApp(cfg, { sysops, serviceWatch: { intervalMs: 5 } });
     expect(app.serviceWatch).toBeDefined();
 
-    const create = await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
-    const cookie = sessionCookie(create);
-    const channelRes = await app.inject({
-      method: 'POST',
-      url: '/api/notifications/channels',
-      headers: { cookie },
-      payload: { name: 'ops', url: 'https://hooks.slack.com/services/aaa' },
-    });
-    const channelId = (channelRes.json() as { id: number }).id;
-    await app.inject({
-      method: 'PUT',
-      url: '/api/notifications/subscriptions',
-      headers: { cookie },
-      payload: { event: 'service_down', channelId, enabled: true },
-    });
+    await app.inject({ method: 'POST', url: '/api/setup/admin', payload: ADMIN });
 
-    // Let a few automatic (real, short-interval) ticks happen, seeding state (still active, silent).
+    // Let a few automatic (real, short-interval) ticks happen, so the poller is demonstrably running.
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(calls).toHaveLength(0);
+    expect(sysops.statusReads).toBeGreaterThan(0);
 
     await app.close();
+    const readsAtClose = sysops.statusReads;
 
-    // If `onClose` had NOT called `.stop()`, the interval would keep firing: flipping the unit down
-    // now and waiting would pick it up on the next automatic tick and produce a call. With the
-    // interval genuinely cleared, no more ticks ever run, so this must stay at 0 forever.
-    sysops.setStatus('nginx', 'failed');
+    // If `onClose` had NOT called `.stop()`, the interval would keep firing and keep reading unit
+    // statuses. With it genuinely cleared, the count can never move again.
     await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(calls).toHaveLength(0);
+    expect(sysops.statusReads).toBe(readsAtClose);
   });
 });

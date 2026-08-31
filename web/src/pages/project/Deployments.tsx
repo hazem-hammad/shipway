@@ -18,7 +18,7 @@ import {
 } from '../../api';
 import { useDeployments } from '../../hooks';
 import { DurationText } from '../../components/Duration';
-import { Button, Card, Chip, EmptyState, ICON_STROKE, Skeleton, StatusDot, type StatusDotStatus } from '../../components/ui';
+import { BranchLabel, Button, Card, Chip, EmptyState, ICON_STROKE, Skeleton, StatusDot, type StatusDotStatus } from '../../components/ui';
 import { formatRelativeTime, shortSha } from '../../lib/format';
 
 const DOT_STATUS_BY_DEPLOY: Record<DeploymentStatus, StatusDotStatus> = {
@@ -163,6 +163,12 @@ function DeploymentRow({
         </div>
 
         <Chip>{TRIGGER_LABEL[deployment.trigger]}</Chip>
+
+        {/* Hidden on narrow screens for the same reason as Duration/Started below it: the commit
+            message is what this row is really about, and it needs the width. */}
+        <div className="hidden w-32 shrink-0 md:block">
+          <BranchLabel branch={deployment.branch} />
+        </div>
 
         <div className="flex min-w-0 flex-1 items-center gap-2">
           {deployment.commitSha && <Chip>{shortSha(deployment.commitSha)}</Chip>}

@@ -16,7 +16,7 @@ import {
   fetchInvite,
   fetchMailConfig,
   fetchMe,
-  fetchNotifications,
+  fetchProjectNotifications,
   fetchOverview,
   fetchProject,
   fetchProjectEnv,
@@ -32,7 +32,7 @@ import {
   verifyCloudflare,
   type AuditConfig,
   type CloudflareVerifyResult,
-  type CronJob,
+  type CronJobsResponse,
   type DatabaseListItem,
   type DbConnection,
   type Deployment,
@@ -43,7 +43,7 @@ import {
   type InvitePreview,
   type MailConfig,
   type Me,
-  type NotificationsMatrix,
+  type ProjectNotifications,
   type Overview,
   type Project,
   type ProjectListItem,
@@ -132,14 +132,22 @@ export function useProjects(): UseQueryResult<ProjectListItem[]> {
 }
 
 /**
- * The global Deployments page's list (`GET /api/deployments`, Task 5/7). Polls every 10s while any
- * row is queued/running, else every 30s.
+ * The global Deployments page's list (`GET /api/deployments`, Task 5/7).
+ *
+ * Two speeds, because the page has two jobs. While something is queued or running it is a live
+ * view of work in flight — a deploy moves through resolve/build/activate in seconds, so a 10s poll
+ * showed a stage that had already finished — hence 2s. With everything settled it is a history
+ * list that only changes when someone pushes, so it drops to 30s.
+ *
+ * `refetchOnWindowFocus` covers the case polling can't: a tab left in the background for an hour
+ * shows the truth the moment it is looked at again, rather than up to 30s later.
  */
 export function useGlobalDeployments(): UseQueryResult<GlobalDeployment[]> {
   return useQuery({
     queryKey: ['deployments-global'],
     queryFn: () => fetchGlobalDeployments(),
-    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 10_000 : 30_000),
+    refetchInterval: (query) => (query.state.data?.some((d) => isPendingDeploymentStatus(d.status)) ? 2_000 : 30_000),
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -235,8 +243,8 @@ export function useWorkers(projectId: number): UseQueryResult<WorkerListItem[]> 
   return useQuery({ queryKey: ['workers', projectId], queryFn: () => fetchWorkers(projectId) });
 }
 
-/** A project's cron jobs (Cron tab). */
-export function useCronJobs(projectId: number): UseQueryResult<CronJob[]> {
+/** A project's cron jobs (Cron tab), plus the host timezone and paths the tab explains them with. */
+export function useCronJobs(projectId: number): UseQueryResult<CronJobsResponse> {
   return useQuery({ queryKey: ['cron', projectId], queryFn: () => fetchCronJobs(projectId) });
 }
 
@@ -277,10 +285,11 @@ export function useUsers(): UseQueryResult<User[]> {
   return useQuery({ queryKey: ['users'], queryFn: fetchUsers });
 }
 
-// ---- Settings > Notifications ----
+// ---- Project > Settings > Notifications ----
 
-export function useNotifications(): UseQueryResult<NotificationsMatrix> {
-  return useQuery({ queryKey: ['notifications'], queryFn: fetchNotifications });
+/** Keyed per project, so switching projects never shows the previous one's recipient list. */
+export function useProjectNotifications(projectId: number): UseQueryResult<ProjectNotifications> {
+  return useQuery({ queryKey: ['project-notifications', projectId], queryFn: () => fetchProjectNotifications(projectId) });
 }
 
 // ---- Audit log ----

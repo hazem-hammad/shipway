@@ -417,9 +417,27 @@ describe('GET /api/projects/:id/cron', () => {
     const res = await app.inject({ method: 'GET', url: `/api/projects/${projectId}/cron`, headers: { cookie } });
 
     expect(res.statusCode).toBe(200);
-    const body = res.json();
-    expect(body).toHaveLength(1);
-    expect(body[0]).toMatchObject({ projectId, schedule: '* * * * *', command: 'true' });
+    const body = res.json() as { jobs: { projectId: number; schedule: string; command: string }[]; timezone: string; workingDir: string; logDir: string };
+    expect(body.jobs).toHaveLength(1);
+    expect(body.jobs[0]).toMatchObject({ projectId, schedule: '* * * * *', command: 'true' });
+
+    await app.close();
+  });
+
+  it('reports the host timezone and the paths a rendered crontab line uses', async () => {
+    const { app, cookie } = await buildCronTestApp();
+    const projectId = insertRouteProject(app, { slug: 'blog', type: 'static' });
+
+    const res = await app.inject({ method: 'GET', url: `/api/projects/${projectId}/cron`, headers: { cookie } });
+    const body = res.json() as { jobs: unknown[]; timezone: string; workingDir: string; logDir: string };
+
+    // A resolvable IANA zone (or the UTC fallback) — never blank, since the dashboard computes
+    // "next run" against it.
+    expect(body.timezone.length).toBeGreaterThan(0);
+    // These have to match what `renderCronLine` actually writes into the crontab, or the UI would
+    // confidently point at the wrong directory.
+    expect(body.workingDir).toBe(`${app.cfg.appsDir}/blog/current`);
+    expect(body.logDir).toBe(`${app.cfg.logsDir}/blog`);
 
     await app.close();
   });

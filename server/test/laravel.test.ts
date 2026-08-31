@@ -10,6 +10,7 @@ import {
   type PhpEnvInput,
 } from '../src/deploy/laravel.js';
 import { parseEnv, serializeEnv } from '../src/deploy/envparse.js';
+import { buildEnvFile, buildManagedVars } from '../src/deploy/envfile.js';
 
 /** Reads a single key's value out of rendered env text (rows only, so comments never match). */
 function valueOf(env: string, key: string): string | undefined {
@@ -22,7 +23,9 @@ const FULL: PhpEnvInput = {
   appKey: 'base64:0000000000000000000000000000000000000000000=',
   baseDomain: 'apps.example.com',
   redis: { host: '10.0.0.5', port: 6380, password: 'r3dis' },
-  mail: { host: '127.0.0.1', port: 1025 },
+  smtpMode: 'mailpit',
+  // What buildManagedVars('mailpit') owns — the template must write none of these itself.
+  managedMailKeys: ['MAIL_MAILER', 'MAIL_HOST', 'MAIL_PORT', 'MAIL_ENCRYPTION', 'SMTP_HOST', 'SMTP_PORT'],
   db: { engine: 'mysql', name: 'tools', username: 'tools', password: 'Sup3rSecret' },
 };
 
@@ -89,9 +92,6 @@ describe('buildPhpEnv', () => {
       'REDIS_HOST',
       'REDIS_PASSWORD',
       'REDIS_PORT',
-      'MAIL_MAILER',
-      'MAIL_HOST',
-      'MAIL_PORT',
       'MAIL_FROM_ADDRESS',
       'MAIL_FROM_NAME',
     ]) {
@@ -115,15 +115,43 @@ describe('buildPhpEnv', () => {
     expect(valueOf(env, 'REDIS_PASSWORD')).toBe('null');
   });
 
-  it('sends mail through mailpit over SMTP', () => {
+  it('leaves the mail transport to the managed block and writes only who mail is from', () => {
     const env = buildPhpEnv(FULL);
 
-    expect(valueOf(env, 'MAIL_MAILER')).toBe('smtp');
-    expect(valueOf(env, 'MAIL_HOST')).toBe('127.0.0.1');
-    expect(valueOf(env, 'MAIL_PORT')).toBe('1025');
+    // Not an omission: a key the template writes is a USER key, and buildEnvFile drops managed vars
+    // for keys the user already defines. Writing MAIL_HOST here would pin the project to whatever
+    // service was chosen at creation forever.
+    for (const key of ['MAIL_MAILER', 'MAIL_HOST', 'MAIL_PORT', 'MAIL_USERNAME', 'MAIL_PASSWORD']) {
+      expect(valueOf(env, key), `${key} must come from the managed block`).toBeUndefined();
+    }
     expect(valueOf(env, 'MAIL_FROM_ADDRESS')).toBe('hello@apps.example.com');
     // Laravel's own dotenv interpolation, deliberately left unquoted so it still interpolates.
     expect(valueOf(env, 'MAIL_FROM_NAME')).toBe('${APP_NAME}');
+  });
+
+  it('yields to the service that supplies its own from-address', () => {
+    const env = buildPhpEnv({ ...FULL, smtpMode: 'ses', managedMailKeys: ['MAIL_MAILER', 'MAIL_HOST', 'MAIL_FROM_ADDRESS'] });
+
+    expect(valueOf(env, 'MAIL_FROM_ADDRESS')).toBeUndefined();
+    expect(valueOf(env, 'MAIL_FROM_NAME')).toBe('${APP_NAME}');
+  });
+
+  /**
+   * The regression this whole split exists for. Before it, the template wrote Mailpit's MAIL_HOST
+   * as a user key, so `buildEnvFile` dropped the managed MAIL_HOST and a project switched to SES
+   * carried on delivering to Mailpit — the SMTP tab looked like it worked and did nothing.
+   */
+  it('lets the chosen email service actually reach the rendered .env', () => {
+    const sesConfig = { region: 'eu-west-1', username: 'AKIAsmtp', password: 'ses-secret', fromAddress: 'hi@example.com' };
+    const managed = buildManagedVars({ smtpMode: 'ses', sesConfig });
+    const template = buildPhpEnv({ ...FULL, smtpMode: 'ses', managedMailKeys: Object.keys(managed) });
+
+    const rendered = buildEnvFile(template, managed);
+
+    expect(valueOf(rendered, 'MAIL_HOST')).toBe('email-smtp.eu-west-1.amazonaws.com');
+    expect(valueOf(rendered, 'MAIL_PORT')).toBe('587');
+    expect(valueOf(rendered, 'MAIL_FROM_ADDRESS')).toBe('hi@example.com');
+    expect(rendered).not.toContain('1025');
   });
 
   it('injects the provisioned database credentials as DB_*', () => {
@@ -182,20 +210,30 @@ describe('buildPhpEnv', () => {
       expect(valueOf(env, 'REDIS_PORT')).toBe('6379');
     });
 
-    it('logs mail when the server has no mailpit', () => {
-      const env = buildPhpEnv({ ...FULL, mail: null });
+    it('logs mail when no email service is selected', () => {
+      const env = buildPhpEnv({ ...FULL, smtpMode: 'none', managedMailKeys: [] });
 
+      // 'none' has no managed block at all, so the template states the mailer itself rather than
+      // letting the app fall through to whatever config/mail.php defaults to.
       expect(valueOf(env, 'MAIL_MAILER')).toBe('log');
       expect(valueOf(env, 'MAIL_HOST')).toBeUndefined();
     });
 
-    it('caches to files and emits no DB_* block when no database is being created', () => {
+    it('falls back to SQLite when no database is being created, so the first deploy still migrates', () => {
       const env = buildPhpEnv({ ...FULL, db: null });
 
       expect(valueOf(env, 'CACHE_STORE')).toBe('file');
-      expect(valueOf(env, 'DB_CONNECTION')).toBeUndefined();
+      // Without this, `php artisan migrate --force` in the build command runs against whatever
+      // config/database.php defaults to and fails the project's very first deploy.
+      expect(valueOf(env, 'DB_CONNECTION')).toBe('sqlite');
       expect(valueOf(env, 'DB_PASSWORD')).toBeUndefined();
-      expect(env).toContain('# No database was created with this project.');
+      expect(env).toContain('SQLite');
+    });
+
+    it('leaves DB_DATABASE to the managed block, since the template cannot know the host apps dir', () => {
+      // The template is rendered in the BROWSER on the New Project page, where `appsDir` is unknown.
+      // `deploy/envfile.ts` supplies the absolute path on every deploy instead.
+      expect(valueOf(buildPhpEnv({ ...FULL, db: null }), 'DB_DATABASE')).toBeUndefined();
     });
 
     it('caches to the database only when there is one (its cache table comes from migrate)', () => {

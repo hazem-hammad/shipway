@@ -12,10 +12,11 @@ import { buildOwnerApp, createAdmin, createMember } from './helpers.js';
 const FORBIDDEN_ADMIN = { error: 'requires admin' };
 
 interface MailConfigResponse {
-  driver: 'none' | 'mailpit' | 'smtp';
+  driver: 'none' | 'mailpit' | 'smtp' | 'ses';
   host: string;
   port: number;
   secure: boolean;
+  region: string | null;
   username: string | null;
   password: string | null;
   fromAddress: string;
@@ -35,6 +36,7 @@ describe('GET /api/settings/mail', () => {
       host: '',
       port: 587,
       secure: false,
+      region: null,
       username: null,
       password: null,
       fromAddress: '',
@@ -148,6 +150,135 @@ describe('PUT /api/settings/mail', () => {
         payload: { driver: 'smtp', host: 'smtp.example.com', port: 587, fromAddress: 'noreply@example.com' },
       });
       expect(res.statusCode).toBe(200);
+      await app.close();
+    });
+
+    it('rejects ses with no region/username/password/fromAddress at all', async () => {
+      const { app, cookie } = await buildOwnerApp();
+      const res = await app.inject({ method: 'PUT', url: '/api/settings/mail', headers: { cookie }, payload: { driver: 'ses' } });
+      expect(res.statusCode).toBe(400);
+      const body = res.json() as { error: string };
+      expect(body.error).toContain('region');
+      expect(body.error).toContain('username');
+      expect(body.error).toContain('password');
+      expect(body.error).toContain('fromAddress');
+      await app.close();
+    });
+
+    it('rejects a ses region that is not a well-formed AWS region code', async () => {
+      const { app, cookie } = await buildOwnerApp();
+      for (const region of ['us-east-1.evil.example.com', 'evil.example.com', 'US-EAST-1', '   ']) {
+        const res = await app.inject({
+          method: 'PUT',
+          url: '/api/settings/mail',
+          headers: { cookie },
+          payload: { driver: 'ses', region, username: 'u', password: 'p', fromAddress: 'a@b.com' },
+        });
+        expect(res.statusCode, region).toBe(400);
+        expect((res.json() as { error: string }).error).toContain('region');
+      }
+      // Nothing was persisted by any of the rejected attempts.
+      expect(getMailConfig(app.db, app.secretBox).driver).toBe('none');
+      await app.close();
+    });
+
+    it('accepts a complete ses config and derives the endpoint from the region', async () => {
+      const { app, cookie } = await buildOwnerApp();
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/api/settings/mail',
+        headers: { cookie },
+        payload: {
+          driver: 'ses',
+          region: 'eu-central-1',
+          username: 'AKIAIOSFODNN7EXAMPLE',
+          password: 'ses-smtp-password',
+          fromAddress: 'noreply@example.com',
+          fromName: 'Shipway',
+        },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const body = res.json() as MailConfigResponse;
+      expect(body.driver).toBe('ses');
+      expect(body.region).toBe('eu-central-1');
+      expect(body.host).toBe('email-smtp.eu-central-1.amazonaws.com');
+      expect(body.port).toBe(587);
+      expect(body.secure).toBe(false);
+      expect(body.configured).toBe(true);
+      // The credential is masked on the way out but stored decryptable.
+      expect(body.password).toBe('•••word');
+      expect(getMailConfig(app.db, app.secretBox).password).toBe('ses-smtp-password');
+
+      await app.close();
+    });
+
+    it('ignores a client-supplied host/port for ses rather than letting it override the endpoint', async () => {
+      const { app, cookie } = await buildOwnerApp();
+      const res = await app.inject({
+        method: 'PUT',
+        url: '/api/settings/mail',
+        headers: { cookie },
+        payload: {
+          driver: 'ses',
+          region: 'us-east-1',
+          host: 'attacker.example.com',
+          port: 2525,
+          secure: true,
+          username: 'u',
+          password: 'p',
+          fromAddress: 'a@b.com',
+        },
+      });
+      expect(res.statusCode).toBe(200);
+
+      const body = res.json() as MailConfigResponse;
+      expect(body.host).toBe('email-smtp.us-east-1.amazonaws.com');
+      expect(body.port).toBe(587);
+      expect(body.secure).toBe(false);
+
+      await app.close();
+    });
+
+    it('keeps an existing ses password when a later ses update omits it', async () => {
+      const { app, cookie } = await buildOwnerApp();
+      const base = { driver: 'ses', region: 'us-east-1', username: 'u', fromAddress: 'a@b.com' };
+
+      const first = await app.inject({ method: 'PUT', url: '/api/settings/mail', headers: { cookie }, payload: { ...base, password: 'keep-me' } });
+      expect(first.statusCode).toBe(200);
+
+      // Changes only the region; `password` is absent entirely, as the frontend sends it.
+      const second = await app.inject({ method: 'PUT', url: '/api/settings/mail', headers: { cookie }, payload: { ...base, region: 'eu-west-1' } });
+      expect(second.statusCode).toBe(200);
+      expect((second.json() as MailConfigResponse).host).toBe('email-smtp.eu-west-1.amazonaws.com');
+      expect(getMailConfig(app.db, app.secretBox).password).toBe('keep-me');
+
+      await app.close();
+    });
+
+    it('does not carry an smtp password over into a ses config on a driver switch', async () => {
+      const { app, cookie } = await buildOwnerApp();
+
+      const first = await app.inject({
+        method: 'PUT',
+        url: '/api/settings/mail',
+        headers: { cookie },
+        payload: { driver: 'smtp', host: 'smtp.example.com', port: 587, fromAddress: 'a@b.com', password: 'an-smtp-secret' },
+      });
+      expect(first.statusCode).toBe(200);
+
+      // Switching drivers without supplying a credential is rejected rather than silently reusing
+      // the SMTP one, which SES SMTP auth would only ever refuse.
+      const second = await app.inject({
+        method: 'PUT',
+        url: '/api/settings/mail',
+        headers: { cookie },
+        payload: { driver: 'ses', region: 'us-east-1', username: 'u', fromAddress: 'a@b.com' },
+      });
+      expect(second.statusCode).toBe(400);
+      expect((second.json() as { error: string }).error).toContain('password');
+      expect(getMailConfig(app.db, app.secretBox).driver).toBe('smtp');
+
       await app.close();
     });
 

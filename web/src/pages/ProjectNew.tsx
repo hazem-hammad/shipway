@@ -7,7 +7,7 @@
  * carried over from the v1 page) is to also set the env (if any was pasted) and kick off the first
  * deploy, then land the user on that deployment's live log.
  */
-import { type FormEvent, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, type FormEvent, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -18,13 +18,19 @@ import {
   GitBranch,
   Globe,
   HeartPulse,
+  Check,
   Link2,
+  LoaderCircle,
   Lock,
+  Mail,
+  Minus,
   PlayCircle,
   Rocket,
   Search,
   Tag,
   Terminal,
+  Upload,
+  X,
   Zap,
 } from 'lucide-react';
 import {
@@ -33,15 +39,21 @@ import {
   createProject,
   deployProject,
   fetchDatabaseCredentials,
+  importDatabaseSql,
   injectDatabase,
   putProjectEnv,
+  putProjectSmtp,
+  MAX_SQL_IMPORT_BYTES,
   type CloudflareVerifyResult,
   type CreateProjectBody,
   type DatabaseListItem,
   type DbConnection,
   type DnsOutcome,
   type GithubRepo,
+  type ProjectSmtpMode,
   type ProjectType,
+  type SesSmtpConfig,
+  type SmtpConfig,
 } from '../api';
 import {
   useCloudflareVerify,
@@ -65,6 +77,7 @@ import {
   generateAppKey,
   upsertEnvVars,
 } from '../../../server/src/deploy/laravel.js';
+import { NODE_BUILD_CMD, NODE_INSTALL_CMD, NODE_START_CMD } from '../../../server/src/deploy/node.js';
 import { IDENTIFIER_RE, connectionEnv, isReservedDbName, type DbEngine } from '../../../server/src/services/dbconn.js';
 import { NextjsIcon, NodeIcon, PhpIcon, StaticIcon, type BrandIconProps } from '../components/BrandIcons';
 import {
@@ -85,8 +98,12 @@ import {
   Skeleton,
   Tabs,
   Textarea,
+  buttonClasses,
 } from '../components/ui';
 import { slugify, SLUG_RE } from '../lib/slug';
+import { isDbCapable } from '../lib/database';
+import { SMTP_OPTIONS, managedMailVars, smtpOptionLabel } from '../lib/smtp';
+import { SES_DEFAULT_REGION, SES_REGIONS, SES_SMTP_PORT, sesSmtpHost } from '../lib/ses';
 
 // ---------------------------------------------------------------------------
 // Source (step 1) — a project's git origin: a GitHub App repo, or any git URL.
@@ -166,8 +183,8 @@ const TYPE_DEFAULTS: Record<ProjectType, TypeDefaults> = {
     preDeployScript: LARAVEL_PRE_DEPLOY_SCRIPT,
     postDeployScript: LARAVEL_POST_DEPLOY_SCRIPT,
   },
-  node: { installCmd: 'npm ci', buildCmd: 'npm run build', startCmd: 'npm start', publicDir: '', preDeployScript: '', postDeployScript: '' },
-  nextjs: { installCmd: 'npm ci', buildCmd: 'npm run build', startCmd: 'npm start', publicDir: '', preDeployScript: '', postDeployScript: '' },
+  node: { installCmd: NODE_INSTALL_CMD, buildCmd: NODE_BUILD_CMD, startCmd: NODE_START_CMD, publicDir: '', preDeployScript: '', postDeployScript: '' },
+  nextjs: { installCmd: NODE_INSTALL_CMD, buildCmd: NODE_BUILD_CMD, startCmd: NODE_START_CMD, publicDir: '', preDeployScript: '', postDeployScript: '' },
   static: { installCmd: '', buildCmd: '', startCmd: '', publicDir: '', preDeployScript: '', postDeployScript: '' },
 };
 
@@ -245,10 +262,87 @@ function dbNameError(name: string): string | null {
 }
 
 /**
+ * Why the chosen email service can't be saved yet, or null. Only `custom` and `ses` can be
+ * incomplete — Mailpit and None need nothing from the user. Deliberately the same fields the
+ * server validates (`PUT /api/projects/:id/smtp`), so the form refuses what the API would refuse,
+ * at the point the user can still fix it.
+ */
+function mailFormError(
+  mode: ProjectSmtpMode,
+  f: { host: string; port: string; username: string; password: string; from: string; region: string },
+): string | null {
+  if (mode === 'custom') {
+    if (f.host.trim() === '') return 'Give the SMTP server a hostname.';
+    const port = Number(f.port);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return 'Port must be a number between 1 and 65535.';
+    return null;
+  }
+  if (mode === 'ses') {
+    if (f.region.trim() === '') return 'Pick the AWS region your SES identity lives in.';
+    // SES is the one service that can't fall back to anything: an unverified from-address or the
+    // wrong kind of credential fails at send time, long after this page.
+    if (f.username.trim() === '') return 'SES needs its SMTP username — the one minted in the SES console, not an AWS access key.';
+    if (f.password === '') return 'SES needs its SMTP password.';
+    if (f.from.trim() === '') return 'SES needs a from-address, and it must be an identity you have verified.';
+    return null;
+  }
+  return null;
+}
+
+/** The `config` half of `PUT /api/projects/:id/smtp`'s body, for the two modes that carry one. */
+function mailConfigBody(
+  mode: 'custom' | 'ses',
+  config: { smtpConfig?: SmtpConfig; sesConfig?: SesSmtpConfig },
+): SmtpConfig | SesSmtpConfig | undefined {
+  return mode === 'custom' ? config.smtpConfig : config.sesConfig;
+}
+
+/**
+ * The setup screen shown between "Deploy" and the deployment log: one line per thing Shipway is
+ * actually doing, ticked off as each finishes.
+ *
+ * Every step here is real work, and a step only appears when it will actually run — no database
+ * line for a project without one, no SQL line without a dump. The one presentational liberty is
+ * that the three stages `POST /api/projects` performs server-side in a single request (vhost +
+ * unit, the DNS record, and the Laravel cron/worker seed) are revealed in sequence rather than
+ * all at once, because they genuinely happen in that order inside that call.
+ */
+type PrepState = 'pending' | 'active' | 'done' | 'skipped' | 'failed';
+
+interface PrepStep {
+  id: string;
+  label: string;
+  state: PrepState;
+  /** Replaces `label`'s trailing detail once the step resolves — e.g. what DNS actually did. */
+  detail?: string;
+}
+
+/**
+ * The floor on how long the setup screen stays up. The work behind it is often faster than this,
+ * and a progress screen that flashes past is worse than none at all — the user is left unsure
+ * whether anything happened. Padding to a readable minimum is the point, not the illusion of work.
+ */
+const MIN_PREP_MS = 5000;
+
+/** The beat between the server-side stages of project creation, revealed in sequence. */
+const PREP_BEAT_MS = 420;
+
+/**
  * How a project gets its database: no database at all, a new one created on the chosen connection,
  * or one that is already there.
  */
 type DbMode = 'none' | 'create' | 'existing';
+
+/**
+ * A setup step that failed after the project row itself was created, and which one. The project
+ * exists and is deployable in every case — the rail uses `stage` to say what is actually missing,
+ * because "no database", "a database with none of your data in it" and "mail that will not send"
+ * need three different next moves.
+ */
+interface SetupFailure {
+  stage: 'create' | 'import' | 'smtp';
+  message: string;
+}
 
 /** The Connection dropdown's "don't give this project a database" value. */
 const DB_CONNECTION_NONE = '';
@@ -276,21 +370,51 @@ function errorMessage(err: unknown): string {
  * `error` alone ("database provisioning failed") says nothing actionable, so the `detail` (missing
  * admin credentials, a name the engine already has, …) is what gets shown.
  */
-function databaseErrorMessage(err: unknown): string {
+function databaseErrorMessage(err: unknown, fallback = 'Something went wrong creating the database.'): string {
   if (err instanceof ApiError) {
     const detail = (err.body as { detail?: string } | undefined)?.detail;
     return detail === undefined || detail === '' ? err.message : `${err.message}: ${detail}`;
   }
-  return 'Something went wrong creating the database.';
+  return fallback;
+}
+
+/** `1.4 MB` — one decimal place, and never for a file too small to have one. Only ever shown next
+ * to a picked SQL file, which is why it stops at MB: the upload is capped well below a GB. */
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return `${String(bytes)} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
+  const mb = kb / 1024;
+  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
+}
+
+/** Why a picked dump can't be uploaded, or null. The server enforces both of these itself; catching
+ * them here saves pushing a file across the wire only to be told no at the end of it. */
+function sqlFileError(file: File | null): string | null {
+  if (file === null) return null;
+  if (file.size === 0) return 'That file is empty.';
+  if (file.size > MAX_SQL_IMPORT_BYTES) {
+    return `That file is ${formatFileSize(file.size)} — the limit is ${formatFileSize(MAX_SQL_IMPORT_BYTES)}. Import it from a shell instead.`;
+  }
+  return null;
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** How long the Domain card's DNS result row stays visible before this page navigates away —
- * long enough to actually read a short line, short enough not to feel like a stall. */
-const DNS_RESULT_DISPLAY_MS = 900;
+/**
+ * What the DNS step reports once it has run. `attempted: false` means no Cloudflare client was
+ * configured at all, which is a real outcome rather than a failure — the user acknowledged it on
+ * the form before submitting (see `createAnyway`), so it is stated plainly rather than dressed up.
+ * A genuine DNS failure never reaches here: it fails project creation with a 502 instead.
+ */
+function dnsStepDetail(slug: string, baseDomain: string, dns: DnsOutcome): string {
+  const host = `${slug}.${baseDomain}`;
+  if (!dns.attempted) return `Skipped the DNS record for ${host} — Cloudflare isn't connected`;
+  if (dns.existed) return `${host} already pointed here`;
+  return `Pointed ${host} at this server`;
+}
 
 // ---------------------------------------------------------------------------
 // Domain card readiness — the create route can only make good on the DNS record it shows when
@@ -378,11 +502,32 @@ export default function ProjectNewPage() {
   const [dbExistingId, setDbExistingId] = useState<number | null>(null);
   const [dbNameInput, setDbNameInput] = useState('');
   const [dbNameTouched, setDbNameTouched] = useState(false);
+  // An optional dump to replay into the database being created, uploaded straight after it is
+  // provisioned and before the first deploy — so an app whose migrations expect an existing schema
+  // finds one. Only ever read in 'create' mode; an existing database already has whatever it has.
+  const [dbSqlFile, setDbSqlFile] = useState<File | null>(null);
+
+  // The email service this project's mail goes through. Held here rather than left to the SMTP tab
+  // because the MAIL_* it implies belong in the env the user is reviewing before the first deploy —
+  // and because a project that silently defaults to a catch-all is a project whose password-reset
+  // mails quietly go nowhere.
+  const [smtpMode, setSmtpMode] = useState<ProjectSmtpMode>('mailpit');
+  const [smtpHost, setSmtpHost] = useState('');
+  const [smtpPort, setSmtpPort] = useState('587');
+  const [smtpUsername, setSmtpUsername] = useState('');
+  const [smtpPassword, setSmtpPassword] = useState('');
+  const [smtpFrom, setSmtpFrom] = useState('');
+  const [smtpEncryption, setSmtpEncryption] = useState('tls');
+  const [sesRegion, setSesRegion] = useState(SES_DEFAULT_REGION);
 
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
   const [slugTouched, setSlugTouched] = useState(false);
   const [slugApiError, setSlugApiError] = useState<string | null>(null);
+
+  // Non-null only while the setup screen is up, which is also what makes that screen show instead
+  // of the form. Rebuilt per submit, so a retry after a failure starts from a clean plan.
+  const [prep, setPrep] = useState<PrepStep[] | null>(null);
 
   const [submitting, setSubmitting] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
@@ -390,7 +535,9 @@ export default function ProjectNewPage() {
   // Set once the project row exists, so a follow-up step that failed (the database) can be reported
   // without offering a Deploy button that would only 409 on the now-taken slug.
   const [created, setCreated] = useState<{ id: number; slug: string } | null>(null);
-  const [dbError, setDbError] = useState<string | null>(null);
+  // `stage` is the difference between "there is no database" and "there is one, but your dump
+  // didn't load into it" — two failures with the same shape and completely different fixes.
+  const [setupError, setSetupError] = useState<SetupFailure | null>(null);
 
   // "Create anyway without a DNS record" — required only while dnsReady is false (spec §3 "New
   // Project DNS"); reset to false below whenever the underlying gap reason changes, so a stale ack
@@ -473,7 +620,39 @@ export default function ProjectNewPage() {
       : (databasesQuery.data ?? []).filter((row) => row.connectionKey === dbConnection.key && isReservedDbName(row.name)).length;
   const existingDb = existingDatabases.find((row) => row.id === dbExistingId) ?? null;
 
-  const dbMode: DbMode = dbConnection === null ? 'none' : dbCreateNew ? 'create' : 'existing';
+  // Exactly the shape `buildManagedVars` takes, so the preview below and the .env written at deploy
+  // come from one function rather than two that agree today.
+  const mailConfig = useMemo(
+    () =>
+      smtpMode === 'custom'
+        ? {
+            smtpConfig: {
+              host: smtpHost.trim(),
+              port: Number(smtpPort),
+              username: smtpUsername.trim() === '' ? undefined : smtpUsername,
+              password: smtpPassword === '' ? undefined : smtpPassword,
+              fromAddress: smtpFrom.trim() === '' ? undefined : smtpFrom.trim(),
+              encryption: smtpEncryption.trim() === '' ? undefined : smtpEncryption.trim(),
+            },
+          }
+        : smtpMode === 'ses'
+          ? { sesConfig: { region: sesRegion.trim(), username: smtpUsername.trim(), password: smtpPassword, fromAddress: smtpFrom.trim() } }
+          : {},
+    [smtpMode, smtpHost, smtpPort, smtpUsername, smtpPassword, smtpFrom, smtpEncryption, sesRegion],
+  );
+  // `null` while the form is still missing something the service needs — never "writes nothing".
+  const managedMail = managedMailVars(smtpMode, mailConfig);
+  // The template only cares WHICH keys the service owns, not their values — depending on the values
+  // would rebuild the whole env draft on every keystroke in the SMTP fields.
+  const managedMailKey = Object.keys(managedMail ?? {}).join(',');
+  const mailIssue = mailFormError(smtpMode, { host: smtpHost, port: smtpPort, username: smtpUsername, password: smtpPassword, from: smtpFrom, region: sesRegion });
+
+  // A static site has no server to open a connection from, and nextjs is excluded by the same rule
+  // that hides its Database tab — so the card is not shown, and the mode is forced off rather than
+  // merely hidden. Without the second half, picking a connection as php and then switching type
+  // would still provision a database for a project that can never use it.
+  const showDatabase = isDbCapable(type);
+  const dbMode: DbMode = !showDatabase || dbConnection === null ? 'none' : dbCreateNew ? 'create' : 'existing';
   const dbName = dbNameTouched ? dbNameInput : dbNameFromSlug(slug);
   const dbNameIssue = dbMode === 'create' ? dbNameError(dbName) : null;
   // "Use an existing database" with nothing chosen blocks Deploy, but is not shown in red: an
@@ -482,7 +661,8 @@ export default function ProjectNewPage() {
   // deploying) is a mistake, and that one gets the error text.
   const existingDbUnpicked = dbMode === 'existing' && existingDb === null;
   const existingDbError = existingDbUnpicked && dbExistingId !== null ? 'That database no longer exists. Pick another.' : null;
-  const dbBlocked = dbNameIssue !== null || existingDbUnpicked;
+  const dbSqlIssue = dbMode === 'create' ? sqlFileError(dbSqlFile) : null;
+  const dbBlocked = dbNameIssue !== null || existingDbUnpicked || dbSqlIssue !== null;
 
   // What the env template renders as its DB_* block. For an existing database the real password is
   // fetched at submit time (it's stored encrypted server-side, revealed only on request), so the
@@ -524,7 +704,11 @@ export default function ProjectNewPage() {
       appKey: appKeyRef.current,
       baseDomain,
       redis: redis ? { host: redis.host, port: redis.port, password: redis.password ?? null } : null,
-      mail: mailpit ? { host: mailpit.smtpHost, port: mailpit.smtpPort } : null,
+      smtpMode,
+      // The template writes none of these: everything it emits is a USER key, and a user key
+      // suppresses the managed one Shipway regenerates each deploy (see buildEnvFile). Writing
+      // MAIL_HOST here is what used to pin a project to whatever service it was created with.
+      managedMailKeys: Object.keys(managedMail ?? {}),
       db: dbTarget,
     });
   }, [
@@ -534,7 +718,8 @@ export default function ProjectNewPage() {
     slug,
     baseDomain,
     redis,
-    mailpit,
+    smtpMode,
+    managedMailKey,
     dbTarget?.engine,
     dbTarget?.name,
     dbTarget?.username,
@@ -631,6 +816,7 @@ export default function ProjectNewPage() {
     SLUG_RE.test(slug) &&
     branch.trim() !== '' &&
     publicDirIssue === null &&
+    mailIssue === null &&
     !dbBlocked &&
     created === null &&
     !submitting &&
@@ -642,14 +828,65 @@ export default function ProjectNewPage() {
   }
 
   /** Queues the first deploy and lands on its live log, or on the project if queueing failed. */
-  async function startFirstDeploy(projectId: number): Promise<void> {
+  /**
+   * Triggers the first deploy and lands the user on its log.
+   *
+   * `notBefore` (an epoch ms deadline, used only from the setup screen) delays the NAVIGATION, never
+   * the request — the deploy is kicked off immediately so the "Starting the first deploy" line is
+   * true while it is showing, and only the hand-off waits for the screen's minimum time to elapse.
+   */
+  async function startFirstDeploy(projectId: number, notBefore = 0): Promise<void> {
     try {
       const { deploymentId } = await deployProject(projectId);
+      await sleep(Math.max(0, notBefore - Date.now()));
       navigate(`/projects/${String(projectId)}/deployments/${String(deploymentId)}`);
     } catch {
       // Best-effort, matching the create-then-deploy split below — land on the project instead.
+      await sleep(Math.max(0, notBefore - Date.now()));
       navigate(`/projects/${String(projectId)}`);
     }
+  }
+
+  /** Marks one step, leaving the rest alone. A no-op once the screen is down. */
+  function setStepState(id: string, state: PrepState, detail?: string): void {
+    setPrep((current) => current?.map((s) => (s.id === id ? { ...s, state, ...(detail === undefined ? {} : { detail }) } : s)) ?? null);
+  }
+
+  /** Marks `id` done (or skipped/failed) and lights the next step that hasn't run yet. */
+  function completeStep(id: string, state: PrepState = 'done', detail?: string): void {
+    setPrep((current) => {
+      if (!current) return null;
+      const next = current.map((s) => (s.id === id ? { ...s, state, ...(detail === undefined ? {} : { detail }) } : s));
+      const upcoming = next.find((s) => s.state === 'pending');
+      return upcoming ? next.map((s) => (s.id === upcoming.id ? { ...s, state: 'active' } : s)) : next;
+    });
+  }
+
+  /**
+   * The steps this particular submit will actually run, in order. Built from the form as it stands
+   * so nothing is listed that won't happen — a project with no database contributes no database
+   * line, rather than a line that resolves to "skipped" and leaves the user wondering what it was.
+   */
+  function buildPrepPlan(): PrepStep[] {
+    const steps: PrepStep[] = [
+      { id: 'project', label: 'Creating the project and its web server config', state: 'active' },
+      { id: 'dns', label: `Pointing ${slug}.${baseDomain} at this server`, state: 'pending' },
+    ];
+    if (type === 'php') {
+      steps.push({ id: 'jobs', label: 'Scheduling the Laravel cron and queue worker', state: 'pending' });
+    }
+    steps.push({ id: 'mail', label: `Setting up email via ${smtpOptionLabel(smtpMode)}`, state: 'pending' });
+    if (dbMode === 'create' && dbConnection !== null) {
+      steps.push({ id: 'db', label: `Creating the ${DB_ENGINE_LABEL[dbConnection.engine]} database ${dbName}`, state: 'pending' });
+      if (dbSqlFile !== null && dbSqlIssue === null) {
+        steps.push({ id: 'sql', label: `Importing ${dbSqlFile.name}`, state: 'pending' });
+      }
+    } else if (dbMode === 'existing' && existingDb !== null) {
+      steps.push({ id: 'db', label: `Linking the database ${existingDb.name}`, state: 'pending' });
+    }
+    steps.push({ id: 'env', label: 'Writing environment variables', state: 'pending' });
+    steps.push({ id: 'deploy', label: 'Starting the first deploy', state: 'pending' });
+    return steps;
   }
 
   async function handleDeploy(event: FormEvent) {
@@ -660,8 +897,12 @@ export default function ProjectNewPage() {
     setProvisionError(null);
     setSlugApiError(null);
     setDnsResult(null);
-    setDbError(null);
+    setSetupError(null);
     setSubmitting(true);
+    // The screen goes up only now — after canSubmit, so every client-side check (subdomain shape,
+    // database name, mail config) has already passed and this is genuinely the work starting.
+    setPrep(buildPrepPlan());
+    const prepStartedAt = Date.now();
 
     const body: CreateProjectBody = {
       name,
@@ -682,6 +923,19 @@ export default function ProjectNewPage() {
     try {
       const project = await createProject(body);
       setCreated({ id: project.id, slug: project.slug });
+
+      // These three all completed inside the one request above, in this order, server-side:
+      // the vhost and unit, then the DNS record, then the Laravel cron/worker seed. Revealed with a
+      // beat between them because that is the order they happened in, not to pad the clock — the
+      // padding is at the end, once.
+      completeStep('project');
+      await sleep(PREP_BEAT_MS);
+      completeStep('dns', 'done', dnsStepDetail(slug, baseDomain, project.dns));
+      if (type === 'php') {
+        await sleep(PREP_BEAT_MS);
+        completeStep('jobs');
+      }
+
       await queryClient.invalidateQueries({ queryKey: ['projects'] });
       await queryClient.invalidateQueries({ queryKey: ['overview'] });
 
@@ -699,9 +953,22 @@ export default function ProjectNewPage() {
       // deterministically (no animation to race against the fixed-length delay below): 'nearest'
       // means it's a no-op when the card is already visible, so this never yanks the page around
       // for someone who submitted from the top.
+      // Before the env write and the first deploy: the MAIL_* block is rendered from this at deploy
+      // time, so a project must carry its email service by then or it starts life on the default.
+      // A failure here is not worth abandoning the project over — the SMTP tab can still set it —
+      // so it degrades to the same rail message the database step uses.
+      let smtpFailure: string | null = null;
+      try {
+        await putProjectSmtp(project.id, { mode: smtpMode, ...(smtpMode === 'custom' || smtpMode === 'ses' ? { config: mailConfigBody(smtpMode, mailConfig) } : {}) });
+        completeStep('mail');
+      } catch (err) {
+        smtpFailure = databaseErrorMessage(err, 'Could not save the email service. Set it on the project\u2019s Email tab.');
+        completeStep('mail', 'failed');
+      }
+
+      // Still recorded for the Domain card, which is what the user lands back on if a later step
+      // fails and the setup screen comes down.
       setDnsResult(project.dns);
-      domainCardRef.current?.scrollIntoView({ block: 'nearest' });
-      await sleep(DNS_RESULT_DISPLAY_MS);
 
       // The database comes before the env write, not after: its password is generated server-side
       // and returned exactly once (POST /api/databases), so this is the only moment it can be put
@@ -709,15 +976,27 @@ export default function ProjectNewPage() {
       // ended up — rewritten in place if the template's block survived their edits, appended if
       // they deleted it.
       let envText = envDraft.text();
-      let dbFailure: string | null = null;
+      let dbFailure: SetupFailure | null = null;
       let attachExistingDbId: number | null = null;
+      // Which step the catch below is reporting on. Only ever advanced past 'create' once the
+      // database itself is provisioned, so the rail can say the database is fine and the dump isn't.
+      let dbStage: SetupFailure['stage'] = 'create';
       try {
         if (dbMode === 'create' && dbNameIssue === null && dbConnection !== null) {
           const db = await createDatabase({ connection: dbConnection.key, name: dbName, projectId: project.id });
+          completeStep('db');
           envText = upsertEnvVars(
             envText,
             connectionEnv(db.engine, { name: db.name, username: db.username, password: db.password }, { host: db.host, port: db.port }),
           );
+          // Before the first deploy, deliberately: a dump that fails to import is a reason not to
+          // run the app's migrations against a half-loaded schema, and stopping here is what gives
+          // the user that choice (the rail's "Deploy anyway" is the other half of it).
+          if (dbSqlFile !== null && dbSqlIssue === null) {
+            dbStage = 'import';
+            const imported = await importDatabaseSql(db.id, dbSqlFile);
+            completeStep('sql', 'done', `Imported ${dbSqlFile.name} (${formatFileSize(imported.bytes)})`);
+          }
         } else if (dbMode === 'existing' && existingDb !== null) {
           // The stored password is only handed out by this endpoint, so this is where the env's
           // blank DB_PASSWORD gets its real value. `credentials.env` is the server's own rendering
@@ -725,18 +1004,27 @@ export default function ProjectNewPage() {
           const credentials = await fetchDatabaseCredentials(existingDb.id);
           envText = upsertEnvVars(envText, credentials.env);
           attachExistingDbId = existingDb.id;
+          completeStep('db');
         }
       } catch (err) {
-        dbFailure = databaseErrorMessage(err);
-        setDbError(dbFailure);
+        dbFailure = {
+          stage: dbStage,
+          message: databaseErrorMessage(err, dbStage === 'import' ? 'Something went wrong importing the SQL file.' : undefined),
+        };
+        setStepState(dbStage === 'import' ? 'sql' : 'db', 'failed');
+        setSetupError(dbFailure);
       }
 
       if (envText.trim() !== '') {
         try {
           await putProjectEnv(project.id, envText);
+          completeStep('env');
         } catch {
           // Best-effort — the project exists either way; env can still be set from its page.
+          completeStep('env', 'failed');
         }
+      } else {
+        completeStep('env', 'skipped', 'No environment variables to write');
       }
 
       // Records the association (and audits it) now that the env is saved. Its own env append is a
@@ -754,14 +1042,25 @@ export default function ProjectNewPage() {
       // A failed database is not a failed project, but deploying an app whose DB_PASSWORD is still
       // blank would just fail its migrations — so stop here and let the user decide (the rail shows
       // what went wrong, with "Deploy anyway" and a link to the project).
+      // A failed step means the rail has something to say and the form is where it says it, so the
+      // setup screen comes down rather than sitting on a half-ticked list with no way forward.
       if (dbFailure !== null) {
+        setPrep(null);
+        return;
+      }
+      if (smtpFailure !== null) {
+        setSetupError({ stage: 'smtp', message: smtpFailure });
+        setPrep(null);
         return;
       }
 
-      await startFirstDeploy(project.id);
+      // The deploy fires now; the hand-off to its log waits until the screen has been up long
+      // enough to read. A progress screen that flashes past leaves the user unsure anything ran.
+      await startFirstDeploy(project.id, prepStartedAt + MIN_PREP_MS);
     } catch (err) {
+      setPrep(null);
       if (err instanceof ApiError && err.status === 409) {
-        setSlugApiError(err.message === 'this name is reserved' ? 'This name is reserved.' : 'This slug is already in use.');
+        setSlugApiError(err.message === 'this name is reserved' ? 'This name is reserved.' : 'This subdomain is already in use.');
       } else if (err instanceof ApiError && err.status === 502) {
         const payload = err.body as { step?: string; detail?: string } | undefined;
         setProvisionError({ step: payload?.step ?? 'unknown', detail: payload?.detail ?? err.message });
@@ -771,6 +1070,12 @@ export default function ProjectNewPage() {
     } finally {
       setSubmitting(false);
     }
+  }
+
+  // Ahead of the source/configure split: once setup is under way neither of those views is
+  // actionable, and this screen owns the page until it navigates or hands back on a failure.
+  if (prep !== null) {
+    return <PreparingScreen steps={prep} projectName={name.trim() === '' ? slug : name} domain={`${slug}.${baseDomain}`} />;
   }
 
   if (step === 'source') {
@@ -813,7 +1118,7 @@ export default function ProjectNewPage() {
               formError={formError}
               provisionError={provisionError}
               created={created}
-              dbError={dbError}
+              setupError={setupError}
               onDeployAnyway={() => {
                 if (created) void startFirstDeploy(created.id);
               }}
@@ -877,29 +1182,56 @@ export default function ProjectNewPage() {
             }}
           />
 
-          <DatabaseCard
-            connections={dbConnections}
-            connectionId={dbConnectionId}
-            connection={dbConnection}
-            mode={dbMode}
-            existingDatabases={existingDatabases}
-            existingDatabasesPending={databasesQuery.isPending}
-            existingId={dbExistingId}
-            existingDb={existingDb}
-            existingError={existingDbError}
-            hiddenDatabaseCount={hiddenDatabaseCount}
-            name={dbName}
-            nameIssue={dbNameIssue}
-            onConnectionChange={handleDbConnectionChange}
-            onCreateNewChange={(value) => {
-              setDbCreateNew(value);
-              if (value) setDbExistingId(null);
-            }}
-            onExistingChange={setDbExistingId}
-            onNameChange={(value) => {
-              setDbNameTouched(true);
-              setDbNameInput(value);
-            }}
+          {showDatabase && (
+            <DatabaseCard
+              connections={dbConnections}
+              connectionId={dbConnectionId}
+              connection={dbConnection}
+              mode={dbMode}
+              existingDatabases={existingDatabases}
+              existingDatabasesPending={databasesQuery.isPending}
+              existingId={dbExistingId}
+              existingDb={existingDb}
+              existingError={existingDbError}
+              hiddenDatabaseCount={hiddenDatabaseCount}
+              name={dbName}
+              nameIssue={dbNameIssue}
+              sqlFile={dbSqlFile}
+              sqlIssue={dbSqlIssue}
+              onSqlFileChange={setDbSqlFile}
+              onConnectionChange={handleDbConnectionChange}
+              onCreateNewChange={(value) => {
+                setDbCreateNew(value);
+                if (value) setDbExistingId(null);
+              }}
+              onExistingChange={setDbExistingId}
+              onNameChange={(value) => {
+                setDbNameTouched(true);
+                setDbNameInput(value);
+              }}
+            />
+          )}
+
+          <MailCard
+            mode={smtpMode}
+            mailpitAvailable={mailpit !== null}
+            issue={mailIssue}
+            managed={managedMail}
+            host={smtpHost}
+            port={smtpPort}
+            username={smtpUsername}
+            password={smtpPassword}
+            fromAddress={smtpFrom}
+            encryption={smtpEncryption}
+            region={sesRegion}
+            onModeChange={setSmtpMode}
+            onHostChange={setSmtpHost}
+            onPortChange={setSmtpPort}
+            onUsernameChange={setSmtpUsername}
+            onPasswordChange={setSmtpPassword}
+            onFromAddressChange={setSmtpFrom}
+            onEncryptionChange={setSmtpEncryption}
+            onRegionChange={setSesRegion}
           />
 
           <EnvVarsCard
@@ -1376,8 +1708,12 @@ function EnvVarsCard({
 /**
  * Pre/post-deploy scripts, prefilled for php with the Laravel commands that belong at each stage
  * (`deploy/laravel.ts` documents why migrate lives in the build command and `storage:link`/
- * `queue:restart` run post-activation). Collapsed by default for every other type, where there is
- * nothing to prefill.
+ * `queue:restart` run post-activation).
+ *
+ * Collapsed by default for every type, php included. The php prefill is a sensible default rather
+ * than something most people edit, so opening it on arrival spent a screenful of the form on a
+ * section that usually gets scrolled past — the summary still says what is in there for anyone who
+ * wants it.
  */
 function DeployScriptsCard({
   type,
@@ -1397,7 +1733,7 @@ function DeployScriptsCard({
   const isPhp = type === 'php';
 
   return (
-    <details open={isPhp} className="group rounded-2xl border border-line bg-surface">
+    <details className="group rounded-2xl border border-line bg-surface">
       <summary className="flex cursor-pointer list-none items-center gap-3.5 p-6 [&::-webkit-details-marker]:hidden">
         <IconChip>
           <PlayCircle size={20} strokeWidth={ICON_STROKE} />
@@ -1430,6 +1766,288 @@ function DeployScriptsCard({
 }
 
 /**
+ * The full-page setup screen. Deliberately replaces the form rather than overlaying it: the form is
+ * no longer actionable at this point (the project exists), and leaving it visible behind a spinner
+ * invites someone to try editing fields that no longer feed anything.
+ */
+function PreparingScreen({ steps, projectName, domain }: { steps: PrepStep[]; projectName: string; domain: string }) {
+  const settled = steps.filter((s) => s.state === 'done' || s.state === 'skipped' || s.state === 'failed').length;
+  const percent = steps.length === 0 ? 0 : Math.round((settled / steps.length) * 100);
+
+  return (
+    <div className="flex min-h-[70vh] flex-col items-center justify-center px-6 py-12">
+      <PreparingMark />
+
+      <h1 className="mt-8 text-center text-2xl font-semibold text-ink">Setting up {projectName}</h1>
+      <p className="mt-1.5 text-center font-mono text-sm text-soft">{domain}</p>
+
+      <div className="mt-8 w-full max-w-md">
+        <div className="h-1 overflow-hidden rounded-full bg-surface-2" role="progressbar" aria-valuenow={percent} aria-valuemin={0} aria-valuemax={100}>
+          <div className="h-full rounded-full bg-primary transition-[width] duration-500 ease-out" style={{ width: `${String(percent)}%` }} />
+        </div>
+
+        <ol className="mt-6 flex flex-col gap-3">
+          {steps.map((step) => (
+            <li key={step.id} className="flex items-start gap-3">
+              <PrepStepIcon state={step.state} />
+              <span
+                className={`text-sm transition-colors duration-300 ease-out ${
+                  step.state === 'pending' ? 'text-faint' : step.state === 'failed' ? 'text-danger' : step.state === 'active' ? 'text-ink' : 'text-soft'
+                }`}
+              >
+                {step.detail ?? step.label}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </div>
+    </div>
+  );
+}
+
+/** Per-step status glyph, on a fixed 18px box so the labels stay aligned as states change. */
+function PrepStepIcon({ state }: { state: PrepState }) {
+  const box = 'mt-0.5 flex h-[18px] w-[18px] shrink-0 items-center justify-center';
+  if (state === 'done') {
+    return (
+      <span className={box}>
+        <Check size={15} strokeWidth={2.25} aria-hidden className="text-ok" />
+      </span>
+    );
+  }
+  if (state === 'failed') {
+    return (
+      <span className={box}>
+        <X size={15} strokeWidth={2.25} aria-hidden className="text-danger" />
+      </span>
+    );
+  }
+  if (state === 'skipped') {
+    return (
+      <span className={box}>
+        <Minus size={15} strokeWidth={2} aria-hidden className="text-faint" />
+      </span>
+    );
+  }
+  if (state === 'active') {
+    return (
+      <span className={box}>
+        <LoaderCircle size={15} strokeWidth={2.25} aria-hidden className="animate-spin text-ink" />
+      </span>
+    );
+  }
+  return (
+    <span className={box} aria-hidden>
+      <span className="h-1.5 w-1.5 rounded-full bg-line" />
+    </span>
+  );
+}
+
+/**
+ * The mark above the steps: a static core with two counter-rotating arcs around it. Drawn inline
+ * rather than pulled from an icon set because it has to animate, and built from `currentColor` and
+ * the theme tokens so it reads correctly in both light and dark.
+ */
+function PreparingMark() {
+  return (
+    <div className="relative flex h-28 w-28 items-center justify-center" aria-hidden>
+      {/* Outer arc, slow clockwise. */}
+      <svg viewBox="0 0 100 100" className="absolute inset-0 h-full w-full animate-spin text-line" style={{ animationDuration: '3.6s' }}>
+        <circle cx="50" cy="50" r="46" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeDasharray="60 229" />
+      </svg>
+      {/* Inner arc, faster and counter-clockwise, so the two never lock into one apparent shape. */}
+      <svg
+        viewBox="0 0 100 100"
+        className="absolute inset-0 h-full w-full animate-spin text-primary"
+        style={{ animationDuration: '2.1s', animationDirection: 'reverse' }}
+      >
+        <circle cx="50" cy="50" r="36" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeDasharray="40 186" />
+      </svg>
+      {/* The project itself: a box being packed. Static — the motion belongs to the arcs, and a
+          third moving element reads as noise rather than progress. */}
+      <span className="relative flex h-14 w-14 items-center justify-center rounded-2xl bg-surface-2 text-ink">
+        <Rocket size={24} strokeWidth={ICON_STROKE} />
+      </span>
+    </div>
+  );
+}
+
+/**
+ * Which email service this project's mail goes through, and — the point of showing it here at all —
+ * exactly which `MAIL_*` that choice will put in the `.env` below.
+ *
+ * Those vars are deliberately NOT editable rows in the env card. Shipway regenerates them from this
+ * choice on every deploy (`buildManagedVars`), and anything the user writes for the same key WINS
+ * over the regenerated value (`buildEnvFile`) — so an editable copy would be a copy that silently
+ * disables the dropdown above it. Showing them read-only, attributed, is the honest version: this
+ * is what you picked, this is what it writes, change it by changing the choice.
+ */
+function MailCard({
+  mode,
+  mailpitAvailable,
+  issue,
+  managed,
+  host,
+  port,
+  username,
+  password,
+  fromAddress,
+  encryption,
+  region,
+  onModeChange,
+  onHostChange,
+  onPortChange,
+  onUsernameChange,
+  onPasswordChange,
+  onFromAddressChange,
+  onEncryptionChange,
+  onRegionChange,
+}: {
+  mode: ProjectSmtpMode;
+  mailpitAvailable: boolean;
+  issue: string | null;
+  managed: Record<string, string> | null;
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+  fromAddress: string;
+  encryption: string;
+  region: string;
+  onModeChange: (mode: ProjectSmtpMode) => void;
+  onHostChange: (value: string) => void;
+  onPortChange: (value: string) => void;
+  onUsernameChange: (value: string) => void;
+  onPasswordChange: (value: string) => void;
+  onFromAddressChange: (value: string) => void;
+  onEncryptionChange: (value: string) => void;
+  onRegionChange: (value: string) => void;
+}) {
+  const selected = SMTP_OPTIONS.find((option) => option.value === mode) ?? SMTP_OPTIONS[0]!;
+
+  return (
+    <Card>
+      <CardHeader
+        icon={<Mail size={20} strokeWidth={ICON_STROKE} />}
+        title="Email"
+        description="How this project sends mail. Shipway writes the matching MAIL_* into the env below and keeps them in step with this choice."
+      />
+      <div className="mt-4 flex flex-col gap-4">
+        <Field label="Service" hint={selected.blurb}>
+          <Select value={mode} onChange={(event) => onModeChange(event.target.value as ProjectSmtpMode)}>
+            {SMTP_OPTIONS.map((option) => (
+              <option key={option.value} value={option.value} disabled={option.value === 'mailpit' && !mailpitAvailable}>
+                {option.label}
+              </option>
+            ))}
+          </Select>
+        </Field>
+
+        {mode === 'mailpit' && !mailpitAvailable && (
+          <p className="text-[13px] text-warn">There is no Mailpit on this server, so this project would have nowhere to deliver. Pick another service.</p>
+        )}
+
+        {mode === 'custom' && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="SMTP host">
+              <Input mono value={host} onChange={(event) => onHostChange(event.target.value)} placeholder="smtp.example.com" autoComplete="off" spellCheck={false} />
+            </Field>
+            <Field label="Port">
+              <Input mono value={port} onChange={(event) => onPortChange(event.target.value)} inputMode="numeric" autoComplete="off" />
+            </Field>
+            <Field label="Username" hint="Optional.">
+              <Input mono value={username} onChange={(event) => onUsernameChange(event.target.value)} autoComplete="off" spellCheck={false} />
+            </Field>
+            <Field label="Password" hint="Optional.">
+              <Input mono type="password" value={password} onChange={(event) => onPasswordChange(event.target.value)} autoComplete="new-password" />
+            </Field>
+            <Field label="From address" hint="Optional.">
+              <Input mono value={fromAddress} onChange={(event) => onFromAddressChange(event.target.value)} autoComplete="off" spellCheck={false} />
+            </Field>
+            <Field label="Encryption" hint="Usually tls for 587, ssl for 465.">
+              <Input mono value={encryption} onChange={(event) => onEncryptionChange(event.target.value)} autoComplete="off" spellCheck={false} />
+            </Field>
+          </div>
+        )}
+
+        {mode === 'ses' && (
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Region" hint={`Endpoint: ${sesSmtpHost(region)}:${String(SES_SMTP_PORT)}`}>
+              <Select mono value={region} onChange={(event) => onRegionChange(event.target.value)}>
+                {SES_REGIONS.map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="From address" hint="Must be an identity verified in SES.">
+              <Input mono value={fromAddress} onChange={(event) => onFromAddressChange(event.target.value)} autoComplete="off" spellCheck={false} />
+            </Field>
+            <Field label="SMTP username" hint="From the SES console — not an AWS access key.">
+              <Input mono value={username} onChange={(event) => onUsernameChange(event.target.value)} autoComplete="off" spellCheck={false} />
+            </Field>
+            <Field label="SMTP password">
+              <Input mono type="password" value={password} onChange={(event) => onPasswordChange(event.target.value)} autoComplete="new-password" />
+            </Field>
+          </div>
+        )}
+
+        {issue !== null ? (
+          <p role="alert" className="text-[13px] text-danger">
+            {issue}
+          </p>
+        ) : (
+          <ManagedMailPreview mode={mode} label={selected.label} vars={managed} />
+        )}
+      </div>
+    </Card>
+  );
+}
+
+/**
+ * The `MAIL_*` the chosen service contributes, shown read-only and attributed. Values are rendered
+ * verbatim except the password, which is masked: this block sits on a page the user may well have
+ * open in front of someone else, and the credential is already in the field above for anyone who
+ * needs to check it.
+ */
+function ManagedMailPreview({ mode, label, vars }: { mode: ProjectSmtpMode; label: string; vars: Record<string, string> | null }) {
+  if (vars === null) {
+    return <p className="text-[13px] text-soft">Fill in the fields above to see what {label} will add to the env.</p>;
+  }
+  const entries = Object.entries(vars);
+  if (entries.length === 0) {
+    return (
+      <p className="text-[13px] text-soft">
+        {mode === 'none' ? 'Nothing is added to the env; MAIL_MAILER=log is written below so mail goes to the log.' : `${label} adds nothing to the env.`}
+      </p>
+    );
+  }
+
+  return (
+    <div className="rounded-xl border border-line bg-surface-2 px-4 py-3">
+      <p className="text-[13px] font-medium text-ink">
+        Added automatically because you picked {label}
+      </p>
+      <p className="mt-0.5 text-[13px] text-soft">
+        Shipway owns these — they are rewritten from this choice on every deploy, so they are not in the editable env below.
+      </p>
+      <dl className="mt-3 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1 font-mono text-xs">
+        {entries.map(([key, value]) => (
+          <Fragment key={key}>
+            <dt className="text-soft">{key}</dt>
+            <dd className="truncate text-ink">{SECRET_MAIL_KEY_RE.test(key) ? '\u2022'.repeat(10) : value}</dd>
+          </Fragment>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+/** Mail keys whose value is a credential, masked in the preview above. */
+const SECRET_MAIL_KEY_RE = /PASSWORD/;
+
+/**
  * The project's database, asked the way it actually works: first the connection — a database server
  * Shipway can reach — then either a new database created on it (a name is all it takes; Shipway
  * provisions the database and its user) or one that is already there, connected to as-is.
@@ -1451,10 +2069,13 @@ function DatabaseCard({
   hiddenDatabaseCount,
   name,
   nameIssue,
+  sqlFile,
+  sqlIssue,
   onConnectionChange,
   onCreateNewChange,
   onExistingChange,
   onNameChange,
+  onSqlFileChange,
 }: {
   connections: DbConnection[];
   connectionId: string;
@@ -1468,10 +2089,13 @@ function DatabaseCard({
   hiddenDatabaseCount: number;
   name: string;
   nameIssue: string | null;
+  sqlFile: File | null;
+  sqlIssue: string | null;
   onConnectionChange: (id: string) => void;
   onCreateNewChange: (createNew: boolean) => void;
   onExistingChange: (id: number | null) => void;
   onNameChange: (name: string) => void;
+  onSqlFileChange: (file: File | null) => void;
 }) {
   // Named so the card can say which of this host's engines is missing rather than just quietly
   // listing fewer connections — an absent entry otherwise reads as a bug rather than as
@@ -1568,13 +2192,16 @@ function DatabaseCard({
               ))}
 
             {mode === 'create' && (
-              <Field
-                label="Database name"
-                error={nameIssue ?? undefined}
-                hint={nameIssue ? undefined : `Created on ${connection.name}, with a user of the same name. Suggested from the project slug.`}
-              >
-                <Input mono value={name} onChange={(event) => onNameChange(event.target.value)} autoComplete="off" spellCheck={false} />
-              </Field>
+              <>
+                <Field
+                  label="Database name"
+                  error={nameIssue ?? undefined}
+                  hint={nameIssue ? undefined : `Created on ${connection.name}, with a user of the same name. Suggested from the subdomain.`}
+                >
+                  <Input mono value={name} onChange={(event) => onNameChange(event.target.value)} autoComplete="off" spellCheck={false} />
+                </Field>
+                <SqlFileField file={sqlFile} issue={sqlIssue} engineLabel={DB_ENGINE_LABEL[connection.engine]} onChange={onSqlFileChange} />
+              </>
             )}
           </>
         )}
@@ -1597,6 +2224,69 @@ function DatabaseCard({
         )}
       </div>
     </Card>
+  );
+}
+
+/**
+ * The optional dump to load into the database being created. Deliberately a field on "create a new
+ * database" rather than a third mode next to it: importing a dump is not a different answer to
+ * "where does this project's database come from", it is what the new database starts out holding —
+ * and as a mode it would have duplicated the name field and its validation to add one file picker.
+ *
+ * The `<input type="file">` is visually hidden but still focusable, with the label doing the
+ * clicking, because the native control cannot be styled into the rest of this form. Clearing the
+ * choice is a real button OUTSIDE the label — inside it, every click would reopen the picker.
+ */
+function SqlFileField({
+  file,
+  issue,
+  engineLabel,
+  onChange,
+}: {
+  file: File | null;
+  issue: string | null;
+  engineLabel: string;
+  onChange: (file: File | null) => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1.5">
+      <span className="text-sm font-medium text-ink">SQL file (optional)</span>
+      <div className="flex items-center gap-2">
+        <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 rounded-xl border border-line bg-surface px-3 py-2 transition-colors duration-150 ease-out hover:bg-surface-2 has-[:focus-visible]:border-focus">
+          <input
+            type="file"
+            accept=".sql,application/sql,text/plain"
+            className="sr-only"
+            onChange={(event) => onChange(event.target.files?.[0] ?? null)}
+          />
+          <span className={buttonClasses('outline', 'sm', 'pointer-events-none shrink-0')}>
+            <Upload size={15} strokeWidth={ICON_STROKE} aria-hidden />
+            {file === null ? 'Choose file' : 'Replace'}
+          </span>
+          <span className={`min-w-0 truncate text-sm ${file === null ? 'text-soft' : 'font-mono text-ink'}`}>
+            {file === null ? 'No file chosen' : `${file.name} · ${formatFileSize(file.size)}`}
+          </span>
+        </label>
+        {file !== null && (
+          <button
+            type="button"
+            aria-label="Remove the SQL file"
+            onClick={() => onChange(null)}
+            className="shrink-0 rounded-xl border border-line bg-surface p-2.5 text-icon transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+          >
+            <X size={15} strokeWidth={ICON_STROKE} aria-hidden />
+          </button>
+        )}
+      </div>
+      {issue !== null ? (
+        <span className="text-[13px] text-danger">{issue}</span>
+      ) : (
+        <span className="text-[13px] text-soft">
+          Replayed into the new database with the {engineLabel} client as soon as it exists, before the first deploy. Up to{' '}
+          {formatFileSize(MAX_SQL_IMPORT_BYTES)}.
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -1669,12 +2359,12 @@ function ProjectNameCard({
 }) {
   return (
     <Card>
-      <CardHeader icon={<Tag size={20} strokeWidth={ICON_STROKE} />} title="Project name" description="Used for the URL slug and process names." />
+      <CardHeader icon={<Tag size={20} strokeWidth={ICON_STROKE} />} title="Project name" description="Used for the subdomain and process names." />
       <div className="mt-4 flex flex-col gap-4">
         <Field label="Name">
           <Input required value={name} onChange={(event) => onNameChange(event.target.value)} />
         </Field>
-        <Field label="Slug" hint={slugError ? undefined : 'Lowercase letters, numbers, and hyphens.'} error={slugError}>
+        <Field label="Subdomain" hint={slugError ? undefined : 'Lowercase letters, numbers, and hyphens.'} error={slugError}>
           <Input mono required value={slug} onChange={(event) => onSlugChange(event.target.value)} />
         </Field>
       </div>
@@ -1706,7 +2396,7 @@ function ConfigureRail({
   formError,
   provisionError,
   created,
-  dbError,
+  setupError,
   onDeployAnyway,
 }: {
   source: Source | null;
@@ -1730,7 +2420,7 @@ function ConfigureRail({
   formError: string | null;
   provisionError: ProvisionError | null;
   created: { id: number; slug: string } | null;
-  dbError: string | null;
+  setupError: SetupFailure | null;
   onDeployAnyway: () => void;
 }) {
   const domain = `${slug || 'your-project'}.${baseDomain}`;
@@ -1789,18 +2479,12 @@ function ConfigureRail({
 
       {/* The project exists but its database does not, so its first deploy would fail its
           migrations. Deploying is still the user's call — nothing here is stuck. */}
-      {created && dbError ? (
+      {created && setupError ? (
         <div className="flex flex-col gap-3">
           <div className="rounded-xl border border-danger/30 bg-danger/5 px-4 py-3">
-            <p className="text-sm font-medium text-danger">Project created, but its database wasn&rsquo;t</p>
-            <p className="mt-1 text-sm text-soft">{dbError}</p>
-            <p className="mt-2 text-sm text-soft">
-              Create it from{' '}
-              <Link href="/databases" className="font-medium text-link hover:underline">
-                Databases
-              </Link>{' '}
-              and use &ldquo;Add to project env&rdquo;, then deploy.
-            </p>
+            <p className="text-sm font-medium text-danger">{SETUP_FAILURE_TITLE[setupError.stage]}</p>
+            <p className="mt-1 text-sm whitespace-pre-wrap text-soft">{setupError.message}</p>
+            <SetupFailureAdvice stage={setupError.stage} projectId={created.id} />
           </div>
           <Button type="button" variant="outline" onClick={onDeployAnyway} className="w-full">
             Deploy anyway
@@ -1815,6 +2499,51 @@ function ConfigureRail({
         </Button>
       )}
     </>
+  );
+}
+
+/** What the rail leads with per failed step. The project exists in all three cases; only the thing
+ * that is missing differs. */
+const SETUP_FAILURE_TITLE: Record<SetupFailure['stage'], string> = {
+  create: 'Project created, but its database wasn\u2019t',
+  import: 'Database created, but the SQL file didn\u2019t import',
+  smtp: 'Project created, but its email service wasn\u2019t saved',
+};
+
+/** The next move for each failed step — different enough per stage to be worth saying outright
+ * rather than leaving the user to work out which page owns the thing that broke. */
+function SetupFailureAdvice({ stage, projectId }: { stage: SetupFailure['stage']; projectId: number }) {
+  if (stage === 'smtp') {
+    return (
+      <p className="mt-2 text-sm text-soft">
+        The project is fine and will deploy; mail just falls back to the default until you set it on its{' '}
+        <Link href={`/projects/${String(projectId)}/smtp`} className="font-medium text-link hover:underline">
+          Email tab
+        </Link>
+        .
+      </p>
+    );
+  }
+  if (stage === 'import') {
+    return (
+      <p className="mt-2 text-sm text-soft">
+        The database exists and its credentials are already in this project&rsquo;s env — only the dump is missing. Load it from the
+        console on{' '}
+        <Link href="/databases" className="font-medium text-link hover:underline">
+          Databases
+        </Link>
+        , then deploy.
+      </p>
+    );
+  }
+  return (
+    <p className="mt-2 text-sm text-soft">
+      Create it from{' '}
+      <Link href="/databases" className="font-medium text-link hover:underline">
+        Databases
+      </Link>{' '}
+      and use &ldquo;Add to project env&rdquo;, then deploy.
+    </p>
   );
 }
 

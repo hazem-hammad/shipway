@@ -1,8 +1,9 @@
-import { and, desc, eq } from 'drizzle-orm';
+import { and, desc, eq, inArray } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import * as fs from 'node:fs';
 import { z } from 'zod';
 import { deployments, projects } from '../db/schema.js';
+import { accessibleProjectIds, canAccessProject } from '../lib/projectaccess.js';
 import { getActor, recordAudit } from '../services/audit.js';
 
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
@@ -66,6 +67,12 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     }
     const limit = Math.min(parsedQuery.data.limit ?? GLOBAL_DEPLOYMENTS_DEFAULT_LIMIT, GLOBAL_DEPLOYMENTS_MAX_LIMIT);
 
+    // Scoped members see only their own projects' deploys here (see `lib/projectaccess.ts`); `null`
+    // is unscoped and filters nothing. Applied as a WHERE rather than after the fact, so `limit`
+    // still returns up to `limit` rows the caller can actually see instead of a short page.
+    const allowed = accessibleProjectIds(app.db, request.session.get('userId'));
+    const scope = allowed === null ? undefined : inArray(deployments.projectId, allowed.size > 0 ? [...allowed] : [-1]);
+
     return app.db
       .select({
         id: deployments.id,
@@ -74,6 +81,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
         projectSlug: projects.slug,
         status: deployments.status,
         trigger: deployments.trigger,
+        branch: deployments.branch,
         commitSha: deployments.commitSha,
         commitMessage: deployments.commitMessage,
         startedAt: deployments.startedAt,
@@ -81,6 +89,7 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
       })
       .from(deployments)
       .innerJoin(projects, eq(deployments.projectId, projects.id))
+      .where(scope)
       .orderBy(desc(deployments.id))
       .limit(limit)
       .all();
@@ -173,6 +182,12 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     if (!row) {
       return reply.code(404).send({ error: 'deployment not found' });
     }
+    // Keyed by deployment id, so the owning project is only known once the row is loaded — the
+    // path-based guard in `buildApp` can't cover this one. Reported as a deployment-not-found 404
+    // for the same reason that guard 404s: a scoped member can't probe for what they can't see.
+    if (!canAccessProject(app.db, request.session.get('userId'), row.projectId)) {
+      return reply.code(404).send({ error: 'deployment not found' });
+    }
     return withCancelRequested(app, row);
   });
 
@@ -184,6 +199,9 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
 
     const row = app.db.select({ id: deployments.id, projectId: deployments.projectId }).from(deployments).where(eq(deployments.id, paramsParsed.data.id)).get();
     if (!row) {
+      return reply.code(404).send({ error: 'deployment not found' });
+    }
+    if (!canAccessProject(app.db, request.session.get('userId'), row.projectId)) {
       return reply.code(404).send({ error: 'deployment not found' });
     }
 
@@ -203,11 +221,16 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const row = app.db
-      .select({ logPath: deployments.logPath })
+      .select({ logPath: deployments.logPath, projectId: deployments.projectId })
       .from(deployments)
       .where(eq(deployments.id, paramsParsed.data.id))
       .get();
     if (!row) {
+      return reply.code(404).send({ error: 'deployment not found' });
+    }
+    // A deploy log carries build output and command lines from the project's own repo — exactly the
+    // thing a member scoped away from that project must not read.
+    if (!canAccessProject(app.db, request.session.get('userId'), row.projectId)) {
       return reply.code(404).send({ error: 'deployment not found' });
     }
 
@@ -228,6 +251,12 @@ export async function deploymentRoutes(app: FastifyInstance): Promise<void> {
 
     const row = app.db.select().from(deployments).where(eq(deployments.id, paramsParsed.data.id)).get();
     if (!row) {
+      socket.close();
+      return;
+    }
+    // Same content as the snapshot route above, so the same scope check — closed silently, since a
+    // WebSocket that has already upgraded has no status code left to answer with.
+    if (!canAccessProject(app.db, request.session.get('userId'), row.projectId)) {
       socket.close();
       return;
     }

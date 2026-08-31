@@ -35,12 +35,6 @@ export interface RedisTarget {
   password?: string | null;
 }
 
-/** This server's mailpit SMTP catch-all, as stored in the `mailpit_info` setting. */
-export interface MailTarget {
-  host: string;
-  port: number;
-}
-
 /** The database this project connects to, whose credentials go straight into the env. */
 export interface DbTarget extends DbConnectionInfo {
   engine: DbEngine;
@@ -69,11 +63,27 @@ export interface PhpEnvInput {
   baseDomain?: string;
   /** Redis on this host, or `null` when the server has none — the queue then runs `sync`. */
   redis?: RedisTarget | null;
-  /** Mailpit on this host, or `null` — mail then goes to the log instead of SMTP. */
-  mail?: MailTarget | null;
+  /** The email service picked for this project. Defaults to `'mailpit'`. */
+  smtpMode?: SmtpMode;
+  /**
+   * The `MAIL_*` keys Shipway's managed block will own for `smtpMode` — i.e.
+   * `Object.keys(buildManagedVars(...))`. The template writes none of them, and that omission is
+   * load-bearing rather than tidy: everything the template emits is a USER key, and a user key
+   * SUPPRESSES the managed one (`buildEnvFile` in `deploy/envfile.ts` filters managed vars down to
+   * the keys the user hasn't defined). A template that wrote `MAIL_HOST` itself is exactly what
+   * made the project SMTP tab inert — switching a project to SES rewrote the managed block and the
+   * app carried on talking to Mailpit, because `MAIL_HOST` never came from that block.
+   *
+   * Passed in rather than derived here so this module keeps no opinion about SMTP: the caller
+   * already holds the config `buildManagedVars` needs.
+   */
+  managedMailKeys?: readonly string[];
   /** The database being created with the project, or `null` for no `DB_*` block. */
   db?: DbTarget | null;
 }
+
+/** The email services a project can be pointed at, mirroring `projects.smtp_mode`. */
+export type SmtpMode = 'mailpit' | 'custom' | 'ses' | 'none';
 
 /** One line of the template: a `KEY=value` assignment, or verbatim text (a comment or a blank). */
 type Entry = { kind: 'var'; key: string; value: string } | { kind: 'text'; line: string };
@@ -146,7 +156,7 @@ export function generateAppKey(
  * (driver degradation, and `local`/debug defaults).
  */
 export function buildPhpEnv(input: PhpEnvInput): string {
-  const { appName, appUrl, appKey, redis, mail, db } = input;
+  const { appName, appUrl, appKey, redis, db } = input;
   const baseDomain = input.baseDomain && input.baseDomain !== '' ? input.baseDomain : 'example.com';
 
   const entries: Entry[] = [
@@ -190,18 +200,35 @@ export function buildPhpEnv(input: PhpEnvInput): string {
     text(),
     ...redisEntries(redis ?? null),
     text(),
-    ...mailEntries(mail ?? null, baseDomain),
+    ...mailEntries(input.smtpMode ?? 'mailpit', new Set(input.managedMailKeys ?? []), baseDomain),
   ];
 
   return render(entries);
 }
 
-/** The `DB_*` block for a database created with the project, or a note explaining its absence. */
+/**
+ * The `DB_*` block for a database created with the project, or a working SQLite fallback when there
+ * isn't one.
+ *
+ * The fallback matters more than it looks: the build command runs `php artisan migrate --force`, so
+ * a project with no database and no `DB_CONNECTION` fails its first deploy against whatever
+ * `config/database.php` happens to default to. Pointing it at SQLite makes a database-less Laravel
+ * project deploy and run.
+ *
+ * `DB_DATABASE` is deliberately NOT written here. It's a managed key (`deploy/envfile.ts`'s
+ * `buildManagedVars`), for the same reason the `MAIL_*` keys are: the path depends on the host's
+ * configured apps directory, which this template — rendered in the browser on the New Project page —
+ * has no way to know. Shipway fills it in on every deploy and creates the file in the project's
+ * SHARED directory, so the data survives releases being rotated.
+ */
 function dbEntries(db: DbTarget | null): Entry[] {
   if (!db) {
     return [
-      text('# No database was created with this project. Create one on the Databases page and use'),
+      text('# No database was selected, so this project uses a SQLite file. Shipway keeps it in the'),
+      text("# project's shared directory (it survives deploys) and fills in DB_DATABASE itself."),
+      text('# To switch to MySQL or Postgres, create one on the Databases page and use'),
       text('# "Add to project env" to have its DB_* credentials written in here.'),
+      v('DB_CONNECTION', 'sqlite'),
     ];
   }
 
@@ -248,28 +275,43 @@ function redisEntries(redis: RedisTarget | null): Entry[] {
  * dashboard's shared inbox instead of a real recipient's. Without mailpit, mail goes to the log,
  * which is the only other option that can't fail at runtime.
  */
-function mailEntries(mail: MailTarget | null, baseDomain: string): Entry[] {
-  if (!mail) {
-    return [
-      text('# No mailpit on this server, so mail is written to the log instead of being sent.'),
-      v('MAIL_MAILER', 'log'),
-      v('MAIL_FROM_ADDRESS', `hello@${baseDomain}`),
-      v('MAIL_FROM_NAME', '${APP_NAME}'),
-    ];
-  }
+/** What the template says above the mail block, per service. The transport itself is never written
+ * here — see `PhpEnvInput.managedMailKeys` for why that would break the thing it looks like it does. */
+const MAIL_COMMENT: Record<SmtpMode, string[]> = {
+  mailpit: [
+    "# Mail goes to Mailpit, this server's catch-all inbox: nothing leaves the machine, and every",
+    '# message the app sends is readable from the dashboard.',
+  ],
+  custom: ['# Mail goes through the SMTP server you configured for this project.'],
+  ses: ["# Mail goes through Amazon SES, using your region's SMTP endpoint and credentials."],
+  none: ['# No mail service selected, so mail is written to the log instead of being sent.'],
+};
 
-  return [
-    text("# Mailpit, this server's catch-all inbox: nothing leaves the machine, and every message"),
-    text('# the app sends is readable from the dashboard.'),
-    v('MAIL_MAILER', 'smtp'),
-    v('MAIL_SCHEME', 'null'),
-    v('MAIL_HOST', mail.host),
-    v('MAIL_PORT', String(mail.port)),
-    v('MAIL_USERNAME', 'null'),
-    v('MAIL_PASSWORD', 'null'),
-    v('MAIL_FROM_ADDRESS', `hello@${baseDomain}`),
-    v('MAIL_FROM_NAME', '${APP_NAME}'),
-  ];
+/**
+ * The part of the mail setup the template still owns: who the mail is FROM. The transport
+ * (`MAIL_MAILER`/`MAIL_HOST`/`MAIL_PORT`/credentials) belongs to the managed block Shipway
+ * regenerates from the project's email service on every deploy, so writing it here would pin it to
+ * whatever was chosen at creation and silently ignore every later change.
+ *
+ * `MAIL_FROM_ADDRESS` is skipped when the chosen service supplies one of its own (custom and SES
+ * both carry a from-address, and SES requires the identity to be verified), for the same
+ * user-key-beats-managed-key reason.
+ */
+function mailEntries(mode: SmtpMode, managed: ReadonlySet<string>, baseDomain: string): Entry[] {
+  const entries: Entry[] = MAIL_COMMENT[mode].map((line) => text(line));
+
+  // Nothing in the managed block for 'none', so the mailer is stated here — otherwise the app falls
+  // through to whatever config/mail.php defaults to, which is a worse way to find out.
+  if (mode === 'none' && !managed.has('MAIL_MAILER')) {
+    entries.push(v('MAIL_MAILER', 'log'));
+  }
+  if (!managed.has('MAIL_FROM_ADDRESS')) {
+    entries.push(v('MAIL_FROM_ADDRESS', `hello@${baseDomain}`));
+  }
+  if (!managed.has('MAIL_FROM_NAME')) {
+    entries.push(v('MAIL_FROM_NAME', '${APP_NAME}'));
+  }
+  return entries;
 }
 
 /** Matches a given key's assignment line: `KEY=`, leading whitespace allowed, comments never match. */
@@ -333,6 +375,41 @@ export const LARAVEL_INSTALL_CMD = 'composer install --no-dev --optimize-autoloa
  * can't take the deploy down with it.
  */
 export const LARAVEL_BUILD_CMD = 'php artisan config:clear && php artisan migrate --force';
+
+/**
+ * The scheduler cron every Laravel app needs: `schedule:run` must fire every minute, and Laravel
+ * decides internally which of its own tasks are actually due. Seeded on project creation
+ * (`routes/projects.ts`) so a new Laravel project's scheduled tasks work without anyone having to
+ * know this is the one entry that makes `$schedule->...()` do anything at all.
+ *
+ * The bare `php` prefix is deliberate: `routes/cron.ts`'s `rewritePhpCommand` turns it into the
+ * project's pinned version (`php8.3 artisan ...`), so this doesn't hardcode a PHP version.
+ */
+export const LARAVEL_DEFAULT_CRON = {
+  schedule: '* * * * *',
+  command: 'php artisan schedule:run',
+} as const;
+
+/**
+ * The queue worker seeded alongside it. Mirrors the "Laravel queue worker" preset the Workers tab
+ * offers (`web/src/lib/workerPresets.ts`) so the default a project starts with and the one a user can
+ * pick by hand are the same thing.
+ *
+ * No explicit connection argument: `QUEUE_CONNECTION` is written into the project's `.env` as
+ * `redis` or `sync` depending on what's actually running on the host (see `buildLaravelEnv`), and
+ * `queue:work` with no argument follows that. Naming a connection here would break on a host without
+ * redis. `--max-time=3600` recycles the process hourly so a slow leak can't accumulate, and the
+ * 120s stop timeout lets an in-flight job finish before a deploy kills the worker.
+ */
+export const LARAVEL_DEFAULT_WORKER = {
+  name: 'queue',
+  command: 'php artisan queue:work --sleep=3 --tries=3 --max-time=3600',
+  processes: 2,
+  autoStart: true,
+  restartPolicy: 'always',
+  restartSec: 3,
+  stopTimeoutSec: 120,
+} as const;
 
 /**
  * `preDeployScript` for a PHP project. Documentation only, by design: this stage runs before

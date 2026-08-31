@@ -1,20 +1,19 @@
 import fastifyStatic from '@fastify/static';
 import fastifyWebsocket from '@fastify/websocket';
 import secureSession from '@fastify/secure-session';
-import { eq } from 'drizzle-orm';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { randomBytes } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { Config } from './config.js';
 import { openDb, type ShipwayDb } from './db/index.js';
-import { notificationChannels, notificationSubscriptions } from './db/schema.js';
-import { deleteSetting, getSetting } from './db/settings.js';
+import { getSetting } from './db/settings.js';
 import { DeployQueue, type DeployQueueDeps } from './deploy/queue.js';
 import type { DeployLogger } from './deploy/logger.js';
 import { runDeploy, type PipelineDeps } from './deploy/pipeline.js';
 import { makeRunShell } from './deploy/runshell.js';
+import { canAccessProject } from './lib/projectaccess.js';
 import { SecretBox } from './lib/secretbox.js';
 import { auditRoutes } from './routes/audit.js';
 import { authRoutes } from './routes/auth.js';
@@ -26,7 +25,7 @@ import { deploymentRoutes } from './routes/deployments.js';
 import { gitRoutes } from './routes/git.js';
 import { githubRoutes } from './routes/github.js';
 import { mailRoutes } from './routes/mail.js';
-import { notificationRoutes } from './routes/notifications.js';
+import { projectNotificationRoutes } from './routes/projectnotifications.js';
 import { overviewRoutes } from './routes/overview.js';
 import { projectRoutes } from './routes/projects.js';
 import { serverRoutes } from './routes/server.js';
@@ -34,10 +33,12 @@ import { settingsRoutes } from './routes/settings.js';
 import { userRoutes } from './routes/users.js';
 import { webhookRoutes } from './routes/webhooks.js';
 import { workerRoutes } from './routes/workers.js';
-import { recordAudit, runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle } from './services/audit.js';
+import { runAuditPurgeOnce, startAuditPurge, type AuditPurgeHandle } from './services/audit.js';
 import { FakeDnsClient, isBlankCredential, makeCloudflareClient, type DnsClient } from './services/cloudflare.js';
 import { makeDbAdmin, type DbAdmin } from './services/dbprovision.js';
+import { ensureDefaultVhost } from './services/provisioner.js';
 import { notifyDeployCanceled, notifyDeployTerminal } from './services/deploynotify.js';
+import { describeOutcome } from './services/notifybus.js';
 import { makeGitOps, type GitOps } from './services/git.js';
 import { GitHubService, resolveCloneUrl, type GithubAppConfig } from './services/github.js';
 import { DEFAULT_MAIL_TIMEOUT_MS } from './services/mailer.js';
@@ -89,6 +90,25 @@ declare module 'fastify' {
      * `onClose` hook. A purge also always runs once synchronously at boot regardless of this. */
     auditPurge: AuditPurgeHandle | undefined;
   }
+}
+
+/** Placeholder in `web/index.html` for this install's own origin — see that file's comment. */
+const OG_ORIGIN_TOKEN = '%OG_ORIGIN%';
+
+/**
+ * A hostname, optionally with a port. Deliberately strict: `request.host` comes from the client's
+ * own `Host` header, and the result is interpolated into the HTML shell's `og:url`/`og:image`, so
+ * anything outside this shape could close the attribute and inject markup into a page we serve.
+ */
+const SAFE_HOST_RE = /^[a-z0-9.-]{1,253}(?::\d{1,5})?$/i;
+
+/**
+ * The absolute origin to write into the shell's Open Graph tags, or `''` when the Host header isn't
+ * a plain hostname. Empty leaves `og:image` as `/og.png` — a relative URL most crawlers still
+ * resolve — which is a far better failure than reflecting an attacker-chosen string.
+ */
+function shellOrigin(request: FastifyRequest): string {
+  return SAFE_HOST_RE.test(request.host) ? `${request.protocol}://${request.host}` : '';
 }
 
 /**
@@ -156,50 +176,6 @@ const SERVICE_WATCH_INTERVAL_MS = 60_000;
 /** How often the audit-retention purge timer runs in production (Task 5, spec: "hourly timer + boot"). */
 const AUDIT_PURGE_INTERVAL_MS = 60 * 60 * 1000;
 
-/**
- * One-time migration (Task 4, spec §2's notifybus bullet): if the legacy global
- * `notify_webhook_url` setting is set and no notification channel exists yet, creates a "Default"
- * channel with that URL subscribed to `deploy_failed` (and also `deploy_succeeded` when the legacy
- * `notify_on_success` setting was `true`) — carrying v1's webhook behavior forward as a Task 4
- * channel. Then clears the legacy `notify_webhook_url` setting so `deploynotify.ts`'s global
- * fallback (services/deploynotify.ts:54-63) no longer fires alongside the new channel — otherwise an
- * upgraded install posts twice per event to the same URL (final-review.md finding I-1). Per-project
- * `notifyWebhookUrl` overrides are a separate, still-supported feature and are left untouched.
- *
- * Naturally idempotent — once ANY channel exists (this migration's own "Default", or one a user
- * created by hand first), it never runs again, and once `notify_webhook_url` is cleared the `if
- * (!webhookUrl) return;` guard below makes every later boot a no-op — so this can just be called
- * unconditionally on every boot.
- */
-function migrateLegacyWebhookChannel(db: ShipwayDb): void {
-  const webhookUrl = getSetting<string>(db, 'notify_webhook_url');
-  if (!webhookUrl) return;
-
-  const existingChannel = db.select({ id: notificationChannels.id }).from(notificationChannels).limit(1).get();
-  if (existingChannel) return;
-
-  db.insert(notificationChannels).values({ name: 'Default', url: webhookUrl }).run();
-  const created = db.select({ id: notificationChannels.id }).from(notificationChannels).where(eq(notificationChannels.name, 'Default')).get();
-  if (!created) return; // unreachable: just inserted this row above
-
-  db.insert(notificationSubscriptions).values({ event: 'deploy_failed', channelId: created.id }).run();
-  if (getSetting<boolean>(db, 'notify_on_success') === true) {
-    db.insert(notificationSubscriptions).values({ event: 'deploy_succeeded', channelId: created.id }).run();
-  }
-
-  // Silence the legacy global fallback now that the Default channel covers it — see the doc
-  // comment above (finding I-1). Per-project notifyWebhookUrl overrides are untouched.
-  deleteSetting(db, 'notify_webhook_url');
-
-  recordAudit(db, {
-    actorId: null,
-    actorName: 'system',
-    action: 'notification.migrated',
-    targetType: 'notification_channel',
-    targetName: 'Default',
-  });
-}
-
 export async function buildApp(
   cfg: Config,
   deps: {
@@ -230,12 +206,12 @@ export async function buildApp(
      * default "skip entirely under `NODE_ENV=test`" behavior — lets tests exercise the wiring (short
      * `intervalMs`, a fake `fetchImpl`) deterministically. In production this is never passed; the
      * poller always runs at `SERVICE_WATCH_INTERVAL_MS`. */
-    serviceWatch?: { intervalMs: number; fetchImpl?: typeof fetch };
+    serviceWatch?: { intervalMs: number };
     /** Test-only override: starts the Task 5 hourly audit-retention purge timer at this interval
      * instead of the default "skip entirely under `NODE_ENV=test`" behavior — lets tests drive it
      * deterministically via `.tick()`. In production this is never passed; the timer always runs at
      * `AUDIT_PURGE_INTERVAL_MS`. The boot-time purge itself is unconditional either way (see
-     * `runAuditPurgeOnce(app.db)` below, right after `migrateLegacyWebhookChannel`). */
+     * `runAuditPurgeOnce(app.db)` below). */
     auditPurge?: { intervalMs: number };
   } = {},
 ): Promise<FastifyInstance> {
@@ -260,11 +236,11 @@ export async function buildApp(
 
   app.decorate('cfg', cfg);
   app.decorate('db', openDb(cfg.dbPath));
-  migrateLegacyWebhookChannel(app.db);
   // Task 5's boot-time audit-retention purge: unconditional (not gated by test mode, unlike the
-  // hourly timer below) since it's a single cheap DELETE — mirrors `migrateLegacyWebhookChannel`
+  // hourly timer below) since it's a single cheap DELETE — mirrors the other boot-time maintenance
   // running unconditionally on every boot too.
   runAuditPurgeOnce(app.db);
+
   app.decorate('github', () => {
     const githubAppCfg = getSetting<GithubAppConfig>(app.db, 'github_app');
     return githubAppCfg ? new GitHubService(githubAppCfg) : null;
@@ -329,8 +305,10 @@ export async function buildApp(
     deploymentId: number;
     message: string;
     rolledBack?: boolean;
-  }): Promise<void> {
-    await notifyDeployTerminal(app.db, fetchImpl, p, app.secretBox);
+  }): Promise<string> {
+    // The returned summary is written into the deploy log by the pipeline's `notifySafe`, so every
+    // deploy leaves a record of whether it emailed anyone and why not if it didn't.
+    return describeOutcome(await notifyDeployTerminal(app.db, fetchImpl, p, app.secretBox));
   }
 
   const pipelineDeps: PipelineDeps = {
@@ -372,11 +350,11 @@ export async function buildApp(
         (async (deploymentId: number, signal: AbortSignal, logger: DeployLogger) => {
           const result = await runDeploy(pipelineDeps, deploymentId, logger, signal);
           // The pipeline's own `notify` hook is deliberately never called for a cancellation
-          // (unchanged v1 behavior — see deploy/pipeline.ts), so it's the one terminal status the
-          // bus needs a separate emission for, driven off `runDeploy`'s own return value instead.
+          // (unchanged v1 behavior — see deploy/pipeline.ts), so it's the one terminal status that
+          // needs a separate emission, driven off `runDeploy`'s own return value instead.
           if (result === 'canceled') {
             try {
-              await notifyDeployCanceled(app.db, fetchImpl, deploymentId, app.secretBox);
+              await notifyDeployCanceled(app.db, deploymentId, app.secretBox);
             } catch (err) {
               app.log.error({ err }, 'notifyDeployCanceled failed');
             }
@@ -427,6 +405,33 @@ export async function buildApp(
     }
   });
 
+  /**
+   * Per-project access guard for every `/api/projects/<id>/...` route, in one place (see
+   * `lib/projectaccess.ts` for the rules themselves). Registered as a second global `onRequest` hook,
+   * after the auth guard above, so `request.session` is decoded and an unauthenticated caller has
+   * already been 401'd before this runs.
+   *
+   * Central rather than per-handler ON PURPOSE: the project id sits in the same path position for
+   * every one of these routes across five route files (`projects`, `deployments`, `cron`, `workers`,
+   * `projectnotifications`), so a new `/api/projects/:id/<thing>` route is covered the moment it is
+   * registered instead of only if its author remembered the check. Routes keyed by a CHILD resource's
+   * id instead (`/api/workers/:id`, `/api/cron/:id`, `/api/deployments/:id`, `/api/databases/:id`)
+   * can't be matched by path alone — the owning project is only known after the row is loaded — so
+   * those call `requireProjectAccess` themselves once they have it.
+   *
+   * 404, not 403 — see `lib/projectaccess.ts` for why. A non-numeric id falls through to the route's
+   * own 404.
+   */
+  app.addHook('onRequest', async (request, reply) => {
+    const path = request.url.split('?')[0]!;
+    const match = /^\/api\/projects\/(\d+)(?:\/|$)/.exec(path);
+    if (!match) return;
+
+    if (!canAccessProject(app.db, request.session.get('userId'), Number(match[1]))) {
+      reply.code(404).send({ error: 'project not found' });
+    }
+  });
+
   app.get('/api/health', async () => {
     return { status: 'ok' };
   });
@@ -447,7 +452,7 @@ export async function buildApp(
   await app.register(cronRoutes);
   await app.register(serverRoutes);
   await app.register(webhookRoutes);
-  await app.register(notificationRoutes, { fetchImpl: deps.fetchImpl });
+  await app.register(projectNotificationRoutes);
   await app.register(auditRoutes);
   await app.register(overviewRoutes);
 
@@ -464,11 +469,57 @@ export async function buildApp(
       // directory-listing behavior — with `index` left at its default, a bare `GET /` falls into
       // `@fastify/static`'s own directory handling and 403s instead of reaching either handler.
       index: false,
+      // Vite fingerprints everything under `assets/` (`index-<hash>.js`), so those files are
+      // immutable by construction: a new build is a new name, never new bytes under an old one.
+      // Telling browsers that turns every repeat visit into zero revalidation requests instead of a
+      // 304 round-trip per asset.
+      //
+      // `index.html` is the exception and gets the opposite treatment (see `sendShell`): it is the
+      // one file whose name never changes while its contents do — it is what names the current
+      // bundle — so a cached copy of it is precisely how a browser ends up loading yesterday's app
+      // after a deploy. It must be revalidated every time.
+      maxAge: '1y',
+      immutable: true,
+      // Called with a real `FastifyReply` (see @fastify/static's `sendFileTo`), after the plugin's
+      // own headers are applied — so this overrides the `maxAge`/`immutable` pair above for the one
+      // file it must not apply to.
+      setHeaders(reply, filePath) {
+        if (path.basename(filePath) === 'index.html') {
+          reply.header('cache-control', 'no-cache');
+        }
+      },
     });
+
+    /**
+     * The SPA shell. `no-cache` (revalidate every time, a 304 when unchanged) rather than
+     * `no-store`, so the response is still cheap when nothing has shipped — but never reused
+     * without asking, which is what makes a deploy show up on the next reload instead of whenever
+     * the browser next feels like checking.
+     *
+     * Set here as well as in `setHeaders` above because these two handlers reach `index.html`
+     * through `sendFile`, and a future change to either path must not be able to lose it.
+     */
+    const shellPath = path.join(webDistDir, 'index.html');
+
+    const sendShell = (request: FastifyRequest, reply: FastifyReply): FastifyReply => {
+      // Read per request rather than cached at boot: a web-only deploy replaces this file WITHOUT
+      // restarting the service (see setup/deploy-local.sh), so a boot-time cache would keep serving
+      // the previous bundle's shell until something else happened to restart us.
+      const stat = fs.statSync(shellPath);
+      const origin = shellOrigin(request);
+      // Covers the file AND the substitution, so the same shell served to two different hostnames
+      // is not mistaken for a cache hit. Preserves the 304 that `sendFile` gave us for free.
+      const etag = `W/"${stat.size.toString(16)}-${Math.trunc(stat.mtimeMs).toString(16)}-${Buffer.from(origin).toString('base64url')}"`;
+      reply.header('cache-control', 'no-cache').header('etag', etag);
+      if (request.headers['if-none-match'] === etag) {
+        return reply.code(304).send();
+      }
+      return reply.type('text/html; charset=utf-8').send(fs.readFileSync(shellPath, 'utf8').replaceAll(OG_ORIGIN_TOKEN, origin));
+    };
 
     // `@fastify/static`'s wildcard route (`{prefix}*`) doesn't cover the exact empty path, so `/`
     // needs its own explicit handler alongside the 404-based fallback below for every other route.
-    app.get('/', (_request, reply) => reply.sendFile('index.html'));
+    app.get('/', (request, reply) => sendShell(request, reply));
 
     // Registered at the root level (not nested in a sub-plugin), so it applies across every
     // prefix. The global auth guard's onRequest hook above already lets non-`/api` requests
@@ -480,7 +531,7 @@ export async function buildApp(
       if (request.method !== 'GET' || request.url.startsWith('/api/')) {
         return reply.code(404).send({ error: 'not found' });
       }
-      return reply.sendFile('index.html');
+      return sendShell(request, reply);
     });
   }
 
@@ -497,11 +548,24 @@ export async function buildApp(
           db: app.db,
           sysops: app.sysops,
           intervalMs: deps.serviceWatch?.intervalMs ?? SERVICE_WATCH_INTERVAL_MS,
-          fetchImpl: deps.serviceWatch?.fetchImpl ?? fetchImpl,
-          secretBox: app.secretBox,
         })
       : undefined,
   );
+  // The catch-all HTTPS vhost (see `renderDefaultVhost`). Installed at boot rather than only by
+  // install.sh, so an install predating it picks it up on the next restart — without it nginx answers
+  // any unmatched Host with whichever project vhost sorts first, and a deleted project's still-
+  // resolving wildcard subdomain serves an unrelated site.
+  //
+  // MUST come after `app.decorate('sysops', ...)`: an earlier call got `app.sysops === undefined`,
+  // failed inside its own try/catch, and reported the failure to a logger nothing reads — so it
+  // silently did nothing. Logged via console.error rather than `app.log` for the same reason.
+  // Skipped under test (no real nginx) and never allowed to block startup.
+  if (process.env.NODE_ENV !== 'test') {
+    void ensureDefaultVhost({ db: app.db, cfg, sysops: app.sysops, dns: null }).then((result) => {
+      if (!result.ok) console.error(`shipway: default vhost not installed — ${result.detail}`);
+    });
+  }
+
   app.addHook('onClose', () => {
     app.serviceWatch?.stop();
   });
@@ -509,7 +573,7 @@ export async function buildApp(
   // Hourly audit-retention purge timer (Task 5): same test-gating shape as the service-status
   // poller just above — skipped under `NODE_ENV=test` unless a test injects `deps.auditPurge`, and
   // stopped via `onClose`. The boot-time purge itself already ran unconditionally, right after
-  // `migrateLegacyWebhookChannel` above, regardless of this timer's on/off state.
+  // the boot-time purge above, regardless of this timer's on/off state.
   const auditPurgeEnabled = deps.auditPurge !== undefined || process.env.NODE_ENV !== 'test';
   app.decorate('auditPurge', auditPurgeEnabled ? startAuditPurge(app.db, deps.auditPurge?.intervalMs ?? AUDIT_PURGE_INTERVAL_MS) : undefined);
   app.addHook('onClose', () => {

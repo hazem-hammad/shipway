@@ -20,7 +20,7 @@
  * ("Canceling…"), and a deployment left `canceling` across a server restart is already dead anyway
  * (see Ruling 2, `.superpowers/sdd/2026-08-25-shipway-v3/progress.md`).
  */
-import { eq } from 'drizzle-orm';
+import { and, desc, eq, isNotNull } from 'drizzle-orm';
 import * as path from 'node:path';
 import type { Config } from '../config.js';
 import type { ShipwayDb } from '../db/index.js';
@@ -93,6 +93,7 @@ export class DeployQueue {
         projectId: p.projectId,
         status: 'queued',
         trigger: p.trigger,
+        branch: this.branchFor(p, project.branch),
         commitSha: p.commitSha ?? null,
         commitMessage: p.commitMessage ?? null,
         releasePath: p.releasePath ?? null,
@@ -107,6 +108,35 @@ export class DeployQueue {
     this.queue.push({ id, projectId: p.projectId, trigger: p.trigger, logPath });
     this.pump();
     return id;
+  }
+
+  /**
+   * The branch to stamp on a new deployment row.
+   *
+   * For `push` and `manual` it is the project's branch as configured RIGHT NOW, which is what the
+   * pipeline is about to resolve a commit from — captured here rather than read back at display
+   * time, so changing the project's branch later doesn't rewrite the history of what already ran.
+   *
+   * A `rollback` resolves no branch at all: it activates an existing release directly (see
+   * `deploy/pipeline.ts`). Reporting the project's current branch for it would be a guess, so the
+   * branch is carried over from the deployment that BUILT that release, found by its release path.
+   * Null when that deployment predates this column or has been pruned — an honest blank rather than
+   * a plausible wrong answer.
+   */
+  private branchFor(p: EnqueueInput, projectBranch: string): string | null {
+    if (p.trigger !== 'rollback') {
+      return projectBranch;
+    }
+    if (p.releasePath === undefined) {
+      return null;
+    }
+    const origin = this.deps.db
+      .select({ branch: deployments.branch })
+      .from(deployments)
+      .where(and(eq(deployments.projectId, p.projectId), eq(deployments.releasePath, p.releasePath), isNotNull(deployments.branch)))
+      .orderBy(desc(deployments.id))
+      .get();
+    return origin?.branch ?? null;
   }
 
   /** Running: aborts its signal. Queued: removes it and marks the row `canceled`. Otherwise: no-op. */

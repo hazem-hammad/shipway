@@ -50,8 +50,8 @@ export function workerInstances(slug: string, name: string, processes: number): 
 }
 
 /**
- * Renders + installs the worker's template unit, `daemon-reload`s, then enables + starts each
- * instance `1..worker.processes`, in order.
+ * Renders + installs the worker's template unit, `daemon-reload`s, then enables (or disables, per
+ * `worker.autoStart`) and starts each instance `1..worker.processes`, in order.
  *
  * When `previousProcesses` is given and greater than `worker.processes` (a scale-down), also stops
  * + disables every instance from `worker.processes + 1` through `previousProcesses` — the instances
@@ -64,13 +64,20 @@ export async function applyWorker(deps: WorkerDeps, project: ProjectRow, worker:
     appsDir: deps.cfg.appsDir,
     command: worker.command,
     pathPrefix: pathPrefixFor(deps.cfg, project),
+    restartPolicy: worker.restartPolicy,
+    restartSec: worker.restartSec,
+    stopTimeoutSec: worker.stopTimeoutSec,
   });
 
   await deps.sysops.installFile(unitPath(project.slug, worker.name), content);
   await deps.sysops.daemonReload();
 
   for (const unit of workerInstances(project.slug, worker.name, worker.processes)) {
-    await deps.sysops.unitAction('enable', unit);
+    // `enable` and `start` answer different questions: enable is "come back after a reboot", start is
+    // "run now". A worker with autoStart off still runs immediately — it just isn't wired into the
+    // boot target. `disable` is issued explicitly rather than skipped, so turning autoStart OFF on an
+    // existing worker actually removes the symlink instead of leaving the old one in place.
+    await deps.sysops.unitAction(worker.autoStart ? 'enable' : 'disable', unit);
     await deps.sysops.unitAction('start', unit);
   }
 

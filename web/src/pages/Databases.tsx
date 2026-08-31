@@ -1,14 +1,21 @@
 /**
- * Databases page: provisioned MySQL/Postgres instances plus read-only Redis/Mailpit connection
- * info (server/src/routes/databases.ts). Creation and credential reveal share one panel styling
- * (task-25 controller ruling); the create response carries the plaintext password exactly once
- * (`POST /api/databases`'s doc comment), so that panel alone gets the "shown once" note — a later
- * reveal (`GET /:id/credentials`) can return the password again since it's decrypted server-side,
- * but isn't a one-time event the same way.
+ * Databases page: provisioned MySQL/Postgres instances, the connections they live on, and read-only
+ * Redis/Mailpit info (server/src/routes/databases.ts). Creation and credential reveal share one
+ * panel styling (task-25 controller ruling); the create response carries the plaintext password
+ * exactly once (`POST /api/databases`'s doc comment), so that panel alone gets the "shown once"
+ * note — a later reveal (`GET /:id/credentials`) can return the password again since it's decrypted
+ * server-side, but isn't a one-time event the same way.
+ *
+ * Split across three tabs rather than stacked down one page. Stacked, the database list grows
+ * without bound and pushes Connections and the service info off the bottom — at fifteen databases
+ * they are a scroll away, at fifty they are lost. Tabs give the list the whole page to grow into
+ * while keeping the other two a click away, and each section keeps full width for its own forms.
+ * The active tab lives in the query string, so a section is linkable and survives a reload.
  */
-import { type FormEvent, useEffect, useState } from 'react';
+import { type FormEvent, useEffect, useMemo, useState } from 'react';
+import { useLocation, useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
-import { Check, Copy, Database as DatabaseIcon, ExternalLink, Eye, EyeOff, Mail, Plus, Server } from 'lucide-react';
+import { ExternalLink, Eye, EyeOff, Plus, Search, Server } from 'lucide-react';
 import {
   ApiError,
   createDatabase,
@@ -23,47 +30,42 @@ import {
   type DatabaseListItem,
   type DbConnection,
   type DbEngine,
+  type ProjectListItem,
 } from '../api';
 import { useDatabases, useDbConnections, useProjects, useServicesInfo, useSettings } from '../hooks';
-import { Badge, Button, buttonClasses, Card, CardHeader, Chip, EmptyState, Field, ICON_STROKE, Input, PageHeader, Select, Skeleton } from '../components/ui';
+
+/** Projects worth offering a database to. Filtering the picker rather than letting the attach fail
+ * later keeps the wrong answer off the menu instead of explaining it afterwards. */
+function dbCapableProjects(projects: ProjectListItem[] | undefined): ProjectListItem[] {
+  return (projects ?? []).filter((project) => isDbCapable(project.type));
+}
+import {
+  Badge,
+  Button,
+  buttonClasses,
+  Card,
+  CardHeader,
+  Chip,
+  CopyRow,
+  EmptyState,
+  Field,
+  ICON_STROKE,
+  Input,
+  PageHeader,
+  Select,
+  Skeleton,
+  Tabs,
+} from '../components/ui';
+import { MailpitIcon, RedisIcon } from '../components/BrandIcons';
+import { ENGINE_LABEL, consoleTitle, consoleUrl, hasConsole, isDbCapable } from '../lib/database';
 import { formatRelativeTime } from '../lib/format';
 
 const NAME_RE = /^[a-z][a-z0-9_]{0,31}$/;
-
-/**
- * The console for a database's engine: phpMyAdmin for MySQL, pgAdmin for PostgreSQL. Both are
- * served under paths on the dashboard host, so the browser already carries the Shipway session
- * that nginx checks before letting the request through — no second password to open them.
- *
- * phpMyAdmin takes a database name in the URL, so that much is prefilled. pgAdmin works from
- * saved server connections rather than query parameters, so it can only be opened at its root.
- */
-function consoleUrl(baseDomain: string, database: DatabaseListItem): string {
-  const base = `https://ship.${baseDomain}/db`;
-  if (database.engine === 'mysql') {
-    return `${base}/phpmyadmin/index.php?route=/database/structure&db=${encodeURIComponent(database.name)}`;
-  }
-  return `${base}/pgadmin/`;
-}
-
-/**
- * phpMyAdmin and pgAdmin are installed on this host and configured against its own engines, so the
- * Manage link only means anything for a database that lives here. A database on a registered
- * external server is managed with whatever that provider gives you.
- */
-function hasConsole(database: DatabaseListItem): boolean {
-  return database.connectionId === null;
-}
 
 const ENGINE_OPTIONS: { value: DbEngine; label: string }[] = [
   { value: 'mysql', label: 'MySQL' },
   { value: 'postgres', label: 'Postgres' },
 ];
-
-const ENGINE_LABEL: Record<DbEngine, string> = {
-  mysql: 'MySQL',
-  postgres: 'Postgres',
-};
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
@@ -73,14 +75,36 @@ function portFor(engine: DbEngine): number {
   return engine === 'mysql' ? 3306 : 5432;
 }
 
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+type TabId = 'databases' | 'connections' | 'services';
+
+const TAB_IDS: TabId[] = ['databases', 'connections', 'services'];
+
+function isTabId(value: string): value is TabId {
+  return (TAB_IDS as string[]).includes(value);
+}
+
 export default function DatabasesPage() {
   const databasesQuery = useDatabases();
-  // Only used to build the database-console URLs; the Manage link is simply omitted until it loads,
-  // rather than rendering a link to `ship.undefined`.
-  const settingsQuery = useSettings();
-  const baseDomain = settingsQuery.data?.base_domain ?? null;
+  const connectionsQuery = useDbConnections();
+  const [, navigate] = useLocation();
+  const search = useSearch();
+
+  const params = new URLSearchParams(search);
+  const rawTab = params.get('tab') ?? '';
+  const tab: TabId = isTabId(rawTab) ? rawTab : 'databases';
+
   const [creating, setCreating] = useState(false);
   const [createdCreds, setCreatedCreds] = useState<DatabaseCreated | null>(null);
+
+  function goToTab(next: TabId): void {
+    // `databases` is the default, so it stays out of the URL and an untouched page keeps a clean
+    // `/databases`. `replace`, because switching tabs is not a place worth going Back to.
+    navigate(next === 'databases' ? '/databases' : `/databases?tab=${next}`, { replace: true });
+  }
 
   return (
     <div>
@@ -88,6 +112,9 @@ export default function DatabasesPage() {
         title="Databases"
         subtitle="MySQL and Postgres databases, on this server or on a connection you register"
         actions={
+          // Only on the tab it acts on: a "New database" button while reading Redis connection info
+          // would be an action pointing somewhere other than what is on screen.
+          tab === 'databases' &&
           !creating &&
           !createdCreds && (
             <Button onClick={() => setCreating(true)}>
@@ -99,69 +126,224 @@ export default function DatabasesPage() {
       />
 
       <div className="flex flex-col gap-5">
-        {creating && (
-          <CreateDatabaseForm
+        <Tabs
+          tabs={[
+            { id: 'databases', label: 'Databases', count: databasesQuery.data?.length },
+            { id: 'connections', label: 'Connections', count: connectionsQuery.data?.length },
+            { id: 'services', label: 'Services' },
+          ]}
+          value={tab}
+          onChange={(id) => {
+            goToTab(id as TabId);
+          }}
+        />
+
+        {tab === 'databases' && (
+          <DatabasesTab
+            creating={creating}
+            createdCreds={createdCreds}
             onCreated={(created) => {
               setCreating(false);
               setCreatedCreds(created);
             }}
-            onCancel={() => setCreating(false)}
+            onCancelCreate={() => {
+              setCreating(false);
+            }}
+            onDismissCreds={() => {
+              setCreatedCreds(null);
+            }}
           />
         )}
 
-        {createdCreds && (
-          <Card>
-            <div className="flex items-center justify-between gap-4">
-              <h2 className="text-lg font-semibold text-ink">Database created</h2>
-              <button
-                type="button"
-                onClick={() => setCreatedCreds(null)}
-                className="rounded text-sm font-medium text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-              >
-                Dismiss
-              </button>
-            </div>
-            <div className="mt-4">
-              <CredentialsPanel
-                databaseId={createdCreds.id}
-                engine={createdCreds.engine}
-                name={createdCreds.name}
-                username={createdCreds.username}
-                password={createdCreds.password}
-                host={createdCreds.host}
-                port={createdCreds.port}
-                connectionName={createdCreds.connectionName}
-                oneTime
-              />
-            </div>
-          </Card>
-        )}
+        {tab === 'connections' && <ConnectionsCard />}
 
-        {databasesQuery.isPending ? (
-          <Card>
-            <DatabasesSkeletonRows />
-          </Card>
-        ) : databasesQuery.isError ? (
-          <p role="alert" className="text-sm text-danger">
-            Could not load databases.
-          </p>
-        ) : databasesQuery.data.length === 0 ? (
-          creating ? null : <EmptyState message="No databases yet. Provision one to get connection credentials." />
-        ) : (
-          <Card>
-            <div className="divide-y divide-line">
-              {databasesQuery.data.map((database) => (
-                <DatabaseRow key={database.id} database={database} baseDomain={baseDomain} />
-              ))}
-            </div>
-          </Card>
-        )}
-
-        <ConnectionsCard />
-
-        <ServicesInfoPanels />
+        {tab === 'services' && <ServicesInfoPanels />}
       </div>
     </div>
+  );
+}
+
+/**
+ * The database list, with the create form and the one-time credentials panel that belong to it.
+ *
+ * Search and the connection filter appear only once there is more than one database: a single row
+ * behind a search box that can only ever find it is furniture, not help.
+ */
+function DatabasesTab({
+  creating,
+  createdCreds,
+  onCreated,
+  onCancelCreate,
+  onDismissCreds,
+}: {
+  creating: boolean;
+  createdCreds: DatabaseCreated | null;
+  onCreated: (created: DatabaseCreated) => void;
+  onCancelCreate: () => void;
+  onDismissCreds: () => void;
+}) {
+  const databasesQuery = useDatabases();
+  const connectionsQuery = useDbConnections();
+  // Only used to build the database-console URLs; the Manage link is simply omitted until it loads,
+  // rather than rendering a link to `ship.undefined`.
+  const settingsQuery = useSettings();
+  const baseDomain = settingsQuery.data?.base_domain ?? null;
+
+  const [query, setQuery] = useState('');
+  const [connectionKey, setConnectionKey] = useState('all');
+
+  const databases = useMemo(() => databasesQuery.data ?? [], [databasesQuery.data]);
+  const connections = connectionsQuery.data ?? [];
+
+  const visible = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return databases.filter((database) => {
+      if (connectionKey !== 'all' && database.connectionKey !== connectionKey) return false;
+      if (needle === '') return true;
+      // Found by what it is called, who uses it, and where it lives — the three things someone
+      // scanning a long list actually knows.
+      return [database.name, database.username, database.projectName ?? '', database.connectionName ?? '']
+        .join(' ')
+        .toLowerCase()
+        .includes(needle);
+    });
+  }, [databases, query, connectionKey]);
+
+  const narrowed = query.trim() !== '' || connectionKey !== 'all';
+  const showFilters = databases.length > 1;
+
+  return (
+    <>
+      {creating && <CreateDatabaseForm onCreated={onCreated} onCancel={onCancelCreate} />}
+
+      {createdCreds && (
+        <Card>
+          <div className="flex items-center justify-between gap-4">
+            <h2 className="text-lg font-semibold text-ink">Database created</h2>
+            <button
+              type="button"
+              onClick={onDismissCreds}
+              className="rounded text-sm font-medium text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+            >
+              Dismiss
+            </button>
+          </div>
+          <div className="mt-4">
+            <CredentialsPanel
+              databaseId={createdCreds.id}
+              engine={createdCreds.engine}
+              name={createdCreds.name}
+              username={createdCreds.username}
+              password={createdCreds.password}
+              host={createdCreds.host}
+              port={createdCreds.port}
+              connectionName={createdCreds.connectionName}
+              oneTime
+            />
+          </div>
+        </Card>
+      )}
+
+      {databasesQuery.isPending ? (
+        <Card>
+          <DatabasesSkeletonRows />
+        </Card>
+      ) : databasesQuery.isError ? (
+        <p role="alert" className="text-sm text-danger">
+          Could not load databases.
+        </p>
+      ) : databases.length === 0 ? (
+        creating ? null : <EmptyState message="No databases yet. Provision one to get connection credentials." />
+      ) : (
+        <>
+          {showFilters && (
+            <div className="flex items-center gap-2">
+              <span className="relative block min-w-0 flex-1">
+                <Search
+                  size={16}
+                  strokeWidth={ICON_STROKE}
+                  aria-hidden
+                  className="pointer-events-none absolute top-1/2 left-3.5 -translate-y-1/2 text-icon"
+                />
+                <Input
+                  type="search"
+                  placeholder="Search databases, users, projects"
+                  aria-label="Search databases by name, user, project, or connection"
+                  value={query}
+                  onChange={(event) => {
+                    setQuery(event.target.value);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape' && query !== '') {
+                      event.preventDefault();
+                      setQuery('');
+                    }
+                  }}
+                  className="pl-10"
+                />
+              </span>
+
+              {connections.length > 1 && (
+                <div className="w-48 shrink-0">
+                  <Select
+                    aria-label="Filter by connection"
+                    value={connectionKey}
+                    onChange={(event) => {
+                      setConnectionKey(event.target.value);
+                    }}
+                  >
+                    <option value="all">All connections</option>
+                    {connections.map((connection) => (
+                      <option key={connection.key} value={connection.key}>
+                        {connection.name}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              )}
+            </div>
+          )}
+
+          {narrowed && (
+            <p role="status" className="-mt-2 flex items-center gap-2 text-sm text-soft">
+              {visible.length} of {databases.length}
+              <button
+                type="button"
+                onClick={() => {
+                  setQuery('');
+                  setConnectionKey('all');
+                }}
+                className="rounded font-medium text-link transition-colors duration-150 ease-out hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+              >
+                Clear
+              </button>
+            </p>
+          )}
+
+          {visible.length === 0 ? (
+            <EmptyState
+              title="No matching databases"
+              message="Nothing here matches the current search and filter."
+              action={{
+                label: 'Clear filters',
+                onClick: () => {
+                  setQuery('');
+                  setConnectionKey('all');
+                },
+              }}
+            />
+          ) : (
+            <Card>
+              <div className="divide-y divide-line">
+                {visible.map((database) => (
+                  <DatabaseRow key={database.id} database={database} baseDomain={baseDomain} />
+                ))}
+              </div>
+            </Card>
+          )}
+        </>
+      )}
+    </>
   );
 }
 
@@ -261,7 +443,7 @@ function CreateDatabaseForm({ onCreated, onCancel }: { onCreated: (created: Data
         <Field label="Link to project" hint="Optional. You can also add the connection env later.">
           <Select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
             <option value="">None</option>
-            {(projectsQuery.data ?? []).map((project) => (
+            {dbCapableProjects(projectsQuery.data).map((project) => (
               <option key={project.id} value={project.id}>
                 {project.name}
               </option>
@@ -337,7 +519,7 @@ function DatabaseRow({ database, baseDomain }: { database: DatabaseListItem; bas
               target="_blank"
               rel="noreferrer noopener"
               className={buttonClasses('secondary', 'sm')}
-              title="Browse tables and run SQL — phpMyAdmin for MySQL, pgAdmin for Postgres"
+              title={consoleTitle(database.engine)}
             >
               Manage
               <ExternalLink size={14} strokeWidth={ICON_STROKE} aria-hidden />
@@ -456,6 +638,7 @@ function CredentialsPanel({
   oneTime: boolean;
 }) {
   const projectsQuery = useProjects();
+  const injectable = dbCapableProjects(projectsQuery.data);
   const [injectProjectId, setInjectProjectId] = useState('');
   const [injecting, setInjecting] = useState(false);
   const [injectResult, setInjectResult] = useState<'ok' | 'fail' | null>(null);
@@ -485,10 +668,10 @@ function CredentialsPanel({
         {connectionName && <span className="truncate text-sm text-soft">on {connectionName}</span>}
       </p>
       <div className="flex flex-col gap-2">
-        <CredentialRow label="Host" value={host} />
-        <CredentialRow label="Port" value={String(port)} />
-        <CredentialRow label="Username" value={username} />
-        <CredentialRow label="Password" value={password} />
+        <CopyRow label="Host" value={host} />
+        <CopyRow label="Port" value={String(port)} />
+        <CopyRow label="Username" value={username} />
+        <CopyRow label="Password" value={password} />
       </div>
 
       {oneTime && <p className="mt-3 text-sm text-warn">Save these now. The password is shown once.</p>}
@@ -496,11 +679,17 @@ function CredentialsPanel({
       <div className="mt-4 flex flex-wrap items-center gap-2 border-t border-line pt-4">
         <Select value={injectProjectId} onChange={(event) => setInjectProjectId(event.target.value)} className="w-56">
           <option value="">Add to project env…</option>
-          {(projectsQuery.data ?? []).map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
+          {injectable.length === 0 ? (
+            <option value="" disabled>
+              No PHP or Node projects yet
             </option>
-          ))}
+          ) : (
+            injectable.map((project) => (
+              <option key={project.id} value={project.id}>
+                {project.name}
+              </option>
+            ))
+          )}
         </Select>
         <Button variant="secondary" size="sm" disabled={injectProjectId === ''} loading={injecting} onClick={() => void handleInject()}>
           Add to project env
@@ -516,36 +705,6 @@ function CredentialsPanel({
   );
 }
 
-function CredentialRow({ label, value }: { label: string; value: string }) {
-  const [copied, setCopied] = useState(false);
-
-  async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard API unavailable or denied — the value is still visible to copy by hand.
-    }
-  }
-
-  return (
-    <div className="flex items-center justify-between gap-3 rounded-lg bg-surface px-3 py-2.5">
-      <div className="min-w-0">
-        <p className="text-xs text-soft">{label}</p>
-        <p className="truncate font-mono text-sm text-ink">{value}</p>
-      </div>
-      <button
-        type="button"
-        onClick={() => void handleCopy()}
-        className="inline-flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-xs font-medium text-soft transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
-      >
-        {copied ? <Check size={14} strokeWidth={ICON_STROKE} aria-hidden /> : <Copy size={14} strokeWidth={ICON_STROKE} aria-hidden />}
-        {copied ? 'Copied' : 'Copy'}
-      </button>
-    </div>
-  );
-}
 
 /**
  * The database servers Shipway can put a database on. The two engines running on this host are
@@ -838,11 +997,34 @@ function ConnectionForm({ existing, onDone }: { existing: DbConnection | null; o
   );
 }
 
+/**
+ * Redis and Mailpit connection info, read-only. Its own tab now, which means it has to account for
+ * having nothing to show: stacked down the old page an absent panel simply wasn't there, but a tab
+ * that renders nothing looks broken rather than empty.
+ */
 function ServicesInfoPanels() {
   const servicesQuery = useServicesInfo();
-  if (!servicesQuery.data) return null;
-  const { redis, mailpit } = servicesQuery.data;
-  if (!redis && !mailpit) return null;
+
+  if (servicesQuery.isPending) {
+    return (
+      <div className="grid gap-4 sm:grid-cols-2">
+        <Skeleton className="h-48 w-full rounded-2xl" />
+        <Skeleton className="h-48 w-full rounded-2xl" />
+      </div>
+    );
+  }
+
+  const redis = servicesQuery.data?.redis ?? null;
+  const mailpit = servicesQuery.data?.mailpit ?? null;
+
+  if (!redis && !mailpit) {
+    return (
+      <EmptyState
+        title="No shared services"
+        message="This host has neither Redis nor Mailpit configured, so there is no connection info to show."
+      />
+    );
+  }
 
   return (
     <div className="grid gap-4 sm:grid-cols-2">
@@ -877,7 +1059,7 @@ function RedisPanel({ host, port, password }: { host: string; port: number; pass
   const [revealed, setRevealed] = useState(false);
   return (
     <Card>
-      <CardHeader icon={<DatabaseIcon size={20} strokeWidth={ICON_STROKE} />} title="Redis" description="Shared cache and queue broker." />
+      <CardHeader icon={<RedisIcon size={20} />} title="Redis" description="Shared cache and queue broker." />
       <dl className="mt-4 flex flex-col gap-2 text-sm">
         <div className="flex items-center justify-between">
           <dt className="text-soft">Host</dt>
@@ -917,7 +1099,7 @@ function MailpitPanel({
   const [revealed, setRevealed] = useState(false);
   return (
     <Card>
-      <CardHeader icon={<Mail size={20} strokeWidth={ICON_STROKE} />} title="Mailpit" description="Local SMTP catch-all for outgoing mail." />
+      <CardHeader icon={<MailpitIcon size={20} />} title="Mailpit" description="Local SMTP catch-all for outgoing mail." />
       <dl className="mt-4 flex flex-col gap-2 text-sm">
         <div className="flex items-center justify-between">
           <dt className="text-soft">SMTP host</dt>

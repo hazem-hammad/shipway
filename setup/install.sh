@@ -494,6 +494,9 @@ install_phpmyadmin() {
 
   if [[ -f "$stamp" ]] && [[ "$(cat "$stamp")" == "$PMA_VERSION" ]]; then
     log "phpMyAdmin ${PMA_VERSION} already installed, skipping"
+    # The config is still rewritten: it is where the signon server entry lives, and an install that
+    # predates a change to it would otherwise keep the old one forever.
+    configure_phpmyadmin
     return
   fi
 
@@ -538,17 +541,41 @@ configure_phpmyadmin() {
 // Written by setup/install.sh — edits here are overwritten on the next install.
 \$cfg['blowfish_secret'] = '${secret}';
 
+// Two entries for the same server, differing only in how you get in.
+//
+// 1 is signon: credentials arrive in a PHP session written by /db/signon.php (setup/db-signon.php),
+// which is where the dashboard's Manage button points. That is what makes the button land inside a
+// database instead of on a login form. There is no form to fall back to on this entry — phpMyAdmin
+// sends anyone who arrives without a signon session to SignonURL, the Databases page.
+//
+// 2 is the ordinary cookie login, and is the default, so opening the console directly behaves
+// exactly as it did before signon existed: a form, any MySQL account, that account's own grants.
 \$i = 0;
 \$i++;
 // 127.0.0.1 rather than 'localhost': a TCP connection is what Shipway's own connection strings use
 // (see server/src/services/dbprovision.ts), so grants that work for a project also work here.
 \$cfg['Servers'][\$i]['host'] = '127.0.0.1';
 \$cfg['Servers'][\$i]['port'] = 3306;
+\$cfg['Servers'][\$i]['verbose'] = 'Shipway (signed in)';
+\$cfg['Servers'][\$i]['auth_type'] = 'signon';
+// Must match SIGNON_SESSION and SIGNON_COOKIE_PARAMS in setup/db-signon.php, or phpMyAdmin opens a
+// different session than the shim wrote and finds no credentials in it.
+\$cfg['Servers'][\$i]['SignonSession'] = 'ShipwaySignon';
+\$cfg['Servers'][\$i]['SignonCookieParams'] = ['path' => '/db/', 'secure' => true, 'httponly' => true, 'samesite' => 'Lax'];
+\$cfg['Servers'][\$i]['SignonURL'] = 'https://ship.${BASE_DOMAIN}/databases';
+\$cfg['Servers'][\$i]['AllowNoPassword'] = false;
+\$cfg['Servers'][\$i]['AllowRoot'] = false;
+
+\$i++;
+\$cfg['Servers'][\$i]['host'] = '127.0.0.1';
+\$cfg['Servers'][\$i]['port'] = 3306;
+\$cfg['Servers'][\$i]['verbose'] = 'MySQL on this server';
 \$cfg['Servers'][\$i]['auth_type'] = 'cookie';
 \$cfg['Servers'][\$i]['AllowNoPassword'] = false;
 // No root/passwordless shortcut: whoever opens this supplies a database account, so what they can
 // reach is bounded by that account's own grants.
 \$cfg['Servers'][\$i]['AllowRoot'] = false;
+\$cfg['ServerDefault'] = \$i;
 
 \$cfg['TempDir'] = '/var/lib/phpmyadmin/tmp';
 // Served under a path, not at a host root — phpMyAdmin needs to know its own base URL to build
@@ -560,6 +587,17 @@ PMACONF
   # Readable by the FPM worker, not by other local users: it carries the blowfish secret.
   chmod 0640 /opt/phpmyadmin/config.inc.php
   chgrp www-data /opt/phpmyadmin/config.inc.php
+}
+
+# Installs the signon shim served at ship.<base-domain>/db/signon.php — the target of the
+# dashboard's Manage button on a MySQL database, which trades that database's id for a phpMyAdmin
+# session already connected to it. Kept in its own directory rather than inside /opt/phpmyadmin so
+# the nginx rule for it cannot reach anything else, and so a phpMyAdmin upgrade (which replaces that
+# directory wholesale) never deletes it.
+install_db_signon() {
+  log "installing the database signon shim at /opt/shipway-db-signon"
+  install -d -m 0755 -o root -g root /opt/shipway-db-signon
+  install -m 0644 -o root -g root "${SCRIPT_DIR}/db-signon.php" /opt/shipway-db-signon/signon.php
 }
 
 PGADMIN_ADMIN_PASSWORD=""
@@ -644,6 +682,10 @@ install_pgadmin() {
   # Copied out of the checkout first: the checkout normally lives under /root, which the pgadmin
   # user cannot read. The password goes over stdin, not argv, so it never shows up in ps.
   install -m 0755 -o root -g root "${SCRIPT_DIR}/pgadmin-set-password.py" /opt/pgadmin/set-password.py
+  # The server-sync script the root helper runs (shipway-sysops pgadmin-sync) whenever Shipway
+  # creates or drops a Postgres database. Same reason it is copied out of the checkout: /root is
+  # unreadable to the pgadmin user that ends up executing it.
+  install -m 0755 -o root -g root "${SCRIPT_DIR}/pgadmin-sync-servers.py" /opt/pgadmin/sync-servers.py
   log "setting pgAdmin admin password for ${PGADMIN_ADMIN_EMAIL}"
   ( cd "$pkg" && printf '%s\n' "$PGADMIN_ADMIN_PASSWORD" \
       | sudo -u pgadmin "${venv}/bin/python" /opt/pgadmin/set-password.py "$PGADMIN_ADMIN_EMAIL" >/dev/null ) \
@@ -1117,8 +1159,41 @@ postflight() {
 # main
 # ---------------------------------------------------------------------------
 
+# Reapplies just the database-console wiring on a host that is already installed: phpMyAdmin's
+# config (which is where the signon server entry lives), the signon shim, pgAdmin's config and its
+# server-sync script, the root helper, and the dashboard vhost that ties them together. Everything
+# it calls is idempotent and already runs on a normal install; this is the way to pick up a change
+# to one of them without re-running apt, certbot and DNS. Needs the base domain and nothing else.
+consoles_only() {
+  BASE_DOMAIN="${SHIPWAY_BASE_DOMAIN:-}"
+  if [[ -z "$BASE_DOMAIN" ]]; then
+    read -r -p "Base domain (e.g. intcore.dev): " BASE_DOMAIN
+  fi
+  [[ -n "$BASE_DOMAIN" ]] || die "a base domain is required"
+
+  install_phpmyadmin
+  install_db_signon
+  install_pgadmin
+  install_sysops_helper
+  install_vhosts
+
+  log "database consoles reapplied for ship.${BASE_DOMAIN}"
+}
+
 main() {
   check_root
+
+  # A targeted re-run for an already-installed host. Deliberately before preflight: none of the
+  # checks there (ports, DNS, the Cloudflare token) have anything to say about rewriting config on
+  # a host that is already serving.
+  if [[ "${1:-}" == "--consoles-only" ]]; then
+    export DEBIAN_FRONTEND=noninteractive
+    touch "$SECRETS_FILE"
+    chmod 0600 "$SECRETS_FILE"
+    consoles_only
+    return
+  fi
+
   preflight
   export DEBIAN_FRONTEND=noninteractive
 
@@ -1140,6 +1215,7 @@ main() {
   configure_mailpit_auth
 
   install_phpmyadmin
+  install_db_signon
   install_pgadmin
 
   install_certbot

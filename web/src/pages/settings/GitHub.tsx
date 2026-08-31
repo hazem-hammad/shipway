@@ -23,8 +23,21 @@ import {
   type ManualGithubAppBody,
 } from '../../api';
 import { submitManifestForm } from '../../lib/github';
-import { useGithubStatus } from '../../hooks';
-import { Badge, Button, buttonClasses, Card, CardHeader, Field, ICON_STROKE, IconChip, Input, Skeleton, Textarea } from '../../components/ui';
+import { useGithubStatus, useIsAdmin } from '../../hooks';
+import {
+  Badge,
+  Button,
+  buttonClasses,
+  Card,
+  CardHeader,
+  Field,
+  ICON_STROKE,
+  IconChip,
+  Input,
+  ReadOnlyNotice,
+  Skeleton,
+  Textarea,
+} from '../../components/ui';
 
 function errorMessage(err: unknown, fallback: string): string {
   return err instanceof ApiError ? err.message : fallback;
@@ -79,6 +92,17 @@ export default function GithubSection() {
 }
 
 function GithubStatusView({ status }: { status: GithubStatus }) {
+  const canEdit = useIsAdmin();
+
+  // Gated at the top rather than control-by-control, because every branch below is setup machinery:
+  // creating the app, installing it, re-detecting the installation, entering credentials by hand.
+  // None of it does anything for a member, and all of it 403s. What IS worth showing them is the
+  // answer to "can this instance deploy from GitHub at all", which is what their own New Project
+  // form depends on — so that state is rendered, and nothing else.
+  if (!canEdit) {
+    return <GithubStatusReadOnly status={status} />;
+  }
+
   if (!status.configured) {
     return <NotConfigured />;
   }
@@ -86,6 +110,40 @@ function GithubStatusView({ status }: { status: GithubStatus }) {
     return <NotInstalled appSlug={status.appSlug} />;
   }
   return <Installed appSlug={status.appSlug} />;
+}
+
+/** The member's view of Settings > GitHub: connection state, no setup actions. */
+function GithubStatusReadOnly({ status }: { status: GithubStatus }) {
+  const connected = status.configured && status.installed;
+
+  return (
+    <div className="flex max-w-[640px] flex-col gap-4">
+      <div className="flex items-center gap-3.5 rounded-xl bg-surface-2 px-4 py-3.5">
+        <IconChip>
+          <GitBranch size={20} strokeWidth={ICON_STROKE} />
+        </IconChip>
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-base font-semibold text-ink">
+            {connected ? `@${status.appSlug ?? 'unknown app'}` : 'Not connected'}
+          </div>
+          <div className="text-sm text-soft">
+            {connected
+              ? 'Shipway GitHub App'
+              : status.configured
+                ? 'The app is created but not installed on an account yet.'
+                : 'No GitHub App is configured for this instance.'}
+          </div>
+        </div>
+        {connected && (
+          <Badge tone="ok" className="shrink-0">
+            Used for deploys
+          </Badge>
+        )}
+      </div>
+
+      <ReadOnlyNotice can="change the GitHub connection" />
+    </div>
+  );
 }
 
 function Installed({ appSlug }: { appSlug: string | null }) {

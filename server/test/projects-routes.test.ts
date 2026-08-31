@@ -6,8 +6,9 @@ import { desc, eq } from 'drizzle-orm';
 import type { FastifyInstance, LightMyRequestResponse } from 'fastify';
 import { buildApp } from '../src/app.js';
 import { loadConfig } from '../src/config.js';
-import { auditEvents, deployments, projects } from '../src/db/schema.js';
+import { auditEvents, cronJobs, deployments, projects, workers } from '../src/db/schema.js';
 import { RESERVED_SLUGS } from '../src/routes/projects.js';
+import { NODE_BUILD_CMD, NODE_INSTALL_CMD, NODE_START_CMD } from '../src/deploy/node.js';
 import { DevSysOps } from '../src/sysops/dev.js';
 import { FakeDnsClient } from '../src/services/cloudflare.js';
 import {
@@ -47,7 +48,7 @@ async function buildProjectsTestApp(
   opts: { configureDomain?: boolean; makeSysOps?: (systemRoot: string) => DevSysOps } = {},
 ): Promise<TestApp> {
   const dataDir = tmpDataDir();
-  const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir });
+  const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir, SHIPWAY_APPS_DIR: path.join(dataDir, 'apps') });
   const systemRoot = path.join(dataDir, 'system');
   const sysops = opts.makeSysOps ? opts.makeSysOps(systemRoot) : new DevSysOps(systemRoot);
   const dns = new FakeDnsClient();
@@ -111,9 +112,9 @@ describe('POST /api/projects', () => {
       type: 'node',
       nodeVersion: '22',
       publicDir: '',
-      installCmd: 'npm ci',
-      buildCmd: 'npm run build',
-      startCmd: 'npm start',
+      installCmd: NODE_INSTALL_CMD,
+      buildCmd: NODE_BUILD_CMD,
+      startCmd: NODE_START_CMD,
       sharedPaths: [],
       healthCheckPath: null,
       autoDeploy: true,
@@ -329,7 +330,7 @@ describe('POST /api/projects', () => {
 
     it('reports attempted:false when no DNS client is configured (app.dns() returns null)', async () => {
       const dataDir = tmpDataDir();
-      const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir });
+      const cfg = loadConfig({ SHIPWAY_DEV: '1', SHIPWAY_DATA_DIR: dataDir, SHIPWAY_APPS_DIR: path.join(dataDir, 'apps') });
       const sysops = new DevSysOps(path.join(dataDir, 'system'));
       const app = await buildApp(cfg, { sysops, dns: () => null });
 
@@ -806,7 +807,10 @@ describe('project env', () => {
     const envText = 'APP_KEY=base64:supersecret\nDB_PASSWORD=hunter2\n';
 
     const put = await app.inject({ method: 'PUT', url: `/api/projects/${id}/env`, headers: { cookie }, payload: { content: envText } });
-    expect(put.statusCode).toBe(204);
+    expect(put.statusCode).toBe(200);
+    // Nothing has been deployed in this test, so there is no release for the env to reach — the
+    // save still succeeds, and says so rather than claiming to be live.
+    expect(put.json()).toEqual({ applied: false, reason: 'never-deployed', workersRestarted: 0 });
 
     const row = app.db.select({ envEncrypted: projects.envEncrypted }).from(projects).where(eq(projects.id, id)).get();
     expect(row?.envEncrypted).toBeInstanceOf(Buffer);
@@ -815,6 +819,150 @@ describe('project env', () => {
 
     const get = await app.inject({ method: 'GET', url: `/api/projects/${id}/env`, headers: { cookie } });
     expect(get.json()).toEqual({ content: envText });
+
+    await app.close();
+  });
+});
+
+describe('PUT /api/projects/:id/env — applying to the running release', () => {
+  /** Fakes what a deploy leaves behind: a release directory with `.env` symlinked to `shared/.env`,
+   * and the `current` symlink pointing at it. Enough for `applyEnvToRunning` to consider the
+   * project live, without running the pipeline. */
+  function fakeRelease(app: FastifyInstance, slug: string): { sharedEnv: string; releaseEnv: string } {
+    const dir = path.join(app.cfg.appsDir, slug);
+    const shared = path.join(dir, 'shared');
+    const release = path.join(dir, 'releases', '20260101_000000');
+    fs.mkdirSync(shared, { recursive: true });
+    fs.mkdirSync(release, { recursive: true });
+    const sharedEnv = path.join(shared, '.env');
+    fs.writeFileSync(sharedEnv, 'OLD=value\n', 'utf8');
+    const releaseEnv = path.join(release, '.env');
+    fs.symlinkSync(sharedEnv, releaseEnv);
+    fs.symlinkSync(release, path.join(dir, 'current'));
+    return { sharedEnv, releaseEnv };
+  }
+
+  it('rewrites shared/.env and reloads php-fpm, so the live release sees it through its symlink', async () => {
+    const { app, cookie, sysops } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    const slug = create.json().slug as string;
+    const { releaseEnv } = fakeRelease(app, slug);
+    sysops.calls.length = 0;
+
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${String(id)}/env`,
+      headers: { cookie },
+      payload: { content: 'QUEUE_CONNECTION=redis\n' },
+    });
+
+    expect(put.statusCode).toBe(200);
+    // A Laravel project is seeded with a 2-process queue worker at creation
+    // (`seedLaravelDefaults`), so "no workers" is no longer the baseline for a php project.
+    expect(put.json()).toEqual({ applied: true, workersRestarted: 2 });
+    // Read through the RELEASE's symlink, which is the path the running app actually opens.
+    expect(fs.readFileSync(releaseEnv, 'utf8')).toContain('QUEUE_CONNECTION=redis');
+    expect(sysops.calls).toContain('reloadPhpFpm 8.3');
+
+    await app.close();
+  });
+
+  it('restarts every worker instance, since EnvironmentFile is only read at process start', async () => {
+    const { app, cookie, sysops } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    const slug = create.json().slug as string;
+    fakeRelease(app, slug);
+    await app.inject({
+      method: 'POST',
+      url: `/api/projects/${String(id)}/workers`,
+      headers: { cookie },
+      payload: { name: 'app-queue', command: 'php artisan queue:work redis', processes: 2 },
+    });
+    sysops.calls.length = 0;
+
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${String(id)}/env`,
+      headers: { cookie },
+      payload: { content: 'QUEUE_CONNECTION=redis\n' },
+    });
+
+    // 4 = this test's own 2-process `app-queue` plus the 2-process `queue` worker seeded at creation.
+    expect(put.json()).toEqual({ applied: true, workersRestarted: 4 });
+    expect(sysops.calls).toContain(`unitAction restart shipway-worker-${slug}-app-queue@1.service`);
+    expect(sysops.calls).toContain(`unitAction restart shipway-worker-${slug}-app-queue@2.service`);
+    expect(sysops.calls).toContain(`unitAction restart shipway-worker-${slug}-queue@1.service`);
+
+    await app.close();
+  });
+
+  it('stands off while a deploy is in flight rather than racing it for the same file', async () => {
+    const { app, cookie, sysops } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    const slug = create.json().slug as string;
+    const { sharedEnv } = fakeRelease(app, slug);
+    app.db.insert(deployments).values({ projectId: id, status: 'running', trigger: 'manual', logPath: '' }).run();
+    sysops.calls.length = 0;
+
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${String(id)}/env`,
+      headers: { cookie },
+      payload: { content: 'QUEUE_CONNECTION=redis\n' },
+    });
+
+    // The deploy writes shared/.env itself, from this same stored env — so the save is not lost,
+    // it just isn't applied twice by two writers.
+    expect(put.json()).toEqual({ applied: false, reason: 'deploy-in-flight', workersRestarted: 0 });
+    expect(fs.readFileSync(sharedEnv, 'utf8')).toBe('OLD=value\n');
+    expect(sysops.calls).toEqual([]);
+
+    await app.close();
+  });
+
+  it('keeps the saved env when the restart fails, and says the restart is what broke', async () => {
+    const { app, cookie } = await buildProjectsTestApp({
+      makeSysOps: (root) =>
+        new (class extends DevSysOps {
+          async reloadPhpFpm(): Promise<void> {
+            throw new Error('Job for php8.3-fpm.service failed');
+          }
+        })(root),
+    });
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    const { releaseEnv } = fakeRelease(app, create.json().slug as string);
+
+    const put = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${String(id)}/env`,
+      headers: { cookie },
+      payload: { content: 'QUEUE_CONNECTION=redis\n' },
+    });
+
+    // Losing the saved env because a unit was wedged would be the worse of the two failures.
+    expect(put.statusCode).toBe(200);
+    expect(put.json().restartError).toContain('php8.3-fpm');
+    expect(fs.readFileSync(releaseEnv, 'utf8')).toContain('QUEUE_CONNECTION=redis');
+    const get = await app.inject({ method: 'GET', url: `/api/projects/${String(id)}/env`, headers: { cookie } });
+    expect(get.json().content).toBe('QUEUE_CONNECTION=redis\n');
+
+    await app.close();
+  });
+
+  it('records whether it applied in the audit trail', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    fakeRelease(app, create.json().slug as string);
+
+    await app.inject({ method: 'PUT', url: `/api/projects/${String(id)}/env`, headers: { cookie }, payload: { content: 'A=1\n' } });
+
+    const row = app.db.select().from(auditEvents).where(eq(auditEvents.action, 'project.env.update')).get();
+    expect(JSON.parse(row?.meta ?? '{}')).toMatchObject({ applied: true });
 
     await app.close();
   });
@@ -860,17 +1008,47 @@ describe('GET /api/projects/:id/env/preview', () => {
     await app.close();
   });
 
-  it('returns an empty preview when SMTP mode is "none"', async () => {
+  it('returns SES vars with a derived host once mode is "ses"', async () => {
     const { app, cookie } = await buildProjectsTestApp();
     const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
     const id = create.json().id as number;
+
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${id}/smtp`,
+      headers: { cookie },
+      payload: { mode: 'ses', config: { region: 'eu-central-1', username: 'AKIAEXAMPLE', password: 'ses-pass', fromAddress: 'noreply@example.com' } },
+    });
+
+    const res = await app.inject({ method: 'GET', url: `/api/projects/${id}/env/preview`, headers: { cookie } });
+
+    expect(res.statusCode).toBe(200);
+    const { content } = res.json() as { content: string };
+    expect(content).toContain('MAIL_HOST=email-smtp.eu-central-1.amazonaws.com');
+    expect(content).toContain('MAIL_PORT=587');
+    expect(content).toContain('MAIL_ENCRYPTION=tls');
+    expect(content).toContain('MAIL_USERNAME=AKIAEXAMPLE');
+    expect(content).toContain('MAIL_FROM_ADDRESS=noreply@example.com');
+
+    await app.close();
+  });
+
+  it('previews only the SQLite fallback when SMTP mode is "none" — a php project always has that', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    const slug = create.json().slug as string;
 
     await app.inject({ method: 'PUT', url: `/api/projects/${id}/smtp`, headers: { cookie }, payload: { mode: 'none' } });
 
     const res = await app.inject({ method: 'GET', url: `/api/projects/${id}/env/preview`, headers: { cookie } });
 
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ content: '' });
+    const { content } = res.json() as { content: string };
+    // No MAIL_* at all, but the managed DB_DATABASE remains: with no database attached, this is the
+    // SQLite file the project actually runs on.
+    expect(content).not.toContain('MAIL_');
+    expect(content).toContain(`DB_DATABASE=${app.cfg.appsDir}/${slug}/shared/database.sqlite`);
 
     await app.close();
   });
@@ -880,6 +1058,107 @@ describe('GET /api/projects/:id/env/preview', () => {
 
     const res = await app.inject({ method: 'GET', url: '/api/projects/999999/env/preview', headers: { cookie } });
     expect(res.statusCode).toBe(404);
+
+    await app.close();
+  });
+});
+
+describe('PUT /api/projects/:id/smtp — ses mode', () => {
+  it('rejects ses without a config', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const res = await app.inject({ method: 'PUT', url: `/api/projects/${id}/smtp`, headers: { cookie }, payload: { mode: 'ses' } });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: string }).error).toContain('region');
+
+    await app.close();
+  });
+
+  it('rejects ses missing any required credential field', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+    const full = { region: 'us-east-1', username: 'u', password: 'p', fromAddress: 'a@b.com' };
+
+    for (const missing of ['region', 'username', 'password', 'fromAddress'] as const) {
+      const config: Record<string, string> = { ...full };
+      delete config[missing];
+      const res = await app.inject({ method: 'PUT', url: `/api/projects/${id}/smtp`, headers: { cookie }, payload: { mode: 'ses', config } });
+      expect(res.statusCode, missing).toBe(400);
+    }
+
+    await app.close();
+  });
+
+  it('rejects a ses region that is not a well-formed AWS region code', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    for (const region of ['us-east-1.evil.example.com', 'evil.example.com', 'US-EAST-1', '   ']) {
+      const res = await app.inject({
+        method: 'PUT',
+        url: `/api/projects/${id}/smtp`,
+        headers: { cookie },
+        payload: { mode: 'ses', config: { region, username: 'u', password: 'p', fromAddress: 'a@b.com' } },
+      });
+      expect(res.statusCode, region).toBe(400);
+    }
+
+    // Nothing was persisted by any of the rejected attempts.
+    const row = app.db.select().from(projects).where(eq(projects.id, id)).get();
+    expect(row?.smtpMode).toBe('mailpit');
+
+    await app.close();
+  });
+
+  it('accepts a complete ses config, stores it encrypted, and never returns it', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const res = await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${id}/smtp`,
+      headers: { cookie },
+      payload: { mode: 'ses', config: { region: 'us-east-1', username: 'AKIAEXAMPLE', password: 'ses-pass', fromAddress: 'a@b.com' } },
+    });
+    // 200 with an apply result, not 204: this writes the project's .env, so it now also applies
+    // it to the running release (services/envapply.ts).
+    expect(res.statusCode).toBe(200);
+
+    const row = app.db.select().from(projects).where(eq(projects.id, id)).get();
+    expect(row?.smtpMode).toBe('ses');
+    expect(row?.smtpConfigEncrypted).not.toBeNull();
+    // Stored ciphertext, not plaintext.
+    expect(row?.smtpConfigEncrypted?.toString('utf8')).not.toContain('ses-pass');
+    expect(JSON.parse(app.secretBox.decrypt(row!.smtpConfigEncrypted!))).toMatchObject({ region: 'us-east-1', password: 'ses-pass' });
+
+    // The credential never comes back out through the API.
+    const get = await app.inject({ method: 'GET', url: `/api/projects/${id}`, headers: { cookie } });
+    expect(JSON.stringify(get.json())).not.toContain('ses-pass');
+
+    await app.close();
+  });
+
+  it('clears the stored config when switching from ses back to mailpit', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${id}/smtp`,
+      headers: { cookie },
+      payload: { mode: 'ses', config: { region: 'us-east-1', username: 'u', password: 'p', fromAddress: 'a@b.com' } },
+    });
+    await app.inject({ method: 'PUT', url: `/api/projects/${id}/smtp`, headers: { cookie }, payload: { mode: 'mailpit' } });
+
+    const row = app.db.select().from(projects).where(eq(projects.id, id)).get();
+    expect(row?.smtpMode).toBe('mailpit');
+    expect(row?.smtpConfigEncrypted).toBeNull();
 
     await app.close();
   });
@@ -909,7 +1188,9 @@ describe('PUT /api/projects/:id/smtp', () => {
       payload: { mode: 'custom', config: { host: 'smtp.example.com', port: 587, username: 'bot', password: 'hunter2' } },
     });
 
-    expect(res.statusCode).toBe(204);
+    // 200 with an apply result, not 204: this writes the project's .env, so it now also applies
+    // it to the running release (services/envapply.ts).
+    expect(res.statusCode).toBe(200);
     const row = app.db
       .select({ smtpMode: projects.smtpMode, smtpConfigEncrypted: projects.smtpConfigEncrypted })
       .from(projects)
@@ -928,7 +1209,307 @@ describe('PUT /api/projects/:id/smtp', () => {
     const id = create.json().id as number;
 
     const res = await app.inject({ method: 'PUT', url: `/api/projects/${id}/smtp`, headers: { cookie }, payload: { mode: 'mailpit' } });
-    expect(res.statusCode).toBe(204);
+    // 200 with an apply result, not 204: the SMTP mode renders part of the project's .env, so saving
+    // it now writes and applies that file the same way the Environment tab does.
+    expect(res.statusCode).toBe(200);
+
+    await app.close();
+  });
+});
+
+/**
+ * A Laravel project needs two things nobody new to it knows are required: the every-minute
+ * `schedule:run` cron (without which `$schedule` never fires at all) and a queue worker. Both are
+ * seeded at creation and remain ordinary, editable rows.
+ */
+describe('POST /api/projects — Laravel defaults', () => {
+  it('seeds the every-minute scheduler cron, with the php version pinned', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const rows = app.db.select().from(cronJobs).where(eq(cronJobs.projectId, id)).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.schedule).toBe('* * * * *');
+    // Rewritten to the project's pinned version, exactly as a hand-added cron would be.
+    expect(rows[0]?.command).toBe('php8.3 artisan schedule:run');
+
+    await app.close();
+  });
+
+  it('seeds a queue worker with a shutdown grace period, and no hardcoded queue connection', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const rows = app.db.select().from(workers).where(eq(workers.projectId, id)).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ name: 'queue', processes: 2, autoStart: true, restartPolicy: 'always', stopTimeoutSec: 120 });
+    expect(rows[0]?.command).toContain('php artisan queue:work');
+    // Naming a connection would break on a host with no redis, where QUEUE_CONNECTION is `sync`.
+    expect(rows[0]?.command).not.toContain('redis');
+
+    await app.close();
+  });
+
+  it('installs them on the host, not just in the database', async () => {
+    const { app, cookie, sysops } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const slug = create.json().slug as string;
+
+    expect(sysops.calls.some((call) => call.startsWith('writeCrontab'))).toBe(true);
+    expect(sysops.calls).toContain(`unitAction start shipway-worker-${slug}-queue@1.service`);
+    expect(sysops.calls).toContain(`unitAction start shipway-worker-${slug}-queue@2.service`);
+
+    await app.close();
+  });
+
+  it('seeds nothing for a non-php project', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: NODE_PAYLOAD });
+    const id = create.json().id as number;
+
+    expect(app.db.select().from(cronJobs).where(eq(cronJobs.projectId, id)).all()).toHaveLength(0);
+    expect(app.db.select().from(workers).where(eq(workers.projectId, id)).all()).toHaveLength(0);
+
+    await app.close();
+  });
+
+  it('leaves them fully editable — they are ordinary rows, not fixed config', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const create = await app.inject({ method: 'POST', url: '/api/projects', headers: { cookie }, payload: PHP_PAYLOAD });
+    const id = create.json().id as number;
+
+    const workerId = app.db.select().from(workers).where(eq(workers.projectId, id)).all()[0]!.id;
+    const cronId = app.db.select().from(cronJobs).where(eq(cronJobs.projectId, id)).all()[0]!.id;
+
+    expect((await app.inject({ method: 'DELETE', url: `/api/workers/${String(workerId)}`, headers: { cookie } })).statusCode).toBe(204);
+    expect((await app.inject({ method: 'DELETE', url: `/api/cron/${String(cronId)}`, headers: { cookie } })).statusCode).toBe(204);
+    expect(app.db.select().from(workers).where(eq(workers.projectId, id)).all()).toHaveLength(0);
+
+    await app.close();
+  });
+});
+
+describe('PATCH /api/projects/:id/subdomain', () => {
+  /** Creates a static project and returns its id. `PHP_PAYLOAD`/`NODE_PAYLOAD` both work too — the
+   *  move is type-independent, so the cheapest project type is used throughout. */
+  async function createStatic(app: FastifyInstance, cookie: string, slug: string): Promise<number> {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects',
+      headers: { cookie },
+      payload: { name: slug, slug, repo: `acme/${slug}`, branch: 'main', type: 'static' },
+    });
+    expect(res.statusCode).toBe(201);
+    return res.json().id as number;
+  }
+
+  it('moves the DNS record and the vhost, and reports what it did', async () => {
+    const { app, cookie, dns, dataDir } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'store' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.project).toMatchObject({ slug: 'shop', subdomain: 'store' });
+    expect(body.move).toMatchObject({
+      domain: 'store.apps.example.com',
+      previousDomain: 'shop.apps.example.com',
+      dnsAttempted: true,
+      created: true,
+      oldRecordRemoved: true,
+    });
+    expect([...dns.records.keys()]).toEqual(['store.apps.example.com']);
+
+    // The vhost file keeps the slug in its name — only what it serves changed.
+    const vhost = fs.readFileSync(path.join(dataDir, 'system/etc/nginx/sites-available/shipway-shop.conf'), 'utf8');
+    expect(vhost).toContain('store.apps.example.com');
+
+    const audit = app.db.select().from(auditEvents).where(eq(auditEvents.action, 'project.subdomain.update')).get();
+    expect(JSON.parse(audit?.meta ?? '{}')).toMatchObject({ from: 'shop.apps.example.com', to: 'store.apps.example.com' });
+
+    await app.close();
+  });
+
+  it('stores null (not a copy of the slug) when moved back, so the slug stays the default', async () => {
+    const { app, cookie, dns } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+    await app.inject({ method: 'PATCH', url: `/api/projects/${String(id)}/subdomain`, headers: { cookie }, payload: { subdomain: 'store' } });
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'shop' },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().project.subdomain).toBeNull();
+    expect([...dns.records.keys()]).toEqual(['shop.apps.example.com']);
+
+    await app.close();
+  });
+
+  it('repoints the old domain in the project env at the new one', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+    await app.inject({
+      method: 'PUT',
+      url: `/api/projects/${String(id)}/env`,
+      headers: { cookie },
+      payload: { content: 'APP_URL=https://shop.apps.example.com\nSESSION_DOMAIN=shop.apps.example.com\nDB_HOST=127.0.0.1\n' },
+    });
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'store' },
+    });
+    expect(res.json().envRewritten).toBe(true);
+
+    const env = await app.inject({ method: 'GET', url: `/api/projects/${String(id)}/env`, headers: { cookie } });
+    expect(env.json().content).toBe('APP_URL=https://store.apps.example.com\nSESSION_DOMAIN=store.apps.example.com\nDB_HOST=127.0.0.1\n');
+
+    await app.close();
+  });
+
+  it('reports envRewritten: false when the old domain was not in the env', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+    await app.inject({ method: 'PUT', url: `/api/projects/${String(id)}/env`, headers: { cookie }, payload: { content: 'DB_HOST=127.0.0.1\n' } });
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'store' },
+    });
+
+    expect(res.json().envRewritten).toBe(false);
+    const env = await app.inject({ method: 'GET', url: `/api/projects/${String(id)}/env`, headers: { cookie } });
+    expect(env.json().content).toBe('DB_HOST=127.0.0.1\n');
+
+    await app.close();
+  });
+
+  it('409s on a reserved subdomain, and on one another project already answers to', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+    await createStatic(app, cookie, 'blog');
+
+    for (const reserved of RESERVED_SLUGS) {
+      const res = await app.inject({
+        method: 'PATCH',
+        url: `/api/projects/${String(id)}/subdomain`,
+        headers: { cookie },
+        payload: { subdomain: reserved },
+      });
+      expect(res.statusCode).toBe(409);
+      expect(res.json()).toEqual({ error: 'this name is reserved' });
+    }
+
+    const taken = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'blog' },
+    });
+    expect(taken.statusCode).toBe(409);
+    expect(taken.json()).toEqual({ error: 'subdomain already in use' });
+
+    await app.close();
+  });
+
+  it('frees the slug of a project that has itself been moved away', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const blogId = await createStatic(app, cookie, 'blog');
+    const shopId = await createStatic(app, cookie, 'shop');
+
+    // 'blog' vacates its slug...
+    await app.inject({ method: 'PATCH', url: `/api/projects/${String(blogId)}/subdomain`, headers: { cookie }, payload: { subdomain: 'journal' } });
+    // ...so 'shop' can take it, even though a row still has `slug: 'blog'`.
+    const res = await app.inject({ method: 'PATCH', url: `/api/projects/${String(shopId)}/subdomain`, headers: { cookie }, payload: { subdomain: 'blog' } });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().move.domain).toBe('blog.apps.example.com');
+
+    await app.close();
+  });
+
+  it('400s on a no-op move, an invalid shape, and 404s on an unknown project', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+
+    const noop = await app.inject({ method: 'PATCH', url: `/api/projects/${String(id)}/subdomain`, headers: { cookie }, payload: { subdomain: 'shop' } });
+    expect(noop.statusCode).toBe(400);
+    expect(noop.json()).toEqual({ error: 'this project already uses that subdomain' });
+
+    const bad = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'Not A Subdomain' },
+    });
+    expect(bad.statusCode).toBe(400);
+
+    const missing = await app.inject({ method: 'PATCH', url: '/api/projects/9999/subdomain', headers: { cookie }, payload: { subdomain: 'store' } });
+    expect(missing.statusCode).toBe(404);
+
+    await app.close();
+  });
+
+  it('rolls the column back when the host work fails, so the row never claims an unserved domain', async () => {
+    // Toggled on only after the project exists, so provisioning succeeds and it is the MOVE's
+    // `nginx -t` that fails.
+    class ToggleableNginxTestSysOps extends DevSysOps {
+      failNginxTest = false;
+      async nginxTest(): Promise<{ ok: boolean; output: string }> {
+        if (this.failNginxTest) {
+          this.calls.push('nginxTest');
+          return { ok: false, output: 'nginx: [emerg] duplicate server_name' };
+        }
+        return super.nginxTest();
+      }
+    }
+    let sysops!: ToggleableNginxTestSysOps;
+    const { app, cookie, dns } = await buildProjectsTestApp({
+      makeSysOps: (root) => (sysops = new ToggleableNginxTestSysOps(root)),
+    });
+    const id = await createStatic(app, cookie, 'shop');
+    sysops.failNginxTest = true;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${String(id)}/subdomain`,
+      headers: { cookie },
+      payload: { subdomain: 'store' },
+    });
+
+    expect(res.statusCode).toBe(502);
+    expect(res.json()).toMatchObject({ error: 'could not move the project', step: 'nginx-test' });
+    expect(app.db.select().from(projects).where(eq(projects.id, id)).get()?.subdomain).toBeNull();
+    expect([...dns.records.keys()]).toEqual(['shop.apps.example.com']);
+
+    await app.close();
+  });
+
+  it('rejects a subdomain sent to the general PATCH route, pointing at the one that moves DNS too', async () => {
+    const { app, cookie } = await buildProjectsTestApp();
+    const id = await createStatic(app, cookie, 'shop');
+
+    const res = await app.inject({ method: 'PATCH', url: `/api/projects/${String(id)}`, headers: { cookie }, payload: { subdomain: 'store' } });
+
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({ error: 'use PATCH /api/projects/:id/subdomain to move a project' });
+    expect(app.db.select().from(projects).where(eq(projects.id, id)).get()?.subdomain).toBeNull();
 
     await app.close();
   });

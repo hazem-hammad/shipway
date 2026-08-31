@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { buildManagedVars, buildEnvFile } from '../src/deploy/envfile.js';
+import { buildEnvFile, buildManagedVars, sqlitePath } from '../src/deploy/envfile.js';
 
 const MARKER_START = '# >>> shipway managed — do not edit below >>>';
 const MARKER_END = '# <<< shipway managed <<<';
@@ -55,6 +55,48 @@ describe('buildManagedVars', () => {
       SMTP_HOST: 'smtp.example.com',
       SMTP_PORT: '587',
     });
+  });
+
+  it('ses mode derives host/port/encryption from the region instead of taking them', () => {
+    const out = buildManagedVars({
+      smtpMode: 'ses',
+      sesConfig: { region: 'eu-central-1', username: 'AKIAIOSFODNN7EXAMPLE', password: 'ses-smtp-password', fromAddress: 'noreply@example.com' },
+    });
+    expect(out).toEqual({
+      MAIL_MAILER: 'smtp',
+      MAIL_HOST: 'email-smtp.eu-central-1.amazonaws.com',
+      MAIL_PORT: '587',
+      MAIL_USERNAME: 'AKIAIOSFODNN7EXAMPLE',
+      MAIL_PASSWORD: 'ses-smtp-password',
+      MAIL_FROM_ADDRESS: 'noreply@example.com',
+      MAIL_ENCRYPTION: 'tls',
+      SMTP_HOST: 'email-smtp.eu-central-1.amazonaws.com',
+      SMTP_PORT: '587',
+    });
+  });
+
+  it('ses mode ignores a smtpConfig left over from a previous mode', () => {
+    const out = buildManagedVars({
+      smtpMode: 'ses',
+      // A stale `custom` blob must never leak its host into an SES project's .env.
+      smtpConfig: { host: 'stale.example.com', port: 25 },
+      sesConfig: { region: 'us-east-1', username: 'u', password: 'p', fromAddress: 'a@b.com' },
+    });
+    expect(out.MAIL_HOST).toBe('email-smtp.us-east-1.amazonaws.com');
+    expect(out.MAIL_PORT).toBe('587');
+  });
+
+  it('ses mode throws rather than writing a bogus host when the region is malformed', () => {
+    for (const region of ['us-east-1.evil.example.com', 'evil.example.com', 'US-EAST-1', '']) {
+      expect(
+        () => buildManagedVars({ smtpMode: 'ses', sesConfig: { region, username: 'u', password: 'p', fromAddress: 'a@b.com' } }),
+        region,
+      ).toThrow(/not a valid AWS region/);
+    }
+  });
+
+  it('ses mode throws when sesConfig is missing entirely', () => {
+    expect(() => buildManagedVars({ smtpMode: 'ses' })).toThrow(/sesConfig is required/);
   });
 
   it('custom mode omits keys whose source field is undefined', () => {
@@ -254,5 +296,54 @@ describe('buildEnvFile', () => {
     const userEnv = '# my app config\nAPP_NAME=demo\nAPP_DEBUG=true\n';
     const out = buildEnvFile(userEnv, { MAIL_MAILER: 'smtp' });
     expect(out.startsWith(userEnv.replace(/\n$/, ''))).toBe(true);
+  });
+});
+
+/**
+ * A php project with no database falls back to SQLite so its first deploy can run
+ * `php artisan migrate --force` at all. The path is MANAGED rather than written into the env
+ * template, because the template is rendered in the browser where the host's apps directory is
+ * unknown — and because it must keep following the project if that directory changes.
+ */
+describe('buildManagedVars — sqlite fallback', () => {
+  it('adds DB_CONNECTION and DB_DATABASE alongside the mail block', () => {
+    const out = buildManagedVars({ smtpMode: 'mailpit', sqliteDatabasePath: '/srv/apps/shop/shared/database.sqlite' });
+
+    // The driver is managed with the path: a sqlite path under whatever config/database.php happens
+    // to default to works on one Laravel version and silently doesn't on another.
+    expect(out.DB_CONNECTION).toBe('sqlite');
+    expect(out.DB_DATABASE).toBe('/srv/apps/shop/shared/database.sqlite');
+    expect(out.MAIL_HOST).toBe('127.0.0.1');
+  });
+
+  it('is the only managed var when mail is off', () => {
+    expect(buildManagedVars({ smtpMode: 'none', sqliteDatabasePath: '/srv/apps/shop/shared/database.sqlite' })).toEqual({
+      DB_CONNECTION: 'sqlite',
+      DB_DATABASE: '/srv/apps/shop/shared/database.sqlite',
+    });
+  });
+
+  it('is absent entirely when the project has a real database', () => {
+    expect(buildManagedVars({ smtpMode: 'none' })).toEqual({});
+    expect(buildManagedVars({ smtpMode: 'mailpit' }).DB_DATABASE).toBeUndefined();
+  });
+
+  it('is suppressed by a user-defined DB_DATABASE, like every other managed var', () => {
+    const managed = buildManagedVars({ smtpMode: 'none', sqliteDatabasePath: '/srv/apps/shop/shared/database.sqlite' });
+    const rendered = buildEnvFile('DB_CONNECTION=mysql\nDB_DATABASE=shop\n', managed);
+
+    // The user attached a real database by hand; the fallback must not fight them for either key.
+    expect(rendered).toContain('DB_DATABASE=shop');
+    expect(rendered).toContain('DB_CONNECTION=mysql');
+    expect(rendered).not.toContain('database.sqlite');
+    expect(rendered).not.toContain('DB_CONNECTION=sqlite');
+  });
+});
+
+describe('sqlitePath', () => {
+  it('puts the file in the project\'s SHARED directory, not a release', () => {
+    // A file under `current/` would be deleted with the release on the next deploy or prune, taking
+    // the project's data with it.
+    expect(sqlitePath('/srv/apps', 'shop')).toBe('/srv/apps/shop/shared/database.sqlite');
   });
 });

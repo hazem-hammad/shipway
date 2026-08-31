@@ -10,6 +10,7 @@ import {
   renderWorkerUnit,
   renderCrontabSection,
   mergeCrontab,
+  renderDefaultVhost,
 } from '../src/system/templates.js';
 import type { VhostInput, AppUnitInput, WorkerUnitInput, CronLine } from '../src/system/templates.js';
 
@@ -365,6 +366,38 @@ describe('renderWorkerUnit', () => {
   });
 });
 
+describe('renderWorkerUnit — runtime options', () => {
+  const base = { slug: 'shop', name: 'queue', appsDir: '/srv/apps', command: 'php artisan queue:work', pathPrefix: '/usr/bin' };
+
+  it('defaults to the behavior every worker had before these were configurable', () => {
+    const unit = renderWorkerUnit(base);
+    expect(unit).toContain('Restart=always');
+    expect(unit).toContain('RestartSec=3');
+    // systemd's own default is 90s, so units rendered before this option existed behaved this way.
+    expect(unit).toContain('TimeoutStopSec=90');
+  });
+
+  it('renders each supplied option as its systemd directive', () => {
+    const unit = renderWorkerUnit({ ...base, restartPolicy: 'on-failure', restartSec: 15, stopTimeoutSec: 300 });
+    expect(unit).toContain('Restart=on-failure');
+    expect(unit).toContain('RestartSec=15');
+    expect(unit).toContain('TimeoutStopSec=300');
+    expect(unit).not.toContain('Restart=always');
+  });
+
+  it('supports disabling restarts entirely', () => {
+    expect(renderWorkerUnit({ ...base, restartPolicy: 'no' })).toContain('Restart=no');
+  });
+
+  it('keeps the directives inside [Service], not [Unit] or [Install]', () => {
+    const unit = renderWorkerUnit({ ...base, restartPolicy: 'on-failure', restartSec: 9, stopTimeoutSec: 120 });
+    const service = unit.slice(unit.indexOf('[Service]'), unit.indexOf('[Install]'));
+    for (const directive of ['Restart=on-failure', 'RestartSec=9', 'TimeoutStopSec=120']) {
+      expect(service, directive).toContain(directive);
+    }
+  });
+});
+
 describe('renderCrontabSection', () => {
   it('returns "" for an empty array (no markers)', () => {
     expect(renderCrontabSection([])).toBe('');
@@ -564,5 +597,43 @@ describe('mergeCrontab', () => {
     const once = mergeCrontab(existing, section);
     const twice = mergeCrontab(once, section);
     expect(twice).toBe(once);
+  });
+});
+
+/**
+ * The catch-all vhost exists because nginx, given no `default_server` on 443, answers an unmatched
+ * Host with whichever project block sorts first — so a deleted project's still-resolving wildcard
+ * subdomain served an unrelated project's site.
+ */
+describe('renderDefaultVhost', () => {
+  it('claims the 443 default_server on both address families', () => {
+    const conf = renderDefaultVhost('intcore.dev');
+    expect(conf).toContain('listen 443 ssl default_server;');
+    expect(conf).toContain('listen [::]:443 ssl default_server;');
+    expect(conf).toContain('server_name _;');
+  });
+
+  it('answers 404 rather than serving anything', () => {
+    const conf = renderDefaultVhost('intcore.dev');
+    expect(conf).toContain('return 404;');
+    expect(conf).not.toContain('root ');
+    expect(conf).not.toContain('proxy_pass');
+  });
+
+  it('terminates TLS with the wildcard certificate, since the handshake precedes any response', () => {
+    const conf = renderDefaultVhost('intcore.dev');
+    expect(conf).toContain('ssl_certificate /etc/letsencrypt/live/intcore.dev/fullchain.pem;');
+    expect(conf).toContain('ssl_certificate_key /etc/letsencrypt/live/intcore.dev/privkey.pem;');
+  });
+
+  it('never claims port 80, which Debian\'s stock default already owns', () => {
+    // Two `default_server` directives on the same port make nginx refuse to start entirely.
+    expect(renderDefaultVhost('intcore.dev')).not.toContain('listen 80');
+  });
+
+  it('rejects a certName that is not hostname-shaped', () => {
+    for (const bad of ['not a host', 'evil.com;', '../../etc/passwd', '']) {
+      expect(() => renderDefaultVhost(bad), bad).toThrow(/Invalid certName/);
+    }
   });
 });

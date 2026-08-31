@@ -23,13 +23,13 @@ import type { ShipwayDb } from '../db/index.js';
 import { deployments, projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import { AbortedError } from '../lib/aborted-error.js';
+import { projectDomain } from '../lib/domain.js';
 import type { SecretBox } from '../lib/secretbox.js';
 import type { GitOps } from '../services/git.js';
+import { restartRuntime, restartWorkers, writeSharedEnv } from '../services/envapply.js';
 import { nodeBinDir, phpBinDir } from '../services/provisioner.js';
-import { workerInstances } from '../services/workers.js';
 import type { SysOps } from '../sysops/types.js';
 import { unitNames } from '../system/templates.js';
-import { buildEnvFile, buildManagedVars, type SmtpConfig } from './envfile.js';
 import type { DeployLogger } from './logger.js';
 
 type DeploymentRow = typeof deployments.$inferSelect;
@@ -62,7 +62,9 @@ export interface PipelineDeps {
      * instead of `deploy_failed` on the notification bus. Unset for a plain failure or a pre-activate
      * one, where nothing was ever rolled back. */
     rolledBack?: boolean;
-  }) => Promise<void>;
+    /** A one-line summary of what the notification did, written into the deploy log by
+     * `notifySafe`. `void` is still accepted so a test double can stay a bare stub. */
+  }) => Promise<string | void>;
   /** Injectable delay, used between health-check retries. `signal`, when given and aborted,
    * resolves the sleep immediately instead of waiting out the full `ms`. Tests pass an instant
    * stub. */
@@ -200,26 +202,15 @@ function linkSharedPaths(projectDir: string, project: ProjectRow, releaseDir: st
   }
 }
 
-/** Decrypts and JSON-parses `project.smtpConfigEncrypted`, or `undefined` if unset. */
-function decryptSmtpConfig(secretBox: SecretBox, project: ProjectRow): SmtpConfig | undefined {
-  if (!project.smtpConfigEncrypted) {
-    return undefined;
-  }
-  return JSON.parse(secretBox.decrypt(project.smtpConfigEncrypted)) as SmtpConfig;
-}
-
-/** Writes `shared/.env` (decrypted user env + managed block) and symlinks it into the release. */
-function writeReleaseEnv(deps: PipelineDeps, project: ProjectRow, projectDir: string, releaseDir: string): void {
-  const sharedDir = path.join(projectDir, 'shared');
-  fs.mkdirSync(sharedDir, { recursive: true });
-
-  const userEnv = project.envEncrypted ? deps.secretBox.decrypt(project.envEncrypted) : '';
-  const smtpConfig = decryptSmtpConfig(deps.secretBox, project);
-  const managed = buildManagedVars({ smtpMode: project.smtpMode, smtpConfig });
-  const content = buildEnvFile(userEnv, managed);
-
-  const envPath = path.join(sharedDir, '.env');
-  fs.writeFileSync(envPath, content, 'utf8');
+/**
+ * Writes `shared/.env` (decrypted user env + managed block) and symlinks it into the release.
+ *
+ * The write itself is `services/envapply.ts`'s, shared with the Environment tab's save — and this
+ * symlink is precisely what lets a later env change reach an already-live release without building
+ * a new one. It is (re)created on every deploy because a fresh release directory has no `.env` yet.
+ */
+function writeReleaseEnv(deps: PipelineDeps, project: ProjectRow, _projectDir: string, releaseDir: string): void {
+  const envPath = writeSharedEnv(deps, project);
   replaceSymlink(path.join(releaseDir, '.env'), envPath);
 }
 
@@ -255,10 +246,11 @@ function parseEnvContent(content: string): Record<string, string> {
 }
 
 /**
- * Builds the environment for `runShell`: `process.env`, with `PATH` prefixed by the project's node
- * bin dir for node-like projects or its php version's shim dir for php projects (see
- * `services/provisioner.ts`'s `nodeBinDir`/`phpBinDir`), then every `KEY=value` pair parsed from the
- * release's final `.env` content, then (node-like only) `PORT` set from the project's assigned port.
+ * Builds the environment for `runShell`: `process.env` (minus `NODE_ENV`, see below), with `PATH`
+ * prefixed by the project's node bin dir for node-like projects or its php version's shim dir for
+ * php projects (see `services/provisioner.ts`'s `nodeBinDir`/`phpBinDir`), then every `KEY=value`
+ * pair parsed from the release's final `.env` content, then (node-like only) `PORT` set from the
+ * project's assigned port.
  */
 function buildShellEnv(cfg: Config, project: ProjectRow, envFileContent: string): Record<string, string> {
   const env: Record<string, string> = {};
@@ -267,6 +259,15 @@ function buildShellEnv(cfg: Config, project: ProjectRow, envFileContent: string)
       env[key] = value;
     }
   }
+
+  // Shipway's own systemd unit sets `NODE_ENV=production` (it is a production node service), and
+  // every deploy script would otherwise inherit it from this process — a detail of how the
+  // dashboard happens to be run, silently reshaping how the user's app builds. It is not harmless:
+  // under `NODE_ENV=production` npm omits `devDependencies`, and a Next.js app keeps its entire
+  // build toolchain there (typescript, the postcss/tailwind plugins), so the install "succeeds" and
+  // the build then fails on a module the repo clearly declares. The project's own `.env` is applied
+  // below and can still set `NODE_ENV` deliberately.
+  delete env.NODE_ENV;
 
   if (isNodeLike(project.type)) {
     const prefix = nodeBinDir(cfg, project.nodeVersion ?? '22');
@@ -426,45 +427,8 @@ function activateRelease(projectDir: string, releaseDir: string): string | null 
   return previous;
 }
 
-/**
- * `signal` is optional and deliberately NOT passed by the rollback path in
- * `handlePostActivateFailure`: that call must run to completion and restore the previous release
- * even when `signal` is already aborted (that's the whole point of a rollback during a cancel) — a
- * `cancelSignal` that's already fired would immediately kill it. The forward activate→restart path
- * does pass it, so a genuinely-hung restart is still interruptible, and (per `sysops/real.ts`'s
- * `unitAction`/`reloadPhpFpm`) a failure caused by that abort throws `AbortedError` specifically,
- * distinguishable from an unrelated restart failure that merely coincides with a cancel.
- */
-async function restartRuntime(deps: PipelineDeps, project: ProjectRow, signal?: AbortSignal): Promise<void> {
-  switch (project.type) {
-    case 'php': {
-      if (!project.phpVersion) {
-        throw new Error(`project "${project.slug}" has no phpVersion configured`);
-      }
-      await deps.sysops.reloadPhpFpm(project.phpVersion, signal);
-      return;
-    }
-    case 'node':
-    case 'nextjs':
-      await deps.sysops.unitAction('restart', unitNames.app(project.slug), signal);
-      return;
-    case 'static':
-      return;
-  }
-}
-
 function getProjectWorkers(db: ShipwayDb, projectId: number): WorkerRow[] {
   return db.select().from(workers).where(eq(workers.projectId, projectId)).all();
-}
-
-/** Restarts every instance of every worker in `rows`. See `restartRuntime`'s doc comment for why
- * `signal` is optional and omitted by the rollback path. */
-async function restartWorkers(deps: PipelineDeps, project: ProjectRow, rows: WorkerRow[], signal?: AbortSignal): Promise<void> {
-  for (const worker of rows) {
-    for (const unit of workerInstances(project.slug, worker.name, worker.processes)) {
-      await deps.sysops.unitAction('restart', unit, signal);
-    }
-  }
 }
 
 const HEALTH_CHECK_TRIES = 5;
@@ -526,7 +490,7 @@ function defaultWaitForPort(port: number, timeoutMs: number, signal?: AbortSigna
 
 /**
  * `healthCheckPath` set: polls the URL (node-like: `http://127.0.0.1:<port><path>`; php/static:
- * `https://<slug>.<baseDomain><path>`) up to 5 times, 3s apart, accepting any 2xx/3xx status.
+ * `https://<subdomain>.<baseDomain><path>`) up to 5 times, 3s apart, accepting any 2xx/3xx status.
  * Unset, node-like: waits up to 15s for the port to accept connections. Unset, php/static: skipped
  * (always healthy). `signal` short-circuits all of the above the moment it aborts — the fetch, the
  * between-retry sleep, and the port poll all bail immediately rather than running out their clock.
@@ -541,7 +505,7 @@ async function runHealthCheck(deps: PipelineDeps, project: ProjectRow, signal: A
   if (project.healthCheckPath) {
     const url = isNodeLike(project.type)
       ? `http://127.0.0.1:${String(project.port)}${project.healthCheckPath}`
-      : `https://${project.slug}.${getSetting<string>(deps.db, 'base_domain') ?? ''}${project.healthCheckPath}`;
+      : `https://${projectDomain(project, getSetting<string>(deps.db, 'base_domain') ?? '')}${project.healthCheckPath}`;
 
     for (let attempt = 1; attempt <= HEALTH_CHECK_TRIES; attempt++) {
       if (signal.aborted) {
@@ -613,13 +577,25 @@ function pruneReleases(projectDir: string): void {
   }
 }
 
+/**
+ * Runs the notify hook and records what it did in the deploy log — including on success.
+ *
+ * Logging only failures (the previous behavior) made "did this deploy email anyone?" unanswerable
+ * after the fact: a deploy that notified nobody and a deploy that emailed the whole team produced
+ * byte-identical logs. Every deploy now ends with one line saying which it was, so the next question
+ * about a missing notification is answered by reading the log instead of re-deriving it from the
+ * database and the source.
+ */
 async function notifySafe(
   deps: PipelineDeps,
   logger: DeployLogger,
   payload: { project: string; status: 'success' | 'failed'; deploymentId: number; message: string; rolledBack?: boolean },
 ): Promise<void> {
   try {
-    await deps.notify(payload);
+    const summary = await deps.notify(payload);
+    if (typeof summary === 'string' && summary !== '') {
+      logger.line(summary);
+    }
   } catch (err) {
     logger.line(`notify failed: ${errMessage(err)}`);
   }

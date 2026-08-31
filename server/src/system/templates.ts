@@ -254,6 +254,38 @@ export function renderNginxVhost(i: VhostInput): string {
   ].join('\n');
 }
 
+/**
+ * The catch-all HTTPS vhost, installed as `shipway-default.conf`.
+ *
+ * Without it, nginx has no `default_server` on 443 (Debian's stock default vhost ships that line
+ * commented out) and answers any unmatched `Host` with the FIRST server block that happens to listen
+ * on 443 — in practice whichever project sorts first alphabetically. With a wildcard DNS record every
+ * nonexistent subdomain resolves, so a deleted project's domain, or a typo, silently served an
+ * unrelated project's site. This block claims that fallback and answers 404 instead.
+ *
+ * It terminates TLS with the same wildcard certificate the project vhosts use, because a browser
+ * completes the handshake before nginx can answer at all — without a certificate the visitor gets a
+ * TLS error rather than a 404.
+ */
+export function renderDefaultVhost(certName: string): string {
+  assertHostname(certName, 'certName');
+
+  return [
+    `# Managed by Shipway. Catch-all for hostnames that match no project vhost.`,
+    `server {`,
+    `    listen 443 ssl default_server;`,
+    `    listen [::]:443 ssl default_server;`,
+    `    server_name _;`,
+    ``,
+    `    ssl_certificate /etc/letsencrypt/live/${certName}/fullchain.pem;`,
+    `    ssl_certificate_key /etc/letsencrypt/live/${certName}/privkey.pem;`,
+    ``,
+    `    return 404;`,
+    `}`,
+    ``,
+  ].join('\n');
+}
+
 // ---------------------------------------------------------------------------
 // systemd units
 // ---------------------------------------------------------------------------
@@ -299,6 +331,14 @@ export interface WorkerUnitInput {
   appsDir: string;
   command: string;
   pathPrefix: string; // PATH=<prefix>:/usr/bin:/bin
+  /** `Restart=`. Defaults to `always`, which is what every worker got before this was configurable. */
+  restartPolicy?: 'always' | 'on-failure' | 'no';
+  /** `RestartSec=`, in seconds. */
+  restartSec?: number;
+  /** `TimeoutStopSec=`, in seconds: how long the process gets after SIGTERM to finish the job in hand
+   * before systemd SIGKILLs it. Omitted from the unit when undefined, leaving systemd's own 90s
+   * default — which is what previously-rendered units relied on. */
+  stopTimeoutSec?: number;
 }
 
 /** Renders the `shipway-worker-<slug>-<name>@.service` template unit. */
@@ -318,8 +358,11 @@ export function renderWorkerUnit(i: WorkerUnitInput): string {
     `WorkingDirectory=${i.appsDir}/${i.slug}/current`,
     `EnvironmentFile=-${i.appsDir}/${i.slug}/shared/.env`,
     `ExecStart=/bin/bash -lc 'export PATH=${i.pathPrefix}:$PATH && exec ${i.command}'`,
-    `Restart=always`,
-    `RestartSec=3`,
+    `Restart=${i.restartPolicy ?? 'always'}`,
+    `RestartSec=${String(i.restartSec ?? 3)}`,
+    // A queue worker is normally mid-job when a deploy restarts it, so the grace period before
+    // SIGKILL is the difference between finishing that job and losing it.
+    `TimeoutStopSec=${String(i.stopTimeoutSec ?? 90)}`,
     ``,
     `[Install]`,
     `WantedBy=multi-user.target`,

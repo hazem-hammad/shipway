@@ -38,6 +38,8 @@ class NoopDbAdmin implements DbAdmin {
   async createDatabase(_target: DbAdminTarget, _name: string, _user: string, _password: string): Promise<void> {}
   async dropDatabase(_target: DbAdminTarget, _name: string, _user: string): Promise<void> {}
   async testConnection(_target: DbAdminTarget): Promise<void> {}
+  async importSql(_target: DbAdminTarget, _database: string, _sqlPath: string): Promise<void> {}
+  async dumpSql(_target: DbAdminTarget, _database: string, _sqlPath: string): Promise<void> {}
 }
 
 async function buildProvisioningApp(opts: { dataDir?: string } = {}) {

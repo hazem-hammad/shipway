@@ -182,7 +182,10 @@ describe('POST /api/users/invite — email delivery', () => {
     const rows = app.db.select().from(auditEvents).where(eq(auditEvents.action, 'user.invite')).all();
     const row = rows.find((r) => r.targetName === 'audited-emailed@example.com');
     expect(row).toBeDefined();
-    expect(JSON.parse(row!.meta!)).toEqual({ role: 'member', emailed: true });
+    // `projectAccess`/`projectCount` record WHAT access the invite granted (see
+    // `lib/projectaccess.ts`) — a count, never project names, keeping this row as free of
+    // free-form data as the rest of the audit trail.
+    expect(JSON.parse(row!.meta!)).toEqual({ role: 'member', emailed: true, projectAccess: 'all', projectCount: 0 });
     expect(row!.meta).not.toContain('smtp.example.com');
 
     await app.close();

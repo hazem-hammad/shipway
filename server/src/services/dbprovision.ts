@@ -9,6 +9,8 @@
  * settings or the database — a target arrives fully formed, which is what lets the same two SQL
  * paths serve a local socket and an RDS instance without knowing the difference.
  */
+import { randomBytes } from 'node:crypto';
+import { execa } from 'execa';
 import { Client as PgClient } from 'pg';
 import { createConnection as createMysqlConnection } from 'mysql2/promise';
 import { IDENTIFIER_RE, type DbEngine } from './dbconn.js';
@@ -66,6 +68,50 @@ export interface DbAdmin {
    * credentials that don't work are worth refusing at the point someone can still fix the typo.
    */
   testConnection(target: DbAdminTarget): Promise<void>;
+  /**
+   * Replays the SQL dump at `sqlPath` into `database` on `target`. Unlike every other method here,
+   * the credentials in `target.url` are expected to be the *database's own* user rather than the
+   * server admin (see `routes/databases.ts`) — a Postgres dump restored by the admin role would
+   * leave every table owned by that role and unreadable to the app, and on MySQL the app user's
+   * grants are the right blast radius for someone else's dump either way.
+   *
+   * Shells out to the engine's own client (`mysql` / `psql`) rather than replaying the file through
+   * the driver: a real dump is not a list of statements a driver can take. mysqldump emits
+   * `DELIMITER` around triggers and routines, and pg_dump emits `COPY ... FROM stdin` followed by
+   * raw rows and a `\.` terminator — both are client-side directives that the wire protocol has no
+   * idea about, so the driver route works on toy files and fails on the dumps people actually have.
+   */
+  importSql(target: DbAdminTarget, database: string, sqlPath: string): Promise<void>;
+  /**
+   * Writes a plain-SQL dump of `database` on `target` to `sqlPath`, in the form `importSql` reads
+   * back — the two are a matched pair, and cloning a project is the one caller that uses both.
+   *
+   * Like `importSql`, `target.url` carries the DATABASE'S OWN user rather than the server admin:
+   * the dump is of one database's contents, and the user that owns them is the one guaranteed to be
+   * able to read all of them. Nothing about the source database's NAME is written into the dump
+   * (no `CREATE DATABASE`, no `USE`), which is what lets the result be restored into a database
+   * called something else — the whole point here, since a clone's database has a new name.
+   */
+  dumpSql(target: DbAdminTarget, database: string, sqlPath: string): Promise<void>;
+}
+
+/** Chars used for generated database passwords: letters + digits only (safe to embed unquoted in
+ *  most contexts, and matches the brief's `[A-Za-z0-9]` spec). */
+const PASSWORD_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+const PASSWORD_LENGTH = 24;
+
+/**
+ * A random `PASSWORD_LENGTH`-char password from `PASSWORD_CHARS`, using `randomBytes` for entropy.
+ * Lives here rather than in the create-database route because a database's password is generated in
+ * two places now — creating one, and cloning a project's — and the two must not drift.
+ */
+export function generateDbPassword(): string {
+  const bytes = randomBytes(PASSWORD_LENGTH);
+  let out = '';
+  for (let i = 0; i < PASSWORD_LENGTH; i++) {
+    out += PASSWORD_CHARS[bytes[i]! % PASSWORD_CHARS.length];
+  }
+  return out;
 }
 
 function assertIdentifier(value: string, label: string): void {
@@ -101,6 +147,84 @@ export interface DbAdminDeps {
   connectMysql?: (url: string, tls: boolean) => Promise<SqlConnection>;
   /** Opens (and connects) an admin `pg` client. Defaults to a real `pg.Client`. */
   connectPg?: (url: string, tls: boolean) => Promise<SqlConnection>;
+  /** Runs the `mysql`/`psql` client for `importSql`. Defaults to the real `execa`; tests inject a
+   * stub to assert on the exact command and environment without a database anywhere in sight. */
+  run?: typeof execa;
+}
+
+/**
+ * How long a dump or an import is given before its client is killed. A database big enough to
+ * outlast this is one to move from a shell, not from a browser tab that nginx will have given up on
+ * long before (see `setup/templates/nginx-dashboard.conf`'s `proxy_read_timeout`).
+ */
+const IMPORT_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** The pieces of a `mysql://` / `postgres://` URL the CLI clients take as separate flags. */
+interface UrlParts {
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+}
+
+/** `decodeURIComponent` that yields the raw value rather than throwing on a stray `%` — a local
+ * admin URL is assembled by `install.sh` without encoding, so its password may not be valid
+ * percent-encoding at all. */
+function decodeUrlPart(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+/** Splits a connection URL into the flags a CLI client wants. The counterpart of
+ * `services/dbconnections.ts`'s `adminUrl`, which percent-encodes the credentials on the way in. */
+function urlParts(url: string, engine: DbEngine): UrlParts {
+  const parsed = new URL(url);
+  return {
+    host: parsed.hostname,
+    port: parsed.port === '' ? String(engine === 'mysql' ? 3306 : 5432) : parsed.port,
+    username: decodeUrlPart(parsed.username),
+    password: decodeUrlPart(parsed.password),
+  };
+}
+
+/** The last `count` non-blank lines of `text` — a client's error output ends with the part that
+ * says what actually went wrong, and a 50MB dump can produce a lot of preamble before it. */
+function lastLines(text: string, count: number): string {
+  const lines = text.split('\n').map((line) => line.trimEnd()).filter((line) => line.trim() !== '');
+  return lines.slice(-count).join('\n');
+}
+
+/**
+ * Turns a failed client run into an error worth showing someone. A missing binary is called out by
+ * name — that is an install problem, not a problem with their dump — and everything else is
+ * reported as the client's own last words, which for both engines name the offending line number.
+ */
+function importFailure(bin: string, err: unknown): Error {
+  if ((err as { code?: unknown }).code === 'ENOENT') {
+    return new Error(`the ${bin} client is not installed on this server, so the dump cannot be imported`);
+  }
+  if ((err as { timedOut?: unknown }).timedOut === true) {
+    return new Error(`${bin} import timed out after ${String(IMPORT_TIMEOUT_MS / 60000)} minutes`);
+  }
+  const stderr = (err as { stderr?: unknown }).stderr;
+  const detail = typeof stderr === 'string' && stderr.trim() !== '' ? lastLines(stderr, 3) : err instanceof Error ? err.message : String(err);
+  return new Error(`${bin} import failed: ${detail}`);
+}
+
+/** {@link importFailure}'s counterpart for the dump half — same three cases, read from the other end. */
+function dumpFailure(bin: string, err: unknown): Error {
+  if ((err as { code?: unknown }).code === 'ENOENT') {
+    return new Error(`the ${bin} client is not installed on this server, so the database cannot be copied`);
+  }
+  if ((err as { timedOut?: unknown }).timedOut === true) {
+    return new Error(`${bin} timed out after ${String(IMPORT_TIMEOUT_MS / 60000)} minutes`);
+  }
+  const stderr = (err as { stderr?: unknown }).stderr;
+  const detail = typeof stderr === 'string' && stderr.trim() !== '' ? lastLines(stderr, 3) : err instanceof Error ? err.message : String(err);
+  return new Error(`${bin} failed: ${detail}`);
 }
 
 async function defaultConnectMysql(url: string, tls: boolean): Promise<SqlConnection> {
@@ -140,10 +264,12 @@ async function rollback(conn: SqlConnection, sql: string): Promise<void> {
 class RealDbAdmin implements DbAdmin {
   private readonly connectMysql: (url: string, tls: boolean) => Promise<SqlConnection>;
   private readonly connectPg: (url: string, tls: boolean) => Promise<SqlConnection>;
+  private readonly run: typeof execa;
 
   constructor(deps: DbAdminDeps = {}) {
     this.connectMysql = deps.connectMysql ?? defaultConnectMysql;
     this.connectPg = deps.connectPg ?? defaultConnectPg;
+    this.run = deps.run ?? execa;
   }
 
   async createDatabase(target: DbAdminTarget, name: string, user: string, password: string): Promise<void> {
@@ -174,6 +300,135 @@ class RealDbAdmin implements DbAdmin {
       await conn.query('SELECT 1');
     } finally {
       await conn.end();
+    }
+  }
+
+  async importSql(target: DbAdminTarget, database: string, sqlPath: string): Promise<void> {
+    assertIdentifier(database, 'database name');
+    const parts = urlParts(target.url, target.engine);
+    if (target.engine === 'mysql') {
+      await this.mysqlImport(target, database, sqlPath, parts);
+    } else {
+      await this.postgresImport(target, database, sqlPath, parts);
+    }
+  }
+
+  async dumpSql(target: DbAdminTarget, database: string, sqlPath: string): Promise<void> {
+    assertIdentifier(database, 'database name');
+    const parts = urlParts(target.url, target.engine);
+    if (target.engine === 'mysql') {
+      await this.mysqlDump(target, database, sqlPath, parts);
+    } else {
+      await this.postgresDump(target, database, sqlPath, parts);
+    }
+  }
+
+  private async mysqlDump(target: DbAdminTarget, database: string, sqlPath: string, parts: UrlParts): Promise<void> {
+    // The database is named as a bare argument rather than via `--databases`, which is what keeps
+    // `CREATE DATABASE`/`USE` out of the output — see `dumpSql`'s contract. `--no-tablespaces`
+    // matters because the dump runs as the database's own user, and the tablespace query mysqldump
+    // otherwise issues needs the global PROCESS privilege that user has no reason to hold.
+    const args = [
+      '--protocol=TCP',
+      `--host=${parts.host}`,
+      `--port=${parts.port}`,
+      `--user=${parts.username}`,
+      '--single-transaction',
+      '--quick',
+      '--no-tablespaces',
+      '--routines',
+      '--triggers',
+      '--default-character-set=utf8mb4',
+      ...(target.tls === true ? ['--ssl-mode=REQUIRED'] : []),
+      database,
+    ];
+    try {
+      await this.run('mysqldump', args, {
+        env: { MYSQL_PWD: parts.password },
+        stdout: { file: sqlPath },
+        timeout: IMPORT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw dumpFailure('mysqldump', err);
+    }
+  }
+
+  private async postgresDump(target: DbAdminTarget, database: string, sqlPath: string, parts: UrlParts): Promise<void> {
+    // `--no-owner`/`--no-acl` because the restore runs as a DIFFERENT role than the dump: the clone's
+    // own user owns its database, and replaying `ALTER TABLE ... OWNER TO <source user>` would either
+    // fail outright or hand the copy back to the project it was copied from.
+    const args = [
+      `--host=${parts.host}`,
+      `--port=${parts.port}`,
+      `--username=${parts.username}`,
+      `--dbname=${database}`,
+      '--no-password',
+      '--no-owner',
+      '--no-acl',
+      '--format=plain',
+      `--file=${sqlPath}`,
+    ];
+    try {
+      await this.run('pg_dump', args, {
+        env: { PGPASSWORD: parts.password, ...(target.tls === true ? { PGSSLMODE: 'require' } : {}) },
+        stdin: 'ignore',
+        timeout: IMPORT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw dumpFailure('pg_dump', err);
+    }
+  }
+
+  private async mysqlImport(target: DbAdminTarget, database: string, sqlPath: string, parts: UrlParts): Promise<void> {
+    // `--protocol=TCP` because the endpoint really is a TCP one: pointed at 127.0.0.1 the client
+    // would otherwise quietly switch to the unix socket, where the credentials that work over the
+    // network may not apply. `--ssl-mode=REQUIRED` encrypts without demanding a locally-trusted CA,
+    // matching `DbAdminTarget.tls`'s documented trade.
+    const args = [
+      '--protocol=TCP',
+      `--host=${parts.host}`,
+      `--port=${parts.port}`,
+      `--user=${parts.username}`,
+      `--database=${database}`,
+      '--default-character-set=utf8mb4',
+      ...(target.tls === true ? ['--ssl-mode=REQUIRED'] : []),
+    ];
+    try {
+      // The password goes through the environment, never argv: a command line is world-readable in
+      // `ps` on a host that has other people's app processes on it.
+      await this.run('mysql', args, {
+        env: { MYSQL_PWD: parts.password },
+        stdin: { file: sqlPath },
+        timeout: IMPORT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw importFailure('mysql', err);
+    }
+  }
+
+  private async postgresImport(target: DbAdminTarget, database: string, sqlPath: string, parts: UrlParts): Promise<void> {
+    // ON_ERROR_STOP is what makes this an import rather than a best-effort sprinkle: without it psql
+    // reports every failed statement and still exits 0, so a half-restored database would be
+    // reported as a success. `--no-password` keeps a bad password a fast error instead of a client
+    // sitting on a prompt no one can see until the timeout.
+    const args = [
+      `--host=${parts.host}`,
+      `--port=${parts.port}`,
+      `--username=${parts.username}`,
+      `--dbname=${database}`,
+      '--no-password',
+      '--quiet',
+      '--set=ON_ERROR_STOP=1',
+      `--file=${sqlPath}`,
+    ];
+    try {
+      await this.run('psql', args, {
+        env: { PGPASSWORD: parts.password, ...(target.tls === true ? { PGSSLMODE: 'require' } : {}) },
+        stdin: 'ignore',
+        timeout: IMPORT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      throw importFailure('psql', err);
     }
   }
 

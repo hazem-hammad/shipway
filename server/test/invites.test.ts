@@ -121,7 +121,7 @@ describe('POST /api/users/invite', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ actorId: ownerId, targetType: 'user', targetName: 'audited@example.com' });
     // Mail is unconfigured (driver: 'none') by default, so no send is even attempted.
-    expect(JSON.parse(rows[0]!.meta!)).toEqual({ role: 'member', emailed: false });
+    expect(JSON.parse(rows[0]!.meta!)).toEqual({ role: 'member', emailed: false, projectAccess: 'all', projectCount: 0 });
 
     await app.close();
   });

@@ -402,4 +402,53 @@ describe('DeployQueue', () => {
     expect(row.commitMessage).toBe('a commit');
     expect(row.logPath).toBe(path.join(cfg.logsDir, 'proj-row', `${String(id)}.log`));
   });
+
+  it("stamps the project's branch on the row, so later retargeting can't rewrite history", () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const queue = makeQueue(db, cfg, 1, new FakeRun());
+    const projectId = insertProject(db, 'proj-branch');
+
+    const first = queue.enqueue({ projectId, trigger: 'manual' });
+    expect(getDeploymentRow(db, first).branch).toBe('main');
+
+    // Point the project at a different branch, as the Settings tab would.
+    db.update(projects).set({ branch: 'testing' }).where(eq(projects.id, projectId)).run();
+    const second = queue.enqueue({ projectId, trigger: 'manual' });
+
+    expect(getDeploymentRow(db, second).branch).toBe('testing');
+    // The earlier deployment still reports the branch it actually built from. Reading
+    // projects.branch at display time instead would have retroactively changed this to 'testing'.
+    expect(getDeploymentRow(db, first).branch).toBe('main');
+  });
+
+  it('carries a rollback branch over from the deployment that built the release', () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const queue = makeQueue(db, cfg, 1, new FakeRun());
+    const projectId = insertProject(db, 'proj-rollback');
+
+    const built = queue.enqueue({ projectId, trigger: 'manual' });
+    const releasePath = '/var/deploy/apps/proj-rollback/releases/20260101_000000';
+    db.update(deployments).set({ releasePath }).where(eq(deployments.id, built)).run();
+
+    db.update(projects).set({ branch: 'testing' }).where(eq(projects.id, projectId)).run();
+    const rolledBack = queue.enqueue({ projectId, trigger: 'rollback', releasePath });
+
+    // A rollback resolves no branch of its own — it activates an existing release. Reporting the
+    // project's current 'testing' would be a guess about code that came from 'main'.
+    expect(getDeploymentRow(db, rolledBack).branch).toBe('main');
+  });
+
+  it('leaves the branch null for a rollback to a release it cannot attribute', () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const queue = makeQueue(db, cfg, 1, new FakeRun());
+    const projectId = insertProject(db, 'proj-orphan');
+
+    const id = queue.enqueue({ projectId, trigger: 'rollback', releasePath: '/releases/never-built-here' });
+
+    // An honest blank beats a plausible wrong answer.
+    expect(getDeploymentRow(db, id).branch).toBeNull();
+  });
 });

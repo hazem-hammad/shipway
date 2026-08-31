@@ -19,6 +19,13 @@
 #                          rename is on the same filesystem), mode 0644.
 #   remove-file <dest>    Removes <dest> (rm -f — a missing file is not an
 #                          error).
+#   pgadmin-sync          Reads a server list from stdin and hands it to
+#                          /opt/pgadmin/sync-servers.py, run as the `pgadmin`
+#                          user (whose config database is the only thing it
+#                          touches). Takes no path argument at all — the script
+#                          and the interpreter are both fixed here — so there is
+#                          nothing for the whitelist below to check. A host with
+#                          no pgAdmin installed succeeds and does nothing.
 #
 # <dest> must match one of:
 #   /etc/nginx/sites-available/shipway-<slug>.conf
@@ -39,9 +46,15 @@ readonly SYSTEMD_DEST_RE='^/etc/systemd/system/shipway-[a-z0-9@.-]+\.service$'
 # install.sh creates and nothing else writes to.
 readonly HTPASSWD_DEST_RE='^/etc/nginx/shipway-auth/shipway-[a-z0-9-]+\.htpasswd$'
 
+# Fixed paths for the pgadmin-sync verb: pgAdmin's own venv interpreter and the
+# sync script install.sh puts beside it. Neither is caller-supplied.
+readonly PGADMIN_PYTHON=/opt/pgadmin/venv/bin/python
+readonly PGADMIN_SYNC=/opt/pgadmin/sync-servers.py
+
 usage() {
   echo "usage: shipway-sysops install-file <dest>   (content read from stdin)" >&2
   echo "       shipway-sysops remove-file <dest>" >&2
+  echo "       shipway-sysops pgadmin-sync          (server list read from stdin)" >&2
 }
 
 # Exits 2 (with a message on stderr) unless $1 matches the nginx-vhost or
@@ -85,20 +98,43 @@ remove_file() {
   rm -f "$dest"
 }
 
-if [[ $# -ne 2 ]]; then
+# Runs the pgAdmin server sync as the `pgadmin` user, with the payload on stdin
+# passed straight through. Not an error on a host where pgAdmin was never
+# installed: Shipway syncs on every database create/drop and would otherwise log
+# a failure on each one for a console that isn't there.
+pgadmin_sync() {
+  if [[ ! -x "$PGADMIN_PYTHON" || ! -f "$PGADMIN_SYNC" ]]; then
+    echo "shipway-sysops: pgAdmin is not installed here; nothing to sync" >&2
+    return 0
+  fi
+  runuser -u pgadmin -- env HOME=/var/lib/pgadmin "$PGADMIN_PYTHON" "$PGADMIN_SYNC"
+}
+
+if [[ $# -lt 1 ]]; then
   usage
   exit 2
 fi
 
 verb="$1"
-dest="$2"
 
 case "$verb" in
-  install-file)
-    install_file "$dest"
+  install-file | remove-file)
+    if [[ $# -ne 2 ]]; then
+      usage
+      exit 2
+    fi
+    if [[ "$verb" == "install-file" ]]; then
+      install_file "$2"
+    else
+      remove_file "$2"
+    fi
     ;;
-  remove-file)
-    remove_file "$dest"
+  pgadmin-sync)
+    if [[ $# -ne 1 ]]; then
+      usage
+      exit 2
+    fi
+    pgadmin_sync
     ;;
   *)
     echo "shipway-sysops: unknown verb: $verb" >&2

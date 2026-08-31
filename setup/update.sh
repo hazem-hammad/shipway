@@ -29,6 +29,21 @@ fi
 
 cd /opt/shipway
 
+# An install created from a local checkout (install.sh's rsync branch) has no
+# .git here, so there is nothing to pull and this script cannot be what updates
+# it. Saying so — and naming the script that CAN — beats `git pull` failing with
+# "not a git repository" and leaving the operator to guess what that means about
+# their install.
+if [[ ! -d /opt/shipway/.git ]]; then
+  echo "update.sh: /opt/shipway is not a git clone, so there is nothing to pull." >&2
+  echo "update.sh: this host was installed from a local checkout. Update it from that" >&2
+  echo "update.sh: checkout instead:" >&2
+  echo >&2
+  echo "    sudo /path/to/your/checkout/setup/deploy-local.sh" >&2
+  echo >&2
+  exit 1
+fi
+
 sudo -u deployer git pull --ff-only
 
 sudo -u deployer bash -lc "export PATH=/opt/node/22/bin:\$PATH && cd /opt/shipway && npm ci && npm run build"

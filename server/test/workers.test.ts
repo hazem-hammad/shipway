@@ -71,10 +71,27 @@ interface WorkerRowInput {
   name: string;
   command: string;
   processes: number;
+  /** Runtime options default to the same values the DB columns default to, so a test that doesn't
+   * care about them exercises the ordinary path rather than an accidental edge case. */
+  autoStart?: boolean;
+  restartPolicy?: 'always' | 'on-failure' | 'no';
+  restartSec?: number;
+  stopTimeoutSec?: number;
 }
 
 function makeWorkerRow(input: WorkerRowInput): typeof workers.$inferSelect {
-  return { id: 1, projectId: input.projectId, name: input.name, command: input.command, processes: input.processes, statusCached: null };
+  return {
+    id: 1,
+    projectId: input.projectId,
+    name: input.name,
+    command: input.command,
+    processes: input.processes,
+    autoStart: input.autoStart ?? true,
+    restartPolicy: input.restartPolicy ?? 'always',
+    restartSec: input.restartSec ?? 3,
+    stopTimeoutSec: input.stopTimeoutSec ?? 90,
+    statusCached: null,
+  };
 }
 
 function unitFilePath(dest: string): string {
@@ -111,6 +128,143 @@ describe('workerInstances', () => {
 // ---------------------------------------------------------------------------
 // applyWorker
 // ---------------------------------------------------------------------------
+
+describe('POST /api/projects/:id/workers — runtime options', () => {
+  it('stores every supplied option and writes them into the unit', async () => {
+    const { app, cookie } = await buildWorkersTestApp();
+    const projectId = insertRouteProject(app, { slug: 'shop', type: 'php' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${String(projectId)}/workers`,
+      headers: { cookie },
+      payload: { name: 'queue', command: 'php artisan queue:work', processes: 2, autoStart: false, restartPolicy: 'on-failure', restartSec: 10, stopTimeoutSec: 300 },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ autoStart: false, restartPolicy: 'on-failure', restartSec: 10, stopTimeoutSec: 300 });
+
+    await app.close();
+  });
+
+  it('falls back to the pre-existing behavior when the options are omitted', async () => {
+    const { app, cookie } = await buildWorkersTestApp();
+    const projectId = insertRouteProject(app, { slug: 'shop', type: 'php' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${String(projectId)}/workers`,
+      headers: { cookie },
+      payload: { name: 'queue', command: 'php artisan queue:work', processes: 1 },
+    });
+
+    expect(res.statusCode).toBe(201);
+    expect(res.json()).toMatchObject({ autoStart: true, restartPolicy: 'always', restartSec: 3, stopTimeoutSec: 90 });
+
+    await app.close();
+  });
+
+  it('rejects out-of-range or unknown option values', async () => {
+    const { app, cookie } = await buildWorkersTestApp();
+    const projectId = insertRouteProject(app, { slug: 'shop', type: 'php' });
+    const base = { name: 'queue', command: 'x', processes: 1 };
+
+    for (const bad of [
+      { restartPolicy: 'sometimes' },
+      { restartSec: 0 },
+      { restartSec: 301 },
+      { stopTimeoutSec: 0 },
+      { stopTimeoutSec: 1801 },
+      { autoStart: 'yes' },
+    ]) {
+      const res = await app.inject({ method: 'POST', url: `/api/projects/${String(projectId)}/workers`, headers: { cookie }, payload: { ...base, ...bad } });
+      expect(res.statusCode, JSON.stringify(bad)).toBe(400);
+    }
+
+    await app.close();
+  });
+
+  it('PATCH updates the options and re-applies the unit', async () => {
+    const { app, cookie } = await buildWorkersTestApp();
+    const projectId = insertRouteProject(app, { slug: 'shop', type: 'php' });
+    const created = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${String(projectId)}/workers`,
+      headers: { cookie },
+      payload: { name: 'queue', command: 'php artisan queue:work', processes: 1 },
+    });
+    const id = (created.json() as { id: number }).id;
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/workers/${String(id)}`,
+      headers: { cookie },
+      payload: { autoStart: false, stopTimeoutSec: 240 },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toMatchObject({ autoStart: false, stopTimeoutSec: 240, restartPolicy: 'always' });
+
+    await app.close();
+  });
+});
+
+describe('applyWorker — autoStart', () => {
+  it('enables each instance when autoStart is on, so the worker survives a reboot', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const project = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3' });
+    const worker = makeWorkerRow({ projectId: project.id, name: 'queue', command: 'php artisan queue:work', processes: 2, autoStart: true });
+
+    await applyWorker({ sysops, cfg }, project, worker);
+
+    expect(sysops.calls).toContain('unitAction enable shipway-worker-shop-queue@1.service');
+    expect(sysops.calls).toContain('unitAction enable shipway-worker-shop-queue@2.service');
+    expect(sysops.calls).toContain('unitAction start shipway-worker-shop-queue@1.service');
+    expect(sysops.calls.some((call) => call.startsWith('unitAction disable'))).toBe(false);
+  });
+
+  it('disables — but still starts — each instance when autoStart is off', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const project = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3' });
+    const worker = makeWorkerRow({ projectId: project.id, name: 'queue', command: 'php artisan queue:work', processes: 1, autoStart: false });
+
+    await applyWorker({ sysops, cfg }, project, worker);
+
+    // Running now and starting on boot are separate things: the worker still runs.
+    expect(sysops.calls).toContain('unitAction start shipway-worker-shop-queue@1.service');
+    // `disable` is issued explicitly, so turning autoStart off actually removes an existing symlink
+    // rather than leaving the previous `enable` in place.
+    expect(sysops.calls).toContain('unitAction disable shipway-worker-shop-queue@1.service');
+    expect(sysops.calls.some((call) => call.startsWith('unitAction enable'))).toBe(false);
+  });
+
+  it('writes the worker\'s restart and shutdown options into the installed unit file', async () => {
+    const cfg = makeCfg();
+    const db = makeDb(cfg);
+    const sysops = new DevSysOps(sysopsRoot(cfg));
+    const project = insertProject(db, { slug: 'shop', type: 'php', phpVersion: '8.3' });
+    const worker = makeWorkerRow({
+      projectId: project.id,
+      name: 'queue',
+      command: 'php artisan queue:work',
+      processes: 1,
+      restartPolicy: 'on-failure',
+      restartSec: 10,
+      stopTimeoutSec: 120,
+    });
+
+    await applyWorker({ sysops, cfg }, project, worker);
+
+    const content = readInstalledUnit(cfg, '/etc/systemd/system/shipway-worker-shop-queue@.service');
+    expect(content).toContain('Restart=on-failure');
+    expect(content).toContain('RestartSec=10');
+    expect(content).toContain('TimeoutStopSec=120');
+  });
+});
 
 describe('applyWorker', () => {
   it('installs the template unit with the rendered command, daemon-reloads, then enables+starts each instance in order', async () => {

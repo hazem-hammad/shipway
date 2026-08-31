@@ -5,6 +5,48 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/logo.png" />
     <title>Shipway</title>
+    <meta
+      name="description"
+      content="Deploy and manage Laravel, Node, Next.js and static projects — with their databases, queue workers, cron jobs and mail — from one dashboard."
+    />
+
+    <!--
+      This is a private deployment dashboard, not a public site: nothing here should turn up in a
+      search result. `noindex` does not affect link previews — WhatsApp, Slack and the rest fetch the
+      page and read the tags below regardless, which is exactly the split we want.
+    -->
+    <meta name="robots" content="noindex, nofollow" />
+
+    <!--
+      `%OG_ORIGIN%` is substituted with this install's own origin when the server sends the shell
+      (see `sendShell` in server/src/app.ts). It cannot be baked in at build time: og:url and
+      og:image must be ABSOLUTE for WhatsApp and Facebook to resolve them, and the build has no idea
+      which domain it will be served from. It resolves to an empty string when the origin can't be
+      trusted, leaving working relative URLs behind.
+    -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="Shipway" />
+    <meta property="og:title" content="Shipway" />
+    <meta
+      property="og:description"
+      content="Deploy and manage Laravel, Node, Next.js and static projects — with their databases, queue workers, cron jobs and mail — from one dashboard."
+    />
+    <meta property="og:url" content="%OG_ORIGIN%/" />
+    <meta property="og:image" content="%OG_ORIGIN%/og.png" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="Shipway" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Shipway" />
+    <meta
+      name="twitter:description"
+      content="Deploy and manage Laravel, Node, Next.js and static projects — with their databases, queue workers, cron jobs and mail — from one dashboard."
+    />
+    <meta name="twitter:image" content="%OG_ORIGIN%/og.png" />
+
+    <meta name="theme-color" content="#141416" />
   </head>
   <body>
     <div id="root"></div>

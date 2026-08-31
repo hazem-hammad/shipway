@@ -10,13 +10,18 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { Config } from '../config.js';
 import type { ShipwayDb } from '../db/index.js';
-import { projects, workers } from '../db/schema.js';
+import { databases, projects, workers } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
+import type { SecretBox } from '../lib/secretbox.js';
 import type { SysOps } from '../sysops/types.js';
-import { assertSlug, htpasswdPath, renderAppUnit, renderNginxVhost, unitNames } from '../system/templates.js';
+import { assertSlug, htpasswdPath, renderAppUnit, renderDefaultVhost, renderNginxVhost, unitNames } from '../system/templates.js';
 import { renderHtpasswd } from '../system/htpasswd.js';
 import type { DnsClient } from './cloudflare.js';
+import { projectDomain } from '../lib/domain.js';
 import { syncCrontab } from './cron.js';
+import { isReservedDbName } from './dbconn.js';
+import { connectionForDatabase } from './dbconnections.js';
+import type { DbAdmin } from './dbprovision.js';
 import { removeWorker } from './workers.js';
 
 export interface ProvisionDeps {
@@ -24,6 +29,13 @@ export interface ProvisionDeps {
   cfg: Config;
   sysops: SysOps;
   dns: DnsClient | null;
+  /** Needed only by `deprovisionProject`, to DROP the project's databases rather than merely losing
+   * the rows to the FK cascade. Optional so `provisionProject` and its tests, which never touch a
+   * database engine, don't have to supply one — but the delete route always does. */
+  dbAdmin?: DbAdmin;
+  /** Decrypts a db connection's stored admin password (`connectionForDatabase`). Required alongside
+   * `dbAdmin`; without it a drop can't authenticate and is skipped. */
+  secretBox?: SecretBox;
 }
 
 /**
@@ -288,12 +300,52 @@ async function writeAppUnit(deps: ProvisionDeps, project: ProjectRow): Promise<v
  * changing anything about when provisioning itself fails (a DNS failure still throws here, exactly
  * as before; only the success outcome is new).
  */
+/**
+ * Installs (or refreshes) the catch-all HTTPS vhost — see `renderDefaultVhost` for why it has to
+ * exist. Called at boot rather than only from `install.sh`, so an install that predates the
+ * catch-all gets it on the next restart instead of needing a manual step.
+ *
+ * Never throws: a host with no `base_domain` yet (a fresh install before setup) or an `nginx -t`
+ * failure caused by something else entirely must not stop Shipway from booting. On a failed test the
+ * files are removed again, so nginx is never left holding a config it hasn't validated. Returns what
+ * happened, for the caller to log.
+ */
+export async function ensureDefaultVhost(deps: ProvisionDeps): Promise<{ ok: boolean; detail: string }> {
+  const baseDomain = getSetting<string>(deps.db, 'base_domain');
+  if (!baseDomain) {
+    return { ok: false, detail: 'skipped: base_domain is not configured yet' };
+  }
+
+  const availablePath = vhostAvailablePath('default');
+  const enabledPath = vhostEnabledPath('default');
+
+  try {
+    const content = renderDefaultVhost(baseDomain);
+    await deps.sysops.installFile(availablePath, content);
+    await deps.sysops.installFile(enabledPath, content);
+
+    const test = await deps.sysops.nginxTest();
+    if (!test.ok) {
+      // Most likely another `default_server` on 443 already exists (a hand-edited config). Back out
+      // rather than leaving nginx unable to reload for every later project change.
+      await deps.sysops.removeFile(availablePath);
+      await deps.sysops.removeFile(enabledPath);
+      return { ok: false, detail: `nginx test failed, catch-all not installed: ${test.output}` };
+    }
+
+    await deps.sysops.reloadNginx();
+    return { ok: true, detail: `catch-all vhost installed for *.${baseDomain}` };
+  } catch (err) {
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+  }
+}
+
 export async function provisionProject(deps: ProvisionDeps, projectId: number): Promise<DnsOutcome> {
   const project = getProjectOrThrow(deps.db, projectId);
   assertSlug(project.slug);
 
   const { baseDomain, serverIp } = requireDomainSettings(deps.db);
-  const domain = `${project.slug}.${baseDomain}`;
+  const domain = projectDomain(project, baseDomain);
 
   const dnsOutcome = await resolveDnsOutcome(deps.dns, domain, serverIp);
   if (dnsOutcome.error) {
@@ -334,7 +386,7 @@ export async function provisionProject(deps: ProvisionDeps, projectId: number): 
 export async function refreshProjectConfig(deps: ProvisionDeps, projectId: number, previous: ProjectRow): Promise<void> {
   const project = getProjectOrThrow(deps.db, projectId);
   const baseDomain = requireBaseDomain(deps.db);
-  const domain = `${project.slug}.${baseDomain}`;
+  const domain = projectDomain(project, baseDomain);
 
   const previousContent = renderVhostContent(deps, previous, domain, baseDomain);
   await writeVhost(deps, project, domain, baseDomain, previousContent);
@@ -345,6 +397,114 @@ export async function refreshProjectConfig(deps: ProvisionDeps, projectId: numbe
 }
 
 /**
+ * What {@link changeProjectSubdomain} did, so the route can report it and audit it. A DNS failure
+ * never reaches this shape — it throws a `ProvisionError` instead — with one exception: deleting the
+ * OLD record is best-effort (`staleRecordWarning`), because the project is already live and correct
+ * on its new domain by then and failing the whole move over a leftover record would be the worse
+ * outcome. The leftover is named rather than swallowed so someone can remove it by hand.
+ */
+export interface SubdomainMoveResult {
+  /** The domain the project answers on now. */
+  domain: string;
+  /** The domain it answered on before. */
+  previousDomain: string;
+  /** `false` only when no DNS client is configured at all — both record steps were skipped. */
+  dnsAttempted: boolean;
+  /** Whether the new `A` record was created here, as opposed to already existing. */
+  created: boolean;
+  /** Whether the old `A` record was found and deleted. */
+  oldRecordRemoved: boolean;
+  /** Set only when the new domain is live but the old record could not be cleaned up. */
+  staleRecordWarning?: string;
+}
+
+/**
+ * Moves an already-provisioned project to the subdomain now on its row: points a DNS `A` record at
+ * this server for the new domain, re-renders the nginx vhost under the new `server_name`, and
+ * removes the old `A` record.
+ *
+ * `previous` must be the row as it stood BEFORE the caller wrote the new `subdomain` — same contract
+ * as {@link refreshProjectConfig}, and needed for two things here: re-rendering the currently
+ * installed vhost content (so a failed `nginx -t` restores the working site rather than deleting
+ * it), and knowing which old record to delete.
+ *
+ * Ordered DNS-then-nginx so that each failure leaves the project exactly where it started:
+ *  - DNS fails: nothing has been touched yet; throws step `'dns'`.
+ *  - `nginx -t` fails: `writeVhost` has already restored the previous vhost, and the new `A` record
+ *    is deleted again here — but only when this call created it, so a record that was already there
+ *    (pointing at something else the user set up) is never destroyed. Throws step `'nginx-test'`.
+ * In both cases the caller is responsible for putting the `subdomain` column back.
+ *
+ * Nothing named after the slug moves: the vhost file, unit names, `apps/<slug>` and the htpasswd
+ * file all keep the names they had (see `lib/domain.ts` for why the two names are separate), so
+ * there is no on-disk rename to fail halfway through.
+ */
+export async function changeProjectSubdomain(
+  deps: ProvisionDeps,
+  projectId: number,
+  previous: ProjectRow,
+): Promise<SubdomainMoveResult> {
+  const project = getProjectOrThrow(deps.db, projectId);
+  assertSlug(project.slug);
+
+  const { baseDomain, serverIp } = requireDomainSettings(deps.db);
+  const domain = projectDomain(project, baseDomain);
+  const previousDomain = projectDomain(previous, baseDomain);
+
+  const dnsOutcome = await resolveDnsOutcome(deps.dns, domain, serverIp);
+  if (dnsOutcome.error) {
+    throw new ProvisionError('dns', `DNS record creation failed for ${domain}: ${dnsOutcome.error}`);
+  }
+
+  const previousContent = renderVhostContent(deps, previous, previousDomain, baseDomain);
+  try {
+    await writeVhost(deps, project, domain, baseDomain, previousContent);
+  } catch (err) {
+    if (dnsOutcome.created && deps.dns) {
+      // Best-effort: the throw below is the outcome that matters, and a failure to undo the record
+      // must not replace the real error (the nginx output) with a DNS one.
+      try {
+        await deps.dns.deleteARecord(domain);
+      } catch {
+        /* leaves a record pointing here for a domain nginx does not serve — harmless */
+      }
+    }
+    throw err;
+  }
+
+  let oldRecordRemoved = false;
+  let staleRecordWarning: string | undefined;
+  // The `previousDomain !== domain` guard is not decoration: without it a no-op "move" would delete
+  // the record it had just confirmed.
+  if (deps.dns && previousDomain !== domain) {
+    try {
+      if (await deps.dns.findARecord(previousDomain)) {
+        await deps.dns.deleteARecord(previousDomain);
+        oldRecordRemoved = true;
+      }
+    } catch (err) {
+      staleRecordWarning = `${previousDomain} still has a DNS record pointing at this server: ${errMessage(err)}`;
+    }
+  }
+
+  return {
+    domain,
+    previousDomain,
+    dnsAttempted: dnsOutcome.attempted,
+    created: dnsOutcome.created,
+    oldRecordRemoved,
+    ...(staleRecordWarning ? { staleRecordWarning } : {}),
+  };
+}
+
+/** What `deprovisionProject` managed to tear down on the database side, so the caller can record it
+ * in the audit trail and tell the user which databases (if any) it could not drop. */
+export interface DeprovisionResult {
+  databasesDropped: string[];
+  databasesFailed: { name: string; reason: string }[];
+}
+
+/**
  * Best-effort teardown of everything `provisionProject` may have created, then deletes the project
  * row (its `deployments`/`cron_jobs` rows cascade via the FK) and resyncs the host crontab so any
  * cron entries belonging to the now-deleted project are removed rather than left orphaned. Each step
@@ -352,10 +512,10 @@ export async function refreshProjectConfig(deps: ProvisionDeps, projectId: numbe
  * not stop the rest from running, so a partially-broken host state never blocks the user from
  * deleting the project. Silently returns if the project no longer exists.
  */
-export async function deprovisionProject(deps: ProvisionDeps, projectId: number): Promise<void> {
+export async function deprovisionProject(deps: ProvisionDeps, projectId: number): Promise<DeprovisionResult> {
   const project = deps.db.select().from(projects).where(eq(projects.id, projectId)).get();
   if (!project) {
-    return;
+    return { databasesDropped: [], databasesFailed: [] };
   }
   // Validate before constructing any path from `project.slug` (all the paths below interpolate it
   // directly) — the same defense-in-depth invariant `provisionProject` enforces on the way in.
@@ -393,10 +553,19 @@ export async function deprovisionProject(deps: ProvisionDeps, projectId: number)
   if (deps.dns) {
     const baseDomain = getSetting<string>(deps.db, 'base_domain');
     if (baseDomain) {
-      const domain = `${project.slug}.${baseDomain}`;
+      const domain = projectDomain(project, baseDomain);
       await attempt(() => deps.dns!.deleteARecord(domain));
     }
   }
+
+  // The project's databases. Without this they were only ever lost to the `databases.project_id` FK
+  // cascade below — the ROW vanished while the actual MySQL/Postgres database and its user stayed on
+  // the engine forever, invisible to Shipway and impossible to recreate under the same name.
+  //
+  // Best-effort like every other teardown step: a database on an unreachable server, or one whose
+  // connection has no stored admin credentials, must not strand the rest of the deletion. Anything
+  // that couldn't be dropped is reported back so the caller can record it.
+  const dbResult = await dropProjectDatabases(deps, projectId);
 
   await attempt(() => {
     fs.rmSync(path.join(deps.cfg.appsDir, project.slug), { recursive: true, force: true });
@@ -412,4 +581,43 @@ export async function deprovisionProject(deps: ProvisionDeps, projectId: number)
   // `cron_jobs` rows for this project just cascaded away with the delete above; resync the host
   // crontab (best-effort, like every other step here) so its entries don't linger orphaned.
   await attempt(() => syncCrontab(deps));
+
+  return dbResult;
+}
+
+/**
+ * Drops every database belonging to `projectId` on whatever server each one lives on, returning the
+ * names dropped and the ones that couldn't be. Never throws.
+ *
+ * A `keepDatabase` drop (a reserved/system name, which can only come from a row predating the
+ * create-time guard) removes the user and the record but leaves the database itself, exactly as
+ * `DELETE /api/databases/:id` does — dropping it for real would take out the engine's own schema.
+ */
+async function dropProjectDatabases(deps: ProvisionDeps, projectId: number): Promise<DeprovisionResult> {
+  const rows = deps.db.select().from(databases).where(eq(databases.projectId, projectId)).all();
+  if (rows.length === 0) return { databasesDropped: [], databasesFailed: [] };
+
+  // Without both, there is no way to authenticate a drop; say so rather than silently orphaning.
+  if (!deps.dbAdmin || !deps.secretBox) {
+    return { databasesDropped: [], databasesFailed: rows.map((row) => ({ name: row.name, reason: 'no database admin available' })) };
+  }
+
+  const dropped: string[] = [];
+  const failed: { name: string; reason: string }[] = [];
+
+  for (const row of rows) {
+    const connection = connectionForDatabase(deps.db, deps.secretBox, row);
+    if (!connection) {
+      failed.push({ name: row.name, reason: `no admin credentials for the ${row.engine} server it lives on` });
+      continue;
+    }
+    try {
+      await deps.dbAdmin.dropDatabase(connection.target, row.name, row.username, { keepDatabase: isReservedDbName(row.name) });
+      dropped.push(row.name);
+    } catch (err) {
+      failed.push({ name: row.name, reason: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  return { databasesDropped: dropped, databasesFailed: failed };
 }

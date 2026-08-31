@@ -34,3 +34,61 @@ export function formatDuration(ms: number): string {
   const seconds = totalSeconds % 60;
   return minutes > 0 ? `${String(minutes)}m ${String(seconds)}s` : `${String(seconds)}s`;
 }
+
+// ---------------------------------------------------------------------------
+// Absolute time — for records where "3 days ago" is not an answer.
+//
+// A deploy list can live on relative time: what matters there is recency. An audit log cannot —
+// the question it exists to answer is "what happened at 14:32 on Tuesday", so it needs the wall
+// clock, and it needs it in the reader's own timezone (every formatter below is local, matching
+// the epoch-ms-everywhere convention in db/schema.ts).
+// ---------------------------------------------------------------------------
+
+const timeOfDayFormat = new Intl.DateTimeFormat('en-GB', { hour: '2-digit', minute: '2-digit' });
+const dayHeadingFormat = new Intl.DateTimeFormat('en-GB', { weekday: 'long', day: 'numeric', month: 'long' });
+const dayHeadingWithYearFormat = new Intl.DateTimeFormat('en-GB', { day: 'numeric', month: 'long', year: 'numeric' });
+const timestampFormat = new Intl.DateTimeFormat('en-GB', {
+  weekday: 'short',
+  day: 'numeric',
+  month: 'short',
+  year: 'numeric',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+});
+
+/** `14:32` — the time an entry was recorded, local, 24-hour. */
+export function formatTimeOfDay(epochMs: number): string {
+  return timeOfDayFormat.format(epochMs);
+}
+
+/** The full local timestamp to the second, for a `title` attribute — the exact value behind a
+ * rounded one, available on hover without spending a column on it. */
+export function formatTimestamp(epochMs: number): string {
+  return timestampFormat.format(epochMs);
+}
+
+/**
+ * A stable local-day key (`2026-08-26`) for grouping entries into days.
+ *
+ * Built from the local date parts rather than `toISOString().slice(0, 10)`, which is UTC: east of
+ * Greenwich that puts the late evening into tomorrow's group, and west of it puts the early morning
+ * into yesterday's — a bug that only ever shows up for readers in another timezone.
+ */
+export function dayKey(epochMs: number): string {
+  const date = new Date(epochMs);
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${String(date.getFullYear())}-${month}-${day}`;
+}
+
+/** `Today` / `Yesterday` / `Monday, 24 August` / `24 August 2025` once the year differs. */
+export function formatDayHeading(epochMs: number): string {
+  const key = dayKey(epochMs);
+  const now = Date.now();
+  if (key === dayKey(now)) return 'Today';
+  if (key === dayKey(now - 86_400_000)) return 'Yesterday';
+  return new Date(epochMs).getFullYear() === new Date(now).getFullYear()
+    ? dayHeadingFormat.format(epochMs)
+    : dayHeadingWithYearFormat.format(epochMs);
+}

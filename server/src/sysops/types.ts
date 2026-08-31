@@ -42,6 +42,13 @@ export interface SysOps {
   systemUnitStatus(unit: string): Promise<UnitStatus>;
   /** Tails the last `lines` lines of a unit's journal. */
   journalTail(unit: string, lines: number): Promise<string>;
+  /**
+   * Replaces the pgAdmin server list Shipway manages with the one described by `payload` (the JSON
+   * `services/pgadmin.ts` builds). Privileged because pgAdmin's config database and its shared
+   * storage directory are readable only by the `pgadmin` user — see `setup/pgadmin-sync-servers.py`
+   * for what the root helper actually does with it.
+   */
+  syncPgAdminServers(payload: string): Promise<void>;
   /** Reads the current user's crontab, or `''` if none is set. */
   readCrontab(): Promise<string>;
   /** Replaces the current user's crontab with `content`. */

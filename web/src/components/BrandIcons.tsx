@@ -28,6 +28,27 @@ const NEXTJS_PATH =
 const HTML5_PATH =
   'M1.5 0h21l-1.91 21.563L11.977 24l-8.564-2.438L1.5 0zm7.031 9.75l-.232-2.718 10.059.003.23-2.622L5.412 4.41l.698 8.01h9.126l-.326 3.426-2.91.804-2.955-.81-.188-2.11H6.248l.33 4.171L12 19.351l5.379-1.443.744-8.157H8.531z';
 
+
+const REDIS_PATH =
+  'M22.71 13.145c-1.66 2.092-3.452 4.483-7.038 4.483-3.203 0-4.397-2.825-4.48-5.12.701 1.484 2.073 2.685 4.214 2.63 4.117-.133 6.94-3.852 6.94-7.239 0-4.05-3.022-6.972-8.268-6.972-3.752 0-8.4 1.428-11.455 3.685C2.59 6.937 3.885 9.958 4.35 9.626c2.648-1.904 4.748-3.13 6.784-3.744C8.12 9.244.886 17.05 0 18.425c.1 1.261 1.66 4.648 2.424 4.648.232 0 .431-.133.664-.365a100.49 100.49 0 0 0 5.54-6.765c.222 3.104 1.748 6.898 6.014 6.898 3.819 0 7.604-2.756 9.33-8.965.2-.764-.73-1.361-1.261-.73zm-4.349-5.013c0 1.959-1.926 2.922-3.685 2.922-.941 0-1.664-.247-2.235-.568 1.051-1.592 2.092-3.225 3.21-4.973 1.972.334 2.71 1.43 2.71 2.619z';
+
+/**
+ * Mailpit is not in simple-icons, so its mark comes from the project's own
+ * `server/ui/mailpit.svg` (the file it serves as its favicon): two paths on a 132.292x121.708
+ * viewBox rather than the single 24x24 path the icons above share, which is why it does not go
+ * through `BrandMark`.
+ *
+ * The envelope is white in the source file, drawn for Mailpit's own dark header — invisible on a
+ * light `--surface-2` tile. It renders in `currentColor` here for the same reason Next.js's does:
+ * a mark whose brand color is "whatever the background isn't" should follow the tile's ink in both
+ * themes. The swoosh keeps its brand green, which reads on either.
+ */
+const MAILPIT_ENVELOPE_PATH =
+  'M12.321 0l53.861 53.918L120.365 0zM5.155 9.025l60.842 59.673 61.211-59.489-.185 36.835L66.921 70.54l15.164 12.616-8.137 5.986-41.609.184c-4.838-.022-25.877-18.34-27.185-41.255z';
+
+const MAILPIT_SWOOSH_PATH =
+  'M78.385 72.049l53.907-21.679-8.031 57.318-11.845-9.132c-21.727 23.171-45.255 26.289-67.997 20.837S12.281 98.39 5.155 83.8-.67 53.116 2.843 38.769c1.13 10.511-1.313 16.316 6.38 33.612 6.31 11.399 14.413 20.417 25.89 24.956 13.9 6.195 32.247 3.357 41.701-3.039l14.24-12.156z';
+
 function BrandMark({ path, color, size = 28, className = '' }: BrandIconProps & { path: string; color: string }) {
   return (
     <svg viewBox="0 0 24 24" width={size} height={size} fill={color} className={className} aria-hidden="true">
@@ -54,4 +75,19 @@ export function NextjsIcon(props: BrandIconProps) {
 /** Static sites — HTML5 mark, brand color `#E34F26`. */
 export function StaticIcon(props: BrandIconProps) {
   return <BrandMark {...props} path={HTML5_PATH} color="#E34F26" />;
+}
+
+/** Redis — brand color `#FF4438`. */
+export function RedisIcon(props: BrandIconProps) {
+  return <BrandMark {...props} path={REDIS_PATH} color="#FF4438" />;
+}
+
+/** Mailpit — brand green `#00B786` swoosh over an ink-colored envelope; see `MAILPIT_ENVELOPE_PATH`. */
+export function MailpitIcon({ size = 28, className = '' }: BrandIconProps) {
+  return (
+    <svg viewBox="0 0 132.292 121.708" width={size} height={size} className={className} aria-hidden="true">
+      <path d={MAILPIT_ENVELOPE_PATH} fill="currentColor" />
+      <path d={MAILPIT_SWOOSH_PATH} fill="#00B786" />
+    </svg>
+  );
 }

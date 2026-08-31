@@ -641,6 +641,54 @@ describe('runDeploy — build failure', () => {
   });
 });
 
+describe('runDeploy — build environment', () => {
+  it('does not hand the deploy scripts Shipway\u2019s own NODE_ENV, but honours one the project sets', async () => {
+    const fixtureDir = tmpDir('shipway-pipeline-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const { cfg, db, shell, logger, deps, secretBox } = makeHarness();
+
+    const projectId = insertProject(db, {
+      slug: 'nextish',
+      type: 'nextjs',
+      nodeVersion: '22',
+      port: 3101,
+      installCmd: 'npm install',
+    });
+    db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+
+    // Shipway's unit sets NODE_ENV=production; under vitest this process has NODE_ENV=test. Either
+    // way it is *this* process's setting, and must not reach the app's install/build.
+    const saved = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      await runDeploy(deps, insertDeployment(db, { projectId, trigger: 'manual' }), logger, new AbortController().signal);
+    } finally {
+      if (saved === undefined) delete process.env.NODE_ENV;
+      else process.env.NODE_ENV = saved;
+    }
+
+    const installEnv = shell.envs[0];
+    expect(shell.calls[0]?.cmd).toBe('npm install');
+    // npm omits devDependencies under NODE_ENV=production, which is where a Next.js app keeps its
+    // whole build toolchain — inheriting it here breaks builds of repos that are perfectly valid.
+    expect(installEnv?.NODE_ENV).toBeUndefined();
+    // The project's env still reaches the build (nothing was stripped wholesale).
+    expect(installEnv?.PORT).toBe('3101');
+
+    // A project that sets NODE_ENV in its own env vars means it: that value is applied after the
+    // inherited environment and wins.
+    db.update(projects)
+      .set({ envEncrypted: secretBox.encrypt('NODE_ENV=staging\n') })
+      .where(eq(projects.id, projectId))
+      .run();
+    // A fresh logger: `runDeploy` closes the one it is handed when the deploy finishes.
+    const logger2 = new DeployLogger(path.join(cfg.logsDir, 'deploy2.log'));
+    await runDeploy(deps, insertDeployment(db, { projectId, trigger: 'manual' }), logger2, new AbortController().signal);
+
+    expect(shell.envs.find((e) => e.NODE_ENV !== undefined)?.NODE_ENV).toBe('staging');
+  });
+});
+
 describe('runDeploy — node health-check failure', () => {
   it('rolls the symlink back to the previous release, restarts twice, and marks failed', async () => {
     const fixtureDir = tmpDir('shipway-pipeline-fixture');
@@ -1207,5 +1255,65 @@ describe('runDeploy — workers', () => {
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.status).toBe('failed');
     expect(notifications[0]?.rolledBack).toBe(true);
+  });
+});
+
+
+/**
+ * The deploy log has to say what the notification did — a deploy that emailed the team and one that
+ * emailed nobody used to produce byte-identical logs, which is what made a "no email arrived" report
+ * impossible to answer after the fact.
+ */
+describe('runDeploy — notification summary in the deploy log', () => {
+  /** A minimal static project ready to deploy, with `notify` replaced by `hook`. */
+  async function harnessWithNotify(hook: () => Promise<string | void>) {
+    const fixtureDir = tmpDir('shipway-notify-log-fixture');
+    await makeFixtureRepo(fixtureDir, '<h1>v1</h1>\n');
+    const harness = makeHarness();
+    const projectId = insertProject(harness.db, { slug: 'shop', type: 'static' });
+    harness.db.update(projects).set({ repo: fileUrl(fixtureDir) }).where(eq(projects.id, projectId)).run();
+    const deploymentId = insertDeployment(harness.db, { projectId, trigger: 'push' });
+
+    harness.deps.notify = hook;
+
+    const lines: string[] = [];
+    harness.logger.on('line', (l: string) => lines.push(l));
+    return { harness, deploymentId, lines };
+  }
+
+  it('writes the summary the notify hook returns as a log line', async () => {
+    const { harness, deploymentId, lines } = await harnessWithNotify(() => Promise.resolve('notification: emailed 2 recipients'));
+
+    const result = await runDeploy(harness.deps, deploymentId, harness.logger, new AbortController().signal);
+
+    expect(result).toBe('success');
+    expect(lines.some((line) => line.includes('notification: emailed 2 recipients'))).toBe(true);
+  });
+
+  it('writes a skip reason just as visibly as a success', async () => {
+    const { harness, deploymentId, lines } = await harnessWithNotify(() =>
+      Promise.resolve('notification: skipped (no recipients configured for this project)'),
+    );
+
+    await runDeploy(harness.deps, deploymentId, harness.logger, new AbortController().signal);
+
+    expect(lines.some((line) => line.includes('notification: skipped (no recipients configured'))).toBe(true);
+  });
+
+  it('still logs a thrown notify as a failure, and the deploy still succeeds', async () => {
+    const { harness, deploymentId, lines } = await harnessWithNotify(() => Promise.reject(new Error('mailer exploded')));
+
+    const result = await runDeploy(harness.deps, deploymentId, harness.logger, new AbortController().signal);
+
+    expect(result).toBe('success');
+    expect(lines.some((line) => line.includes('notify failed: mailer exploded'))).toBe(true);
+  });
+
+  it('logs nothing extra when the hook returns void, so a bare stub stays silent', async () => {
+    const { harness, deploymentId, lines } = await harnessWithNotify(() => Promise.resolve());
+
+    await runDeploy(harness.deps, deploymentId, harness.logger, new AbortController().signal);
+
+    expect(lines.some((line) => line.includes('notification:'))).toBe(false);
   });
 });

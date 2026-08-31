@@ -1,23 +1,25 @@
 /**
- * SMTP tab: mailpit (default) / custom / none, as horizontal radio-cards. The server never returns
- * a saved custom config back to the client (`toPublicProject` strips `smtpConfigEncrypted` — see
- * server/src/routes/projects.ts), so switching into "custom" always starts from blank fields; saving
- * replaces the whole stored config.
+ * SMTP tab: mailpit (default) / custom / Amazon SES / none, as radio-cards. The server never returns
+ * a saved config back to the client (`toPublicProject` strips `smtpConfigEncrypted` — see
+ * server/src/routes/projects.ts), so switching into "custom" or "SES" always starts from blank
+ * fields; saving replaces the whole stored config.
+ *
+ * SES is the same SMTP transport as "custom" with the endpoint derived instead of typed: the form
+ * asks for a region plus SES SMTP credentials, and the server turns that into
+ * `MAIL_HOST=email-smtp.<region>.amazonaws.com`, port 587, `MAIL_ENCRYPTION=tls` in the project's
+ * `.env` (see `server/src/deploy/envfile.ts`). No host field is offered, so a project's mail can
+ * never be pointed at a host that isn't SES.
  */
 import { type FormEvent, useState } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { Mail } from 'lucide-react';
-import { ApiError, putProjectSmtp, type Project } from '../../api';
+import { ApiError, putProjectSmtp, type Project, type ProjectSmtpMode } from '../../api';
 import { useProject, useSettings } from '../../hooks';
-import { Button, Card, CardHeader, Field, ICON_STROKE, Input, Skeleton } from '../../components/ui';
+import { Button, Card, CardHeader, Field, ICON_STROKE, Input, Select, Skeleton } from '../../components/ui';
+import { SES_DEFAULT_REGION, SES_REGIONS, SES_SMTP_PORT, sesSmtpHost } from '../../lib/ses';
+import { SMTP_OPTIONS } from '../../lib/smtp';
 
-type SmtpMode = 'mailpit' | 'custom' | 'none';
-
-const SMTP_OPTIONS: { value: SmtpMode; label: string; blurb: string }[] = [
-  { value: 'mailpit', label: 'Mailpit', blurb: 'Local catch-all. Nothing leaves the server.' },
-  { value: 'custom', label: 'Custom', blurb: 'Your own SMTP server.' },
-  { value: 'none', label: 'None', blurb: 'Mail sending is disabled.' },
-];
+type SmtpMode = ProjectSmtpMode;
 
 export default function SmtpTab({ projectId }: { projectId: number }) {
   const projectQuery = useProject(projectId);
@@ -47,6 +49,7 @@ function SmtpForm({ project, baseDomain }: { project: Project; baseDomain: strin
   const [password, setPassword] = useState('');
   const [fromAddress, setFromAddress] = useState('');
   const [encryption, setEncryption] = useState('tls');
+  const [region, setRegion] = useState(SES_DEFAULT_REGION);
 
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -76,6 +79,8 @@ function SmtpForm({ project, baseDomain }: { project: Project; baseDomain: strin
               },
             }
           : {}),
+        // SES sends no host/port/encryption: the server derives all three from the region.
+        ...(mode === 'ses' ? { config: { region: region.trim(), username: username.trim(), password, fromAddress: fromAddress.trim() } } : {}),
       });
       await queryClient.invalidateQueries({ queryKey: ['project', project.id] });
       await queryClient.invalidateQueries({ queryKey: ['project-env-preview', project.id] });
@@ -87,7 +92,11 @@ function SmtpForm({ project, baseDomain }: { project: Project; baseDomain: strin
     }
   }
 
-  const canSubmit = dirty && !saving && (mode !== 'custom' || (host.trim() !== '' && port.trim() !== ''));
+  const customComplete = host.trim() !== '' && port.trim() !== '';
+  // Every SES field is required — SES SMTP always authenticates, and the from-address has to be an
+  // identity verified in SES for a send to be accepted at all.
+  const sesComplete = region.trim() !== '' && username.trim() !== '' && password.trim() !== '' && fromAddress.trim() !== '';
+  const canSubmit = dirty && !saving && (mode === 'custom' ? customComplete : mode === 'ses' ? sesComplete : true);
 
   return (
     <Card>
@@ -194,6 +203,72 @@ function SmtpForm({ project, baseDomain }: { project: Project; baseDomain: strin
                 }}
               />
             </Field>
+          </div>
+        )}
+
+        {mode === 'ses' && (
+          <div className="flex flex-col gap-4 rounded-xl bg-surface-2 p-4">
+            <Field label="Region" hint="The AWS region your SES identity is verified in.">
+              <Select
+                mono
+                required
+                value={region}
+                onChange={(event) => {
+                  setRegion(event.target.value);
+                  markDirty();
+                }}
+              >
+                {/* A region saved before it was added here (or set via the API) still renders as the
+                    selected option rather than silently snapping to another region. */}
+                {!SES_REGIONS.includes(region) && region.trim() !== '' && <option value={region}>{region}</option>}
+                {SES_REGIONS.map((value) => (
+                  <option key={value} value={value}>
+                    {value}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field
+              label="SMTP username"
+              hint="From SES > SMTP settings > Create SMTP credentials. Not an AWS access key ID — SMTP auth rejects those."
+            >
+              <Input
+                mono
+                required
+                value={username}
+                onChange={(event) => {
+                  setUsername(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="SMTP password" hint="Shown only once by AWS when the credentials are created.">
+              <Input
+                mono
+                required
+                type="password"
+                value={password}
+                onChange={(event) => {
+                  setPassword(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <Field label="From address" hint="Must be an address or domain you've verified in SES.">
+              <Input
+                mono
+                required
+                type="email"
+                value={fromAddress}
+                onChange={(event) => {
+                  setFromAddress(event.target.value);
+                  markDirty();
+                }}
+              />
+            </Field>
+            <p className="font-mono text-[13px] text-soft">
+              {region.trim() === '' ? 'Pick a region to see the endpoint.' : `${sesSmtpHost(region)}:${String(SES_SMTP_PORT)} (STARTTLS)`}
+            </p>
           </div>
         )}
 

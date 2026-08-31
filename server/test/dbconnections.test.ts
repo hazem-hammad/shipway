@@ -66,6 +66,9 @@ class FakeDbAdmin implements DbAdmin {
     this.tested.push(target);
     if (this.testError) throw this.testError;
   }
+
+  async importSql(_target: DbAdminTarget, _database: string, _sqlPath: string): Promise<void> {}
+  async dumpSql(_target: DbAdminTarget, _database: string, _sqlPath: string): Promise<void> {}
 }
 
 interface TestApp {

@@ -1,15 +1,24 @@
-import { randomBytes } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import type { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { and, eq, isNull } from 'drizzle-orm';
-import type { FastifyInstance } from 'fastify';
+import type { FastifyInstance, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { databases, projects } from '../db/schema.js';
 import { getSetting } from '../db/settings.js';
 import { requireRole } from '../lib/authz.js';
+import { accessibleProjectIds, canAccessProject } from '../lib/projectaccess.js';
 import { getActor, recordAudit } from '../services/audit.js';
-import { connectionForDatabase, fallbackEndpoint, resolveConnection, type ResolvedConnection } from '../services/dbconnections.js';
+import { adminUrl, connectionForDatabase, fallbackEndpoint, resolveConnection, type ResolvedConnection } from '../services/dbconnections.js';
+import { applyEnvToRunning } from '../services/envapply.js';
+import { syncPgAdminServers } from '../services/pgadmin.js';
 import {
   connectionEnv,
   connectionKey,
+  generateDbPassword,
   IDENTIFIER_RE,
   isReservedDbName,
   parseConnectionKey,
@@ -40,18 +49,37 @@ const deleteBodySchema = z.object({ confirmName: z.string() });
 
 const injectBodySchema = z.object({ projectId: z.number().int() });
 
-/** Chars used for generated database passwords: letters + digits only (safe to embed unquoted in most contexts, and matches the brief's `[A-Za-z0-9]` spec). */
-const PASSWORD_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
-const PASSWORD_LENGTH = 24;
+/**
+ * Largest dump `POST /api/databases/:id/import` will take. Deliberately the same figure as the
+ * dashboard vhost's `client_max_body_size` (setup/templates/nginx-dashboard.conf), so a file that
+ * is too big is refused by whichever of the two sees it first with the same number in the message
+ * rather than by nginx with a bare 413 the dashboard can't explain.
+ */
+const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
 
-/** Generates a random `PASSWORD_LENGTH`-char password from `PASSWORD_CHARS`, using `randomBytes` for entropy. */
-function generatePassword(): string {
-  const bytes = randomBytes(PASSWORD_LENGTH);
-  let out = '';
-  for (let i = 0; i < PASSWORD_LENGTH; i++) {
-    out += PASSWORD_CHARS[bytes[i]! % PASSWORD_CHARS.length];
+/** What an uploaded dump is posted as. `application/sql` and not `text/plain`, so the raw parser
+ * below can be added without changing how anything else in the API is read. */
+const SQL_CONTENT_TYPE = 'application/sql';
+
+/** Thrown by `capBytes` once the upload passes `MAX_IMPORT_BYTES`, so the route can tell "too big"
+ * apart from a connection that simply broke mid-upload. */
+class UploadTooLargeError extends Error {}
+
+/**
+ * Passes `source` through unchanged while counting it, aborting the moment it exceeds `limit`.
+ * A cap enforced here rather than by Fastify's `bodyLimit` because the dump is streamed to disk by
+ * a raw content-type parser (see `sqlUploadStream`) — nothing ever buffers it, which is the whole
+ * point, and `bodyLimit` only ever applies to bodies Fastify itself buffers.
+ */
+async function* capBytes(source: AsyncIterable<Buffer>, limit: number): AsyncGenerator<Buffer> {
+  let total = 0;
+  for await (const chunk of source) {
+    total += chunk.length;
+    if (total > limit) {
+      throw new UploadTooLargeError();
+    }
+    yield chunk;
   }
-  return out;
 }
 
 function toErrorMessage(err: unknown): string {
@@ -112,7 +140,28 @@ function endpointFor(app: FastifyInstance, row: { engine: DbEngine; connectionId
  * All routes here sit under the global session guard in `buildApp`.
  */
 export async function databaseRoutes(app: FastifyInstance): Promise<void> {
-  app.get('/api/databases', async () => {
+  // A dump arrives as a raw body under this content type and is handed to the route as the request
+  // stream itself, unbuffered and unparsed — see `POST /api/databases/:id/import`. Registered on
+  // this plugin's own encapsulated context, so nothing outside these routes can be posted a body
+  // Fastify won't parse.
+  app.addContentTypeParser(SQL_CONTENT_TYPE, (_request, payload, done) => {
+    done(null, payload);
+  });
+
+  /**
+   * Whether the requesting user may act on one database row. A database belongs to a project (or to
+   * nothing at all), so its scope is its project's: a `projectAccess: 'selected'` member reaches
+   * only the databases attached to a project they were granted, and never an UNATTACHED one — an
+   * unattached database can't be attributed to any project, so there's no grant that could cover it.
+   * Unscoped users (admins, and members with `'all'`) reach every database exactly as before.
+   */
+  function canAccessDatabase(request: FastifyRequest, projectId: number | null): boolean {
+    const allowed = accessibleProjectIds(app.db, request.session.get('userId'));
+    if (allowed === null) return true;
+    return projectId !== null && allowed.has(projectId);
+  }
+
+  app.get('/api/databases', async (request) => {
     const rows = app.db
       .select({
         id: databases.id,
@@ -126,7 +175,8 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       })
       .from(databases)
       .leftJoin(projects, eq(databases.projectId, projects.id))
-      .all();
+      .all()
+      .filter((row) => canAccessDatabase(request, row.projectId));
 
     // Resolved per row rather than joined, because a host engine isn't a row to join to — see
     // `services/dbconnections.ts`. `connectionName` is null only when the connection has gone
@@ -187,6 +237,16 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       if (!project) {
         return reply.code(404).send({ error: 'project not found' });
       }
+      // Same 404-not-403 rule as everywhere else project scope is enforced (`lib/projectaccess.ts`).
+      if (!canAccessProject(app.db, request.session.get('userId'), projectId)) {
+        return reply.code(404).send({ error: 'project not found' });
+      }
+    } else if (accessibleProjectIds(app.db, request.session.get('userId')) !== null) {
+      // A scoped member can't see an unattached database once it exists (see `canAccessDatabase`),
+      // so creating one would hand them a database — and a live role on a real server — that
+      // immediately vanishes from their Databases page. Requiring the project up front is the
+      // honest failure.
+      return reply.code(400).send({ error: 'select a project for this database' });
     }
 
     // Scoped to the connection, not the engine: the same database name on two different servers is
@@ -206,7 +266,7 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const username = name;
-    const password = generatePassword();
+    const password = generateDbPassword();
 
     try {
       await app.dbAdmin.createDatabase(connection.target, name, username, password);
@@ -243,6 +303,13 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       meta: { engine, connection: connection.name },
     });
 
+    // A Postgres database on this host is one pgAdmin can be pointed at, so register it there.
+    // Not awaited — pgAdmin's CLI takes seconds to start, and the database exists either way; the
+    // console link is the only thing that lags, until the next sync. See services/pgadmin.ts.
+    if (engine === 'postgres' && connection.id === null) {
+      void syncPgAdminServers(app);
+    }
+
     // The ONE time the plaintext password is ever returned — every other read (GET
     // /api/databases, /:id/credentials) either omits it or requires a separate decrypt.
     return reply.code(201).send({
@@ -265,13 +332,18 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const row = app.db.select().from(databases).where(eq(databases.id, paramsParsed.data.id)).get();
-    if (!row) {
+    if (!row || !canAccessDatabase(request, row.projectId)) {
       return reply.code(404).send({ error: 'database not found' });
     }
 
     const password = app.secretBox.decrypt(row.passwordEncrypted);
     const endpoint = endpointFor(app, row);
     return {
+      // `name`/`engine` are already in `GET /api/databases`; they are repeated here so a caller
+      // that has only an id — the phpMyAdmin signon shim at /db/signon.php — can build a complete
+      // connection from this one response instead of fetching the whole list to find the name.
+      name: row.name,
+      engine: row.engine,
       username: row.username,
       password,
       host: endpoint.host,
@@ -335,6 +407,12 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       meta: keepDatabase ? { engine: row.engine, keptDatabase: true } : { engine: row.engine },
     });
 
+    // Drops the matching pgAdmin server too, so the console stops offering a connection to a
+    // database that is gone. Same fire-and-forget reasoning as the create path above.
+    if (row.engine === 'postgres' && row.connectionId === null) {
+      void syncPgAdminServers(app);
+    }
+
     return reply.code(204).send();
   });
 
@@ -345,7 +423,7 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
     }
 
     const dbRow = app.db.select().from(databases).where(eq(databases.id, paramsParsed.data.id)).get();
-    if (!dbRow) {
+    if (!dbRow || !canAccessDatabase(request, dbRow.projectId)) {
       return reply.code(404).send({ error: 'database not found' });
     }
 
@@ -382,17 +460,125 @@ export async function databaseRoutes(app: FastifyInstance): Promise<void> {
       app.db.update(databases).set({ projectId: project.id }).where(eq(databases.id, dbRow.id)).run();
     }
 
+    // "Add to project env" writes DB_* into the same file the Environment tab does, so it applies
+    // the same way — a project handed a database's credentials should be able to reach it without
+    // waiting for a deploy. Selected fresh because the row above is a two-column projection.
+    const full = app.db.select().from(projects).where(eq(projects.id, project.id)).get();
+    const applied = full ? await applyEnvToRunning(app, full) : { applied: false, workersRestarted: 0 };
+
     const actor = getActor(app.db, request.session.get('userId'));
     recordAudit(app.db, {
       ...actor,
       action: 'database.inject',
       targetType: 'database',
       targetName: dbRow.name,
-      meta: { projectId: project.id, attached },
+      meta: { projectId: project.id, attached, applied: applied.applied },
     });
 
-    return reply.code(204).send();
+    return reply.code(200).send(applied);
   });
+
+  /**
+   * Replays an uploaded SQL dump into an existing database. The body is the dump itself
+   * (`Content-Type: application/sql`), streamed straight to a temp file and handed to the engine's
+   * own client — see `DbAdmin.importSql` for why the file never goes through a driver.
+   *
+   * No role gate beyond the session, matching `POST /api/databases`: anyone who can sign in already
+   * reaches every database on this host through the phpMyAdmin/pgAdmin consoles the dashboard vhost
+   * proxies, so requiring admin here would guard a door that is open next to it.
+   */
+  app.post('/api/databases/:id/import', async (request, reply) => {
+    const upload = request.body as Readable;
+
+    const paramsParsed = idParamsSchema.safeParse(request.params);
+    if (!paramsParsed.success) {
+      return discardThen(upload, () => reply.code(404).send({ error: 'database not found' }));
+    }
+
+    const row = app.db.select().from(databases).where(eq(databases.id, paramsParsed.data.id)).get();
+    if (!row || !canAccessDatabase(request, row.projectId)) {
+      return discardThen(upload, () => reply.code(404).send({ error: 'database not found' }));
+    }
+
+    const connection = connectionForDatabase(app.db, app.secretBox, row);
+    if (!connection) {
+      return discardThen(upload, () =>
+        reply.code(502).send({
+          error: 'sql import failed',
+          detail: `no admin credentials for the ${row.engine} server this database lives on`,
+        }),
+      );
+    }
+
+    // The dump is replayed as the database's OWN user, not as the server admin whose credentials
+    // `connection.target` carries. On Postgres that is the difference between a working import and
+    // one whose every table is owned by `shipway_admin` and invisible to the app; on MySQL it keeps
+    // a dump someone else wrote confined to the grants that database's user already has.
+    const password = app.secretBox.decrypt(row.passwordEncrypted);
+    const importTarget = {
+      engine: row.engine,
+      url: adminUrl(row.engine, connection.endpoint.host, connection.endpoint.port, row.username, password),
+      tls: connection.target.tls,
+    };
+
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'shipway-sql-'));
+    const sqlPath = path.join(dir, 'import.sql');
+    // The outcome is decided first and sent last, with the temp file deleted in between. A dump is
+    // someone's live data — it does not get to outlive the request in /tmp whether the import
+    // worked, failed, or the upload was refused — and doing the cleanup after `send` would leave
+    // the file on disk for as long as it takes an unawaited promise to get around to it.
+    const runImport = async (): Promise<{ code: number; body: unknown }> => {
+      try {
+        await pipeline(upload, (source: AsyncIterable<Buffer>) => capBytes(source, MAX_IMPORT_BYTES), createWriteStream(sqlPath));
+      } catch (err) {
+        if (err instanceof UploadTooLargeError) {
+          return { code: 413, body: { error: `the file is larger than ${String(MAX_IMPORT_BYTES / (1024 * 1024))} MB` } };
+        }
+        return { code: 400, body: { error: 'the upload did not finish', detail: toErrorMessage(err) } };
+      }
+
+      const { size } = await fs.stat(sqlPath);
+      if (size === 0) {
+        return { code: 400, body: { error: 'the uploaded file is empty' } };
+      }
+
+      try {
+        await app.dbAdmin.importSql(importTarget, row.name, sqlPath);
+      } catch (err) {
+        return { code: 502, body: { error: 'sql import failed', detail: toErrorMessage(err) } };
+      }
+
+      const actor = getActor(app.db, request.session.get('userId'));
+      recordAudit(app.db, {
+        ...actor,
+        action: 'database.import',
+        targetType: 'database',
+        targetName: row.name,
+        meta: { engine: row.engine, bytes: size },
+      });
+      return { code: 200, body: { bytes: size } };
+    };
+
+    let outcome: { code: number; body: unknown };
+    try {
+      outcome = await runImport();
+    } finally {
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+
+    return reply.code(outcome.code).send(outcome.body);
+  });
+}
+
+/**
+ * Sends `respond`'s reply after throwing away the rest of the upload. A raw-stream route that
+ * answers without reading its body leaves the client pushing a dump into a socket nobody is
+ * draining, which surfaces to the browser as a connection reset instead of as the 404 that was
+ * actually sent.
+ */
+function discardThen<T>(upload: Readable, respond: () => T): T {
+  upload.resume();
+  return respond();
 }
 
 interface RedisInfo {
