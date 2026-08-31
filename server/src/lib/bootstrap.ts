@@ -17,6 +17,17 @@
  *   a clear warning is logged, and the file is left in place — the server still boots normally.
  *   Deleting a bootstrap file we failed to parse would silently strand the operator's provisioned
  *   credentials; leaving it lets a future fixed/valid file (or manual inspection) still work.
+ *
+ * One narrow, deliberate exception to "never clobber": when `force_admin_urls` is `true`,
+ * `mysql_admin_url` and `postgres_admin_url` — and ONLY those two keys — are written even if
+ * already set. `setup/install.sh` sets this flag exclusively when an operator explicitly opted
+ * into `SHIPWAY_ROTATE_DB_ADMIN=1` to rotate the live `shipway_admin` MySQL/Postgres credential
+ * after `/root/.shipway-install-secrets` was lost on an already-provisioned server (see
+ * `provision_mysql_admin`/`provision_postgres_admin` and DEPLOYMENT.md's "Lost
+ * /root/.shipway-install-secrets on an already-live server" section). Without this, that rotation
+ * would push a new password live via `ALTER USER`/`ALTER ROLE` while Shipway kept using the old,
+ * now-wrong one forever (see Finding 1) — every other bootstrap key keeps the plain
+ * never-clobber behavior.
  */
 import * as fs from 'node:fs';
 import type { Config } from '../config.js';
@@ -53,9 +64,13 @@ export interface BootstrapFile {
   base_domain?: string;
   server_ip?: string;
   acme_email?: string;
+  /** Control flag, not itself a settings key — see the "narrow, deliberate exception" doc above. */
+  force_admin_urls?: boolean;
 }
 
-/** The settings keys `importBootstrap` knows how to populate — one-to-one with `BootstrapFile`'s keys. */
+/** The settings keys `importBootstrap` knows how to populate — one-to-one with `BootstrapFile`'s
+ * data keys (`force_admin_urls` is a control flag, not a settings key, so it's deliberately absent
+ * here). */
 const BOOTSTRAP_KEYS = [
   'mysql_admin_url',
   'postgres_admin_url',
@@ -65,6 +80,11 @@ const BOOTSTRAP_KEYS = [
   'server_ip',
   'acme_email',
 ] as const satisfies readonly (keyof BootstrapFile)[];
+
+/** The only keys `force_admin_urls: true` is allowed to overwrite even when already set. Kept as
+ * its own list (rather than, say, a per-key flag on `BOOTSTRAP_KEYS`) so the "narrowly scoped to
+ * exactly these two keys" guarantee is visible and grep-able in one place. */
+const FORCE_OVERWRITABLE_KEYS: readonly string[] = ['mysql_admin_url', 'postgres_admin_url'];
 
 /**
  * Reads `${cfg.dataDir}/bootstrap.json` (if present), writes each key it contains into `settings`
@@ -85,10 +105,17 @@ export function importBootstrap(db: ShipwayDb, cfg: Config): void {
     return;
   }
 
+  const forceAdminUrls = parsed.force_admin_urls === true;
+
   for (const key of BOOTSTRAP_KEYS) {
     const value = parsed[key];
     if (value === undefined) continue;
-    if (getSetting(db, key) !== null) continue; // already configured — never clobber an operator edit
+    const alreadySet = getSetting(db, key) !== null;
+    const forceThisKey = forceAdminUrls && FORCE_OVERWRITABLE_KEYS.includes(key);
+    if (alreadySet && !forceThisKey) continue; // already configured — never clobber an operator edit
+    if (alreadySet && forceThisKey) {
+      console.warn(`bootstrap: force_admin_urls=true — overwriting already-set setting "${key}" with the value from ${bootstrapPath} (a deliberate SHIPWAY_ROTATE_DB_ADMIN=1 rotation, not an accidental clobber)`);
+    }
     setSetting(db, key, value);
   }
 

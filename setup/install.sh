@@ -16,7 +16,10 @@
 # SHIPWAY_SERVER_IP, SHIPWAY_CF_API_TOKEN, SHIPWAY_ACME_EMAIL instead of
 # answering the prompts, plus SHIPWAY_NONINTERACTIVE=1 to skip the one
 # remaining interactive gate (the DNS-not-pointed-here confirmation in
-# `check_dns_resolution`) and proceed unattended.
+# `check_dns_resolution`) and proceed unattended. SHIPWAY_ROTATE_DB_ADMIN=1 is a separate, rare,
+# deliberate opt-in — see `provision_mysql_admin`/`provision_postgres_admin` below and
+# DEPLOYMENT.md's "Lost /root/.shipway-install-secrets on an already-live server" section — not
+# needed for a normal install.
 #
 # Runs a preflight check (root, OS, free disk, ports 80/443, outbound
 # connectivity, Cloudflare token/zone access, DNS pointing at this server)
@@ -215,6 +218,19 @@ get_or_create_secret() {
   printf '%s' "$value"
 }
 
+# True (exit 0) if $SECRETS_FILE already has a non-empty value cached for $1, without generating
+# one — unlike get_or_create_secret, this never mints or writes anything. Used by
+# provision_mysql_admin/provision_postgres_admin to detect "the live admin account already exists,
+# but its password isn't in the cache" BEFORE minting a new one, so that dangerous case can be
+# handled deliberately instead of get_or_create_secret silently generating a value that doesn't
+# match what's already live.
+secret_is_set() {
+  local name="$1"
+  local existing
+  existing="$(grep -m1 "^${name}=" "$SECRETS_FILE" 2>/dev/null | cut -d= -f2- || true)"
+  [[ -n "$existing" ]]
+}
+
 # ---------------------------------------------------------------------------
 # 1. apt packages: nginx/git/curl/acl/unzip + the ondrej/php PPA + PHP
 #    8.1-8.4 + composer
@@ -227,7 +243,14 @@ install_base_packages() {
   log "installing base packages"
   apt-get install -y \
     nginx git curl acl unzip \
-    software-properties-common rsync jq ca-certificates
+    software-properties-common rsync jq ca-certificates cron
+
+  # Ubuntu's `cron` package normally enables and starts itself on install via its postinst script,
+  # but `enable --now` is idempotent and cheap — asserting it explicitly means user crontabs (see
+  # server/src/sysops/real.ts's readCrontab/writeCrontab, which shell out to bare `crontab`) are
+  # guaranteed to actually fire rather than silently sitting unscheduled on a minimal image where
+  # that postinst behavior might differ.
+  systemctl enable --now cron
 }
 
 install_php() {
@@ -618,16 +641,59 @@ EOF
 MYSQL_ADMIN_PASSWORD=""
 POSTGRES_ADMIN_PASSWORD=""
 
+# Set to 1 by provision_mysql_admin/provision_postgres_admin when SHIPWAY_ROTATE_DB_ADMIN=1
+# deliberately rotated an already-live admin credential (secrets file was lost). write_bootstrap_file
+# reads these to set bootstrap.json's `force_admin_urls` flag, so importBootstrap.ts overwrites
+# Shipway's already-stored mysql_admin_url/postgres_admin_url settings to match the new password
+# instead of leaving them silently pointed at the now-wrong old one (Finding 1).
+MYSQL_ADMIN_ROTATED=0
+POSTGRES_ADMIN_ROTATED=0
+
+# Guards the "secrets file lost on an already-live server" hazard described in the file header and
+# DEPLOYMENT.md's "Lost /root/.shipway-install-secrets on an already-live server" section: if the
+# admin account/role already exists but its password isn't in $SECRETS_FILE, minting and pushing a
+# new one live (the old, unconditional behavior) would silently break Shipway's already-stored
+# mysql_admin_url/postgres_admin_url, since importBootstrap only fills unset settings keys. Refuses
+# by default (die() with recovery instructions); proceeds only if the operator explicitly opted in
+# with SHIPWAY_ROTATE_DB_ADMIN=1, in which case the caller is told (via the rotated_var nameref-by-
+# convention below) to also force-update Shipway's stored setting once the install finishes.
+#
+# $1: human label ("MySQL 'shipway_admin' user" / "Postgres 'shipway_admin' role")
+# $2: 1 if the account/role already exists, 0 otherwise
+# $3: secret name in $SECRETS_FILE (MYSQL_ADMIN_PASSWORD / POSTGRES_ADMIN_PASSWORD)
+# $4: name of the *_ROTATED variable to set to 1 on a deliberate rotation
+guard_admin_secret_loss() {
+  local label="$1" account_exists="$2" secret_name="$3" rotated_var="$4"
+
+  if [[ "$account_exists" != "1" ]] || secret_is_set "$secret_name"; then
+    return
+  fi
+
+  if [[ "${SHIPWAY_ROTATE_DB_ADMIN:-}" == "1" ]]; then
+    log "WARNING: ${label} already exists, but ${SECRETS_FILE} has no ${secret_name} entry. SHIPWAY_ROTATE_DB_ADMIN=1 is set, so its password is being rotated now, and Shipway's stored setting will be force-updated to match once this install finishes (bootstrap.json's force_admin_urls) so database provisioning keeps working. Anything holding the OLD password open (e.g. a long-lived connection) will need to reconnect."
+    printf -v "$rotated_var" '%s' 1
+    return
+  fi
+
+  die "${label} already exists, but ${SECRETS_FILE} has no ${secret_name} entry — the secrets file was likely lost or replaced on an already-provisioned server. Re-running as-is would mint a brand-new random password and push it live, but Shipway's already-stored setting for it would NOT be updated to match (importBootstrap only fills unset keys), silently breaking database provisioning (see DEPLOYMENT.md's 'Lost /root/.shipway-install-secrets on an already-live server' section for the full explanation and a command to read the real live password back out of Shipway's own settings, without rotating anything). To instead deliberately rotate the password now (and have this installer update Shipway's stored setting to match automatically), re-run with SHIPWAY_ROTATE_DB_ADMIN=1."
+}
+
 provision_mysql_admin() {
+  local admin_exists
+  admin_exists="$(mysql -u root -N -B -e "SELECT COUNT(*) FROM mysql.user WHERE user='shipway_admin' AND host='localhost'" 2>/dev/null || echo 0)"
+
+  guard_admin_secret_loss "MySQL 'shipway_admin' user" "$admin_exists" MYSQL_ADMIN_PASSWORD MYSQL_ADMIN_ROTATED
+
   MYSQL_ADMIN_PASSWORD="$(get_or_create_secret MYSQL_ADMIN_PASSWORD)"
   log "provisioning MySQL shipway_admin user"
   # Granted at both hosts — see the file header comment for why. The
   # trailing ALTER USERs are not redundant with CREATE USER IF NOT EXISTS:
   # if the account already existed, CREATE's IDENTIFIED BY clause is a
   # no-op, so without the ALTER the account's real password could drift
-  # from whatever get_or_create_secret just returned (e.g. if
-  # /root/.shipway-install-secrets was ever lost and regenerated) — leaving
-  # bootstrap.json reporting a password that doesn't actually work.
+  # from whatever get_or_create_secret just returned. guard_admin_secret_loss
+  # above ensures that value is either the account's real current password
+  # (secret was cached) or a deliberate, operator-approved rotation
+  # (SHIPWAY_ROTATE_DB_ADMIN=1) — never a silent mismatch.
   mysql -u root <<SQL
 CREATE USER IF NOT EXISTS 'shipway_admin'@'localhost' IDENTIFIED BY '${MYSQL_ADMIN_PASSWORD}';
 CREATE USER IF NOT EXISTS 'shipway_admin'@'127.0.0.1' IDENTIFIED BY '${MYSQL_ADMIN_PASSWORD}';
@@ -640,10 +706,15 @@ SQL
 }
 
 provision_postgres_admin() {
-  POSTGRES_ADMIN_PASSWORD="$(get_or_create_secret POSTGRES_ADMIN_PASSWORD)"
-  log "provisioning Postgres shipway_admin role"
   local exists
   exists="$(sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='shipway_admin'")"
+
+  # $exists is "1" or "" (psql -tAc prints nothing for a query with no matching row), and
+  # guard_admin_secret_loss only checks it against "1", so it's passed through as-is.
+  guard_admin_secret_loss "Postgres 'shipway_admin' role" "$exists" POSTGRES_ADMIN_PASSWORD POSTGRES_ADMIN_ROTATED
+
+  POSTGRES_ADMIN_PASSWORD="$(get_or_create_secret POSTGRES_ADMIN_PASSWORD)"
+  log "provisioning Postgres shipway_admin role"
   if [[ "$exists" == "1" ]]; then
     # Same reasoning as the MySQL ALTER USERs above: always (re)assert the
     # password so it can never drift from what bootstrap.json reports.
@@ -669,6 +740,18 @@ write_bootstrap_file() {
   local postgres_admin_url="postgres://shipway_admin:${POSTGRES_ADMIN_PASSWORD}@127.0.0.1:5432/postgres"
   local mailpit_web_url="https://mail.${BASE_DOMAIN}"
 
+  # See guard_admin_secret_loss/provision_mysql_admin/provision_postgres_admin: only true when
+  # SHIPWAY_ROTATE_DB_ADMIN=1 deliberately rotated an already-live admin credential this run. Tells
+  # server/src/lib/bootstrap.ts's importBootstrap to overwrite Shipway's already-stored
+  # mysql_admin_url/postgres_admin_url settings (and ONLY those two) instead of skipping them as
+  # already-set, so the rotated password actually becomes the one Shipway uses (Finding 1) — every
+  # other bootstrap.json key keeps the normal fill-only-if-unset behavior either way.
+  local force_admin_urls="false"
+  if [[ "$MYSQL_ADMIN_ROTATED" == "1" || "$POSTGRES_ADMIN_ROTATED" == "1" ]]; then
+    force_admin_urls="true"
+    log "WARNING: bootstrap.json is being written with force_admin_urls=true — on next boot Shipway will overwrite its stored mysql_admin_url/postgres_admin_url settings with the values below, even though they're already set, because SHIPWAY_ROTATE_DB_ADMIN=1 rotated a live admin credential during this run."
+  fi
+
   install -d -m 0750 -o deployer -g deployer /var/lib/shipway
   jq -n \
     --arg mysql_admin_url "$mysql_admin_url" \
@@ -684,6 +767,7 @@ write_bootstrap_file() {
     --arg base_domain "$BASE_DOMAIN" \
     --arg server_ip "$SERVER_IP" \
     --arg acme_email "$ACME_EMAIL" \
+    --argjson force_admin_urls "$force_admin_urls" \
     '{
       mysql_admin_url: $mysql_admin_url,
       postgres_admin_url: $postgres_admin_url,
@@ -692,7 +776,7 @@ write_bootstrap_file() {
       base_domain: $base_domain,
       server_ip: $server_ip,
       acme_email: $acme_email
-    }' > /var/lib/shipway/bootstrap.json
+    } + (if $force_admin_urls then {force_admin_urls: true} else {} end)' > /var/lib/shipway/bootstrap.json
 
   chown deployer:deployer /var/lib/shipway/bootstrap.json
   chmod 0600 /var/lib/shipway/bootstrap.json
@@ -793,9 +877,21 @@ create_a_record_if_missing() {
   fi
 
   log "creating DNS A record for ${name} -> ${SERVER_IP}"
-  cf_api -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
-    --data "$(jq -n --arg name "$name" --arg content "$SERVER_IP" '{type: "A", name: $name, content: $content, ttl: 300, proxied: false}')" \
-    > /dev/null
+  # Same two-step shape as the lookup above (curl-level failure dies clearly instead of being
+  # misread as success), plus a `.success` check the lookup doesn't need: Cloudflare's API can
+  # return HTTP 200 with `"success": false` and an `errors` array for a logically-failed request
+  # (bad zone, invalid record, rate limit, ...) — matching how the server's own
+  # CloudflareDnsClient.createARecord (server/src/services/cloudflare.ts) treats the same response.
+  # Discarding this to /dev/null with no check, as before, would silently treat that as success.
+  local create_response create_ok create_errors
+  create_response="$(cf_api -X POST "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+    --data "$(jq -n --arg name "$name" --arg content "$SERVER_IP" '{type: "A", name: $name, content: $content, ttl: 300, proxied: false}')" 2>/dev/null)" \
+    || die "Cloudflare API call failed while creating the DNS A record for ${name}. Check connectivity to api.cloudflare.com and that the token still has zone access, then re-run (already-created records are skipped, so this is safe to retry)."
+  create_ok="$(printf '%s' "$create_response" | jq -r '.success == true' 2>/dev/null || echo false)"
+  if [[ "$create_ok" != "true" ]]; then
+    create_errors="$(printf '%s' "$create_response" | jq -r '[.errors[]?.message] | join("; ")' 2>/dev/null || true)"
+    die "Cloudflare rejected creating the DNS A record for ${name} -> ${SERVER_IP}: ${create_errors:-$create_response}"
+  fi
 }
 
 configure_dns() {

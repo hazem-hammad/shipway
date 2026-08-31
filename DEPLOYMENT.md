@@ -32,7 +32,7 @@ Cloudflare's dashboard "Edit zone DNS" template (My Profile > API Tokens > Creat
 | A | `*` (i.e. `*.<base-domain>`) | your server's public IP | DNS only |
 | A | `@` (i.e. `<base-domain>` itself) | your server's public IP | DNS only |
 
-The wildcard is what makes every future project's `<slug>.<base-domain>` resolve without a manual DNS step per project. The apex record isn't served by anything Shipway installs today, but the installer checks that both resolve correctly before touching the system and will ask you to confirm if they don't, so create both to avoid that prompt. Cloudflare's own DNS propagates in seconds to a couple of minutes; give it a minute after creating these before running the installer.
+Every future project's `<slug>.<base-domain>` actually gets its own explicit `A` record — Shipway creates it through the Cloudflare API the moment you create the project (see "Creating the first project" below), and provisioning fails outright if that call fails, so a project's subdomain is never silently relying on the wildcard to resolve. What the wildcard record here is actually for: the installer's own preflight (`check_dns_resolution`) probes a throwaway `*.<base-domain>` hostname to confirm wildcard DNS is wired up correctly at Cloudflare before it touches the system, and warns (rather than fails) if it isn't yet. The apex record isn't served by anything Shipway installs today, but the installer checks that both resolve correctly before touching the system and will ask you to confirm if they don't, so create both to avoid that prompt. Cloudflare's own DNS propagates in seconds to a couple of minutes; give it a minute after creating these before running the installer.
 
 Shipway creates two more records itself during install, under the same zone: `ship.<base-domain>` (the dashboard) and `mail.<base-domain>` (the Mailpit web UI). You don't need to create those.
 
@@ -74,14 +74,14 @@ Typically **10 to 20 minutes**, mostly apt package installs and the Shipway buil
 3. Installs Node 18, 20, and 22 side by side under `/opt/node/<version>`, verifying each download's checksum against the official `SHASUMS256.txt` first.
 4. Installs Mailpit (the shared catch-all SMTP inbox) as its own systemd service, and protects its web UI with HTTP basic auth (random password, printed in the final summary).
 5. Installs certbot and requests one wildcard certificate for `*.<base-domain>` and `<base-domain>` via Cloudflare DNS-01. This does not need ports 80/443 open to the world, since it's a DNS challenge, not an HTTP one.
-6. Creates the `deployer` system user, its directories, the `shipway-sysops` root helper, and a sudoers policy that lets `deployer` run exactly the handful of commands Shipway needs (reload nginx/php-fpm, manage its own `shipway-*` systemd units) and nothing else.
+6. Creates the `deployer` system user, its directories, the `shipway-sysops` root helper, and a sudoers policy that lets `deployer` run exactly the handful of commands Shipway needs (reload nginx/php-fpm, manage its own `shipway-*` systemd units) and nothing else. Also installs and enables the `cron` service, since project cron schedules (Projects > a project > Cron) are written with the bare `crontab` command.
 7. Creates a `shipway_admin` MySQL user and Postgres role with random passwords.
 8. Builds Shipway itself into `/opt/shipway` and starts it as `shipway.service`.
 9. Renders the nginx vhosts for the dashboard and Mailpit's web UI, and reloads nginx.
 10. Creates the `ship.` and `mail.` DNS `A` records at Cloudflare.
 11. Runs a postflight check: confirms shipway, nginx, mysql, postgresql, redis-server, and mailpit are all active, then polls `https://ship.<base-domain>/api/health` (up to a minute) before printing a final summary with the dashboard URL, the Mailpit credentials, and where everything lives on disk.
 
-Re-running `install.sh` is safe: every step checks whether its work is already done before repeating it, generated passwords are cached in `/root/.shipway-install-secrets` so a re-run never rotates a credential something already depends on, and DNS records are looked up before being created so nothing gets duplicated.
+Re-running `install.sh` is safe: every step checks whether its work is already done before repeating it, generated passwords are cached in `/root/.shipway-install-secrets` so a re-run never rotates a credential something already depends on, and DNS records are looked up before being created so nothing gets duplicated. The one case that needs a deliberate decision instead of a silent one: if `/root/.shipway-install-secrets` itself is lost on a server that's already live, the installer refuses to guess — see "Lost `/root/.shipway-install-secrets` on an already-live server" under Troubleshooting.
 
 ## First-run setup wizard
 
@@ -130,13 +130,14 @@ Pulls the latest commit as `deployer`, rebuilds (`npm ci && npm run build`), and
 
 ## Backing up
 
-Three things matter. Back all three up together, they reference each other (encrypted values in the database are only readable with the matching key):
+Four things matter. Back them all up together, they reference each other (encrypted values in the database are only readable with the matching key):
 
 1. **`/var/lib/shipway/shipway.db`**, the SQLite database: users, projects, deployment history, audit log, encrypted env vars and SMTP config.
 2. **`/var/lib/shipway/secret.key`**, the encryption key for everything encrypted in that database. Without it, the encrypted env vars and SMTP passwords stored in the database are unrecoverable.
-3. **`/var/deploy/apps/<slug>/shared/`** for each project, this is what persists across releases: `.env` files, uploaded files, anything a project's `sharedPaths` config points at.
+3. **`/var/lib/shipway/session.key`**, the session cookie signing/encryption key. Restoring `shipway.db` without the matching `session.key` doesn't lose any data, but it silently invalidates every existing login session (everyone gets signed out).
+4. **`/var/deploy/apps/<slug>/shared/`** for each project, this is what persists across releases: `.env` files, uploaded files, anything a project's `sharedPaths` config points at.
 
-A simple approach that covers all of it:
+A simple approach that covers all four:
 
 ```bash
 sudo tar -czf shipway-backup-$(date +%Y%m%d).tar.gz \
@@ -149,6 +150,8 @@ sudo tar -czf shipway-backup-$(date +%Y%m%d).tar.gz \
 Copy that archive off the server. `shipway.db` is a live SQLite database under WAL mode; stopping `shipway.service` first (`sudo systemctl stop shipway`) gives you a guaranteed-consistent snapshot, though a live copy is normally fine too since better-sqlite3's WAL checkpoints are frequent.
 
 There is no built-in backup scheduler. Cron the command above, or point your existing backup tooling at those same paths.
+
+**Also worth backing up separately: `/root/.shipway-install-secrets`.** It isn't needed to restore Shipway itself — the same MySQL/Postgres/Redis/Mailpit credentials it caches also end up in Shipway's own settings once `bootstrap.json` is imported on first boot — but losing it on a server that's already live changes what a future `install.sh` re-run can safely do: with the file missing, the installer can no longer tell whether `shipway_admin`'s live MySQL/Postgres password matches what Shipway has stored, so it refuses to guess (see "Lost `/root/.shipway-install-secrets` on an already-live server" below) instead of silently rotating into a broken state. Keep a copy and that scenario never comes up. It's plaintext root-only (mode 0600) credentials, so store the copy at least as carefully as you'd store the rest of this backup (encrypted at rest off-server).
 
 ## Troubleshooting
 
@@ -178,12 +181,72 @@ sudo certbot renew --dry-run
 ```
 
 **Database credentials.**
-Reveal a project's database credentials from the dashboard (Databases > that database > reveal). The `shipway_admin` MySQL/Postgres credentials the installer created live only in Shipway's settings after the one-time bootstrap import; they are not written anywhere else on disk (the file the installer wrote them to, `bootstrap.json`, is deleted right after Shipway imports it on first boot).
+Reveal a project's database credentials from the dashboard (Databases > that database > reveal). The `shipway_admin` MySQL/Postgres credentials the installer created live only in Shipway's settings after the one-time bootstrap import; they are not written anywhere else on disk (the file the installer wrote them to, `bootstrap.json`, is deleted right after Shipway imports it on first boot) — except the install-time cache at `/root/.shipway-install-secrets`, which `install.sh` itself reads on every re-run (see below).
+
+**Lost `/root/.shipway-install-secrets` on an already-live server.**
+This file is a plaintext cache of the passwords `install.sh` generated (MySQL/Postgres/Redis/Mailpit admin credentials). If it's lost or replaced on a server that already has a working `shipway_admin` MySQL user / Postgres role, do **not** just re-run `install.sh` and hope: `provision_mysql_admin`/`provision_postgres_admin` in `setup/install.sh` detect exactly this — the account/role already exists, but the secrets file has no password cached for it — and refuse to guess by default, `die()`-ing with the two options below instead. The reason this needs a deliberate choice rather than the installer just doing the obvious thing: minting a brand-new random password is exactly right for a fresh install (nothing depends on the old one yet), but wrong here, because Shipway is already relying on the specific password it has stored in its own settings to connect as `shipway_admin` — pushing a different one live with `ALTER USER`/`ALTER ROLE` (which the installer always did unconditionally, on every re-run, before this fix) would silently break that connection, since Shipway's stored `mysql_admin_url`/`postgres_admin_url` settings are only ever filled in when unset, never overwritten, by default.
+
+*Option A — recover the real password without rotating anything (preferred).* Shipway already has the live, working password in its own settings table (plain JSON text, not encrypted — unlike env vars/SMTP passwords). Read it directly with the `better-sqlite3` dependency already vendored under `/opt/shipway/server/node_modules` (no new packages needed):
+
+```bash
+sudo /opt/node/22/bin/node -e "
+const Database = require('/opt/shipway/server/node_modules/better-sqlite3');
+const db = new Database('/var/lib/shipway/shipway.db', { readonly: true });
+for (const key of ['mysql_admin_url', 'postgres_admin_url']) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  console.log(key + ' = ' + (row ? JSON.parse(row.value) : '(not set)'));
+}
+"
+```
+
+Each printed URL is `mysql://shipway_admin:<password>@127.0.0.1:3306` / `postgres://shipway_admin:<password>@127.0.0.1:5432/postgres` — copy the password out of it and append matching lines to the secrets file (creating it if needed):
+
+```bash
+echo "MYSQL_ADMIN_PASSWORD=<password from mysql_admin_url>" | sudo tee -a /root/.shipway-install-secrets
+echo "POSTGRES_ADMIN_PASSWORD=<password from postgres_admin_url>" | sudo tee -a /root/.shipway-install-secrets
+sudo chmod 0600 /root/.shipway-install-secrets
+sudo ./setup/install.sh
+```
+
+That re-run is now a normal, safe no-op for these two accounts (the ALTER USER/ALTER ROLE just reasserts the same password), and every other step behaves exactly as any other re-run.
+
+*Option B — deliberately rotate the password instead.* If you'd rather not (or can't) recover the old one, re-run with `SHIPWAY_ROTATE_DB_ADMIN=1`:
+
+```bash
+sudo SHIPWAY_ROTATE_DB_ADMIN=1 ./setup/install.sh
+```
+
+This mints a fresh password, pushes it live with `ALTER USER`/`ALTER ROLE` as before, **and** writes `bootstrap.json` with `force_admin_urls: true`, which tells Shipway (on the restart this same run triggers) to overwrite its stored `mysql_admin_url`/`postgres_admin_url` settings to match — narrowly, only those two keys, nothing else you've configured in Settings is touched. Anything holding a connection open with the old password will need to reconnect. Only ever pass this flag deliberately; it's not needed for a normal install or a normal re-run.
 
 **Resetting the admin password.**
 There is no supported way to do this from within Shipway today: there's no "forgot password" flow, and the setup wizard's admin-creation step only runs once, before any user exists, so it can't be used to replace a lost password later. If you're still logged in as an owner or admin somewhere, use that session to invite a new admin (Settings > Team) rather than trying to recover the old password.
 
-If you're completely locked out (no active session, no other admin), the only honest option is direct database surgery: stop Shipway, use `sqlite3` to inspect `/var/lib/shipway/shipway.db`'s `users` table, and write a new argon2id password hash into the matching row using the same library Shipway itself uses (`argon2`, already a dependency under `/opt/shipway/server/node_modules`). This is not a supported, documented, or tested procedure, get it wrong and you can corrupt the database; take a backup of `shipway.db` first, and treat this as a last resort rather than a normal recovery path.
+If you're completely locked out (no active session, no other admin), the only honest option is direct database surgery. Ubuntu 24.04 minimal images and this installer don't ship the `sqlite3` CLI, so do this instead with the `better-sqlite3` and `argon2` packages already vendored under `/opt/shipway/server/node_modules` (the exact ones Shipway itself uses to store and verify passwords — `argon2.hash()` defaults to argon2id, matching `server/src/lib/passwords.ts`, and the `users` table's password column is `password_hash`):
+
+```bash
+sudo systemctl stop shipway
+sudo cp /var/lib/shipway/shipway.db /var/lib/shipway/shipway.db.bak-$(date +%Y%m%d)   # back it up first
+
+sudo /opt/node/22/bin/node -e "
+const argon2 = require('/opt/shipway/server/node_modules/argon2');
+const Database = require('/opt/shipway/server/node_modules/better-sqlite3');
+(async () => {
+  const email = 'admin@example.com';        // <-- the locked-out user's email
+  const newPassword = 'choose-a-strong-password'; // <-- the new password
+  const hash = await argon2.hash(newPassword);
+  const db = new Database('/var/lib/shipway/shipway.db');
+  const info = db.prepare('UPDATE users SET password_hash = ? WHERE email = ?').run(hash, email);
+  if (info.changes !== 1) {
+    throw new Error('expected to update exactly 1 row, updated ' + info.changes + ' — check the email and try again');
+  }
+  console.log('password updated for', email);
+})();
+"
+
+sudo systemctl start shipway
+```
+
+This is not a supported, documented (beyond this), or tested-in-CI procedure — get the `UPDATE` wrong and you can corrupt the database, which is why the command above refuses to proceed unless exactly one row matched. Treat it as a last resort rather than a normal recovery path; re-run the invite flow (Settings > Team, from another admin session) instead whenever that's an option.
 
 ## Non-interactive / unattended install
 
@@ -197,6 +260,7 @@ Every prompt `install.sh` asks can be answered via environment variables instead
 | `SHIPWAY_ACME_EMAIL` | "ACME/Let's Encrypt contact email" prompt | Yes, if unattended |
 | `SHIPWAY_NONINTERACTIVE=1` | The "DNS doesn't resolve yet, continue anyway? [y/N]" confirmation | No, only needed if DNS might not have propagated yet |
 | `SHIPWAY_REPO_URL` | Nothing to run from | Only if not running from inside a checkout (see below) |
+| `SHIPWAY_ROTATE_DB_ADMIN=1` | Nothing — it's not a normal-install variable | No. Only relevant when recovering from a lost `/root/.shipway-install-secrets` on an already-live server; see "Lost `/root/.shipway-install-secrets` on an already-live server" under Troubleshooting. Never set it for a routine unattended install. |
 
 A fully unattended run, from inside a checkout:
 
