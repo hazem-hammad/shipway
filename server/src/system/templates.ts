@@ -313,8 +313,14 @@ export function renderAppUnit(i: AppUnitInput): string {
     `Type=simple`,
     `User=deployer`,
     `WorkingDirectory=${i.appsDir}/${i.slug}/current`,
-    `Environment=PORT=${i.port}`,
     `EnvironmentFile=-${i.appsDir}/${i.slug}/shared/.env`,
+    // MUST come after `EnvironmentFile=`: systemd applies these in unit-file order, last one
+    // winning, and `PORT` is Shipway's to own, not the project's. It is the port the allocator
+    // reserved, the port `renderNginxVhost` proxies to, and the port the deploy health check
+    // waits on -- so a project that carries its own `PORT` in its env vars (a leftover from
+    // docker-compose, say) would otherwise bind somewhere nginx never routes and fail every
+    // deploy at the health check, with the app itself logging a perfectly healthy startup.
+    `Environment=PORT=${i.port}`,
     `ExecStart=/bin/bash -lc 'export PATH=${i.nodeBin}:$PATH && exec ${i.startCmd}'`,
     `Restart=always`,
     `RestartSec=3`,

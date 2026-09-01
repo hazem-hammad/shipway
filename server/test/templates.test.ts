@@ -312,6 +312,18 @@ describe('renderAppUnit', () => {
     expect(out).toContain('WantedBy=multi-user.target');
   });
 
+  // Order is load-bearing, not cosmetic: systemd applies `Environment=`/`EnvironmentFile=` in the
+  // order written, last one winning. With `Environment=PORT=` first, a project shipping its own
+  // `PORT=` in its env vars silently overrides the allocated port -- the app binds somewhere nginx
+  // does not proxy to, and every deploy fails the health check while the app logs a clean startup.
+  it('sets PORT after EnvironmentFile so a project-supplied PORT cannot override it', () => {
+    const lines = renderAppUnit(input).split('\n');
+    const envFile = lines.indexOf('EnvironmentFile=-/var/deploy/apps/api/shared/.env');
+    const port = lines.indexOf('Environment=PORT=3007');
+    expect(envFile).toBeGreaterThan(-1);
+    expect(port).toBeGreaterThan(envFile);
+  });
+
   it('validates the slug', () => {
     expect(() => renderAppUnit({ ...input, slug: 'UPPER' })).toThrow();
   });
