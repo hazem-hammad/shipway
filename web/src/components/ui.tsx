@@ -848,18 +848,46 @@ export function Chip({ children }: { children: ReactNode }) {
  * `multiline` value keeps its line breaks on screen (an `.env` block); anything else is a single
  * truncated line.
  */
-export function CopyRow({ label, value, multiline = false }: { label: string; value: string; multiline?: boolean }) {
+/**
+ * Clipboard write plus a 1.5s "copied" flag, shared by both copy affordances. A failed write is
+ * swallowed on purpose: the Clipboard API is unavailable over plain http and can be denied outright,
+ * and in either case the value is still on screen to copy by hand — an error toast would add nothing.
+ */
+function useCopyAction(value: string): { copied: boolean; copy: () => void } {
   const [copied, setCopied] = useState(false);
 
-  async function handleCopy() {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard API unavailable or denied — the value is still visible to copy by hand.
-    }
-  }
+  return {
+    copied,
+    copy: () => {
+      void navigator.clipboard
+        .writeText(value)
+        .then(() => {
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        })
+        .catch(() => {});
+    },
+  };
+}
+
+/** Icon-only copy button, for a value that already reads as itself (a domain, an IP). */
+export function CopyIconButton({ value, label, className = '' }: { value: string; label: string; className?: string }) {
+  const { copied, copy } = useCopyAction(value);
+
+  return (
+    <button
+      type="button"
+      onClick={copy}
+      aria-label={copied ? 'Copied' : label}
+      className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg text-icon transition-colors duration-150 ease-out hover:bg-surface-3 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus ${className}`}
+    >
+      {copied ? <Check size={15} strokeWidth={2.25} aria-hidden /> : <Copy size={15} strokeWidth={ICON_STROKE} aria-hidden />}
+    </button>
+  );
+}
+
+export function CopyRow({ label, value, multiline = false }: { label: string; value: string; multiline?: boolean }) {
+  const { copied, copy } = useCopyAction(value);
 
   return (
     <div className={`flex justify-between gap-3 rounded-lg bg-surface px-3 py-2.5 ${multiline ? 'items-start' : 'items-center'}`}>
@@ -873,7 +901,7 @@ export function CopyRow({ label, value, multiline = false }: { label: string; va
       </div>
       <button
         type="button"
-        onClick={() => void handleCopy()}
+        onClick={copy}
         className="inline-flex shrink-0 items-center gap-1.5 rounded px-2 py-1 text-xs font-medium text-soft transition-colors duration-150 ease-out hover:bg-surface-2 hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
       >
         {copied ? <Check size={14} strokeWidth={ICON_STROKE} aria-hidden /> : <Copy size={14} strokeWidth={ICON_STROKE} aria-hidden />}

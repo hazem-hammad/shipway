@@ -7,7 +7,7 @@
  * carried over from the v1 page) is to also set the env (if any was pasted) and kick off the first
  * deploy, then land the user on that deployment's live log.
  */
-import { Fragment, type FormEvent, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, type FormEvent, type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
 import {
@@ -89,6 +89,7 @@ import {
   CardHeader,
   Checkbox,
   Combobox,
+  CopyIconButton,
   Field,
   ICON_STROKE,
   IconChip,
@@ -2457,12 +2458,31 @@ function ConfigureRail({
       />
 
       <Card>
-        <CardHeader icon={<Rocket size={20} strokeWidth={ICON_STROKE} />} title="Deploy summary" />
-        <div className="mt-3 flex flex-col gap-0.5">
-          <SummaryRow label="Domain" value={domain} mono />
-          <SummaryRow label="Framework" value={TYPE_LABEL[type]} />
-          <SummaryRow label="Build command" value={buildCmd || 'none'} mono />
-          <SummaryRow label="Database" value={database ? `${DB_ENGINE_LABEL[database.engine]} · ${database.name}` : 'none'} mono={database !== null} />
+        <CardHeader icon={<Rocket size={20} strokeWidth={ICON_STROKE} />} title="Deploy summary" description="What Deploy will create" />
+        <div className="mt-4 flex flex-col">
+          <SummaryRow icon={<Globe size={15} strokeWidth={ICON_STROKE} />} label="Domain" value={domain} mono />
+          <SummaryRow
+            icon={<GitBranch size={15} strokeWidth={ICON_STROKE} />}
+            label="Branch"
+            value={source?.branch || 'not set'}
+            mono={Boolean(source?.branch)}
+            muted={!source?.branch}
+          />
+          <SummaryRow icon={<TypeIcon type={type} size={15} />} label="Framework" value={TYPE_LABEL[type]} />
+          <SummaryRow
+            icon={<Terminal size={15} strokeWidth={ICON_STROKE} />}
+            label="Build command"
+            value={buildCmd || 'none'}
+            mono={buildCmd !== ''}
+            muted={buildCmd === ''}
+          />
+          <SummaryRow
+            icon={<Database size={15} strokeWidth={ICON_STROKE} />}
+            label="Database"
+            value={database ? `${DB_ENGINE_LABEL[database.engine]} · ${database.name}` : 'none'}
+            mono={database !== null}
+            muted={database === null}
+          />
         </div>
       </Card>
 
@@ -2583,59 +2603,95 @@ function DomainCard({
   dnsResult: DnsOutcome | null;
   domainCardRef: RefObject<HTMLDivElement | null>;
 }) {
+  const dnsTone = dnsResult === null ? null : dnsResultTone(dnsResult);
+
   return (
     <div ref={domainCardRef}>
       <Card>
-        <CardHeader icon={<Globe size={20} strokeWidth={ICON_STROKE} />} title="Domain" />
+        <CardHeader icon={<Globe size={20} strokeWidth={ICON_STROKE} />} title="Domain" description="Where this project will be reachable" />
 
-        <div className="mt-3 flex flex-col gap-3">
+        <div className="mt-4 flex flex-col gap-3">
+          {/* The URL itself, given the weight the card's title promises — it is the one thing on
+              this card a user wants to read back, and the one thing worth copying. */}
           {!settingsSettled ? (
-            <Skeleton className="h-10 w-full" />
-          ) : serverIpMissing ? (
-            <p className="text-sm text-soft">
-              Set the server IP in{' '}
-              <Link href="/settings/general" className="font-medium text-link hover:underline">
-                Settings &gt; General
-              </Link>{' '}
-              before Shipway can create a DNS record for this project.
-            </p>
+            <Skeleton className="h-14 w-full" />
           ) : (
-            <p className="rounded-xl bg-surface-2 px-3.5 py-2.5 font-mono text-sm text-ink">
-              A &nbsp;&nbsp; {domain} &nbsp;&nbsp; &rarr; &nbsp;&nbsp; {serverIp}
-            </p>
+            <div className="flex items-center gap-2.5 rounded-xl border border-line bg-surface-2 py-2.5 pr-2 pl-3.5">
+              <Lock size={15} strokeWidth={ICON_STROKE} aria-hidden className="shrink-0 text-icon" />
+              <p className="min-w-0 flex-1 truncate font-mono text-sm text-ink" title={domain}>
+                <span className="text-faint">https://</span>
+                <span className="font-medium">{domain}</span>
+              </p>
+              <CopyIconButton value={`https://${domain}`} label="Copy project URL" />
+            </div>
           )}
 
-          {dnsResult ? (
-            <div className={`rounded-xl px-4 py-3 text-sm ${DNS_RESULT_TONE_CLASSES[dnsResultTone(dnsResult)]}`}>{dnsResultLine(dnsResult)}</div>
+          {/* The A record, as a record: three labelled fields rather than one run-on mono line, so
+              it can be read (and retyped into another DNS provider) field by field. */}
+          {!settingsSettled ? (
+            <Skeleton className="h-28 w-full" />
+          ) : serverIpMissing ? (
+            <div className="rounded-xl border border-line bg-surface-2 px-4 py-3">
+              <p className="text-sm text-soft">
+                Set the server IP in{' '}
+                <Link href="/settings/general" className="font-medium text-link hover:underline">
+                  Settings &gt; General
+                </Link>{' '}
+                before Shipway can create a DNS record for this project.
+              </p>
+            </div>
           ) : (
-            <>
-              <div>
-                <Badge tone={cloudflare.tone}>{cloudflare.label}</Badge>
+            <div className="rounded-xl border border-line bg-surface-2 p-3">
+              <div className="flex items-center justify-between gap-2 px-0.5">
+                <span className="section-label">DNS record</span>
+                {dnsResult === null && <Badge tone={cloudflare.tone}>{cloudflare.label}</Badge>}
               </div>
+              <dl className="mt-2.5 flex flex-col gap-1.5">
+                <DnsRecordField label="Type" value="A" />
+                <DnsRecordField label="Name" value={domain} />
+                <DnsRecordField label="Value" value={serverIp ?? ''} />
+              </dl>
+            </div>
+          )}
 
-              {settingsSettled && !cloudflare.pending && !dnsReady && (
-                <div className="rounded-xl border border-line bg-surface-2 px-4 py-3">
-                  <p className="text-sm text-soft">
-                    {serverIpMissing ? (
-                      'No DNS record will be created until the server IP is set.'
-                    ) : (
-                      <>
-                        Cloudflare isn&rsquo;t connected, so no DNS record will be created for this project.{' '}
-                        <Link href="/settings/cloudflare" className="font-medium text-link hover:underline">
-                          Connect Cloudflare &rarr;
-                        </Link>
-                      </>
-                    )}
-                  </p>
-                  <Checkbox
-                    className="mt-3"
-                    checked={createAnyway}
-                    onChange={onCreateAnywayChange}
-                    label="Create anyway without a DNS record"
-                  />
-                </div>
-              )}
-            </>
+          {dnsResult !== null && dnsTone !== null ? (
+            <div className={`flex items-start gap-2.5 rounded-xl px-4 py-3 text-sm ${DNS_RESULT_TONE_CLASSES[dnsTone]}`}>
+              <span aria-hidden className="mt-px shrink-0">
+                {dnsTone === 'ok' ? (
+                  <Check size={16} strokeWidth={2.25} />
+                ) : dnsTone === 'danger' ? (
+                  <X size={16} strokeWidth={2.25} />
+                ) : (
+                  <Minus size={16} strokeWidth={2.25} />
+                )}
+              </span>
+              <span className="min-w-0">{dnsResultLine(dnsResult)}</span>
+            </div>
+          ) : (
+            settingsSettled &&
+            !cloudflare.pending &&
+            !dnsReady && (
+              <div className="rounded-xl border border-warn/30 bg-warn/5 px-4 py-3">
+                <p className="text-sm text-soft">
+                  {serverIpMissing ? (
+                    'No DNS record will be created until the server IP is set.'
+                  ) : (
+                    <>
+                      Cloudflare isn&rsquo;t connected, so no DNS record will be created for this project.{' '}
+                      <Link href="/settings/cloudflare" className="font-medium text-link hover:underline">
+                        Connect Cloudflare &rarr;
+                      </Link>
+                    </>
+                  )}
+                </p>
+                <Checkbox
+                  className="mt-3"
+                  checked={createAnyway}
+                  onChange={onCreateAnywayChange}
+                  label="Create anyway without a DNS record"
+                />
+              </div>
+            )
           )}
         </div>
       </Card>
@@ -2643,11 +2699,57 @@ function DomainCard({
   );
 }
 
-function SummaryRow({ label, value, mono = false }: { label: string; value: string; mono?: boolean }) {
+/** The framework's own brand mark (same marks as the type tiles), at summary-row scale. */
+function TypeIcon({ type, size }: { type: ProjectType; size: number }) {
+  const option = TYPE_OPTIONS.find((candidate) => candidate.value === type);
+  if (!option) return null;
+  return <option.Icon size={size} />;
+}
+
+/** One field of the A record: a fixed-width micro label with the value in mono beside it. */
+function DnsRecordField({ label, value }: { label: string; value: string }) {
   return (
-    <div className="flex items-center justify-between gap-3 px-1 py-1.5">
-      <span className="text-sm text-soft">{label}</span>
-      <span className={`min-w-0 truncate text-right text-sm font-medium text-ink ${mono ? 'font-mono' : ''}`}>{value}</span>
+    <div className="flex items-baseline gap-3 px-0.5">
+      <dt className="section-label w-11 shrink-0">{label}</dt>
+      <dd className="min-w-0 flex-1 truncate font-mono text-sm text-ink" title={value}>
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+/**
+ * One line of the Deploy summary: icon + label on the left, the value right-aligned, hairline
+ * between rows. `muted` renders a value that is an absence ("none") in the faint tone, so a glance
+ * down the card separates what was configured from what wasn't.
+ */
+function SummaryRow({
+  icon,
+  label,
+  value,
+  mono = false,
+  muted = false,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  mono?: boolean;
+  muted?: boolean;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-line py-2.5 last:border-b-0 last:pb-0 first:pt-0">
+      <span className="flex min-w-0 shrink-0 items-center gap-2 text-sm text-soft">
+        <span aria-hidden className="grid h-5 w-5 shrink-0 place-items-center text-icon">
+          {icon}
+        </span>
+        {label}
+      </span>
+      <span
+        title={value}
+        className={`min-w-0 truncate text-right text-sm ${muted ? 'text-faint' : 'font-medium text-ink'} ${mono ? 'font-mono' : ''}`}
+      >
+        {value}
+      </span>
     </div>
   );
 }
