@@ -29,8 +29,14 @@ export interface GithubRepo {
 /** Refresh the cached installation token once fewer than this many ms remain until expiry. */
 const TOKEN_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 
-/** Hard cap on branches returned by `listBranches`, applied across paginated pages. */
-const MAX_BRANCHES = 200;
+/**
+ * Hard cap on branches returned by `listBranches`, applied across paginated pages. Deliberately
+ * high: the branch picker is a search box over the whole list, so a repo silently missing the
+ * branch someone is looking for is a worse failure than a handful of extra API pages. At the
+ * maximum page size this is 10 requests against a repo that actually has that many branches;
+ * almost every repo answers in one.
+ */
+const MAX_BRANCHES = 1000;
 
 const BRANCHES_PAGE_SIZE = 100;
 

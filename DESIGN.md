@@ -77,6 +77,8 @@ Inner list rows: `--surface-2` `rounded-xl` rows (e.g. GitHub account row) with 
 ### Forms
 Label 13.5px/500 above; input 44px, `rounded-xl`, border `--border`, bg `--surface` (nested contexts: `--surface-2`), focus ring as above; helper text 13px `--text-soft` below; mono placeholders for tokens. Toggles: 44×24 pill, ON = `--text` (near-black; dark: white), knob white (dark: black). Checkboxes `rounded-md`.
 
+**Combobox** (searchable dropdown, `Combobox` in `ui.tsx`): used in place of a native `<select>` wherever the list can run long — the New Project branch pickers, above all. Trigger looks exactly like an input (44px, `rounded-xl`, optional leading icon, chevron that flips when open); the panel is our own popover — `rounded-xl`, `--surface`, `--border`, `shadow-lg`, offset 6px — with a `Search` field on top, rows of 36px `rounded-lg` (hover/keyboard-active `--surface-2`, selected in 500 with a `Check` at the right), a scrolling list capped at 256px, and a hairline footer counting matches ("12 of 340 branches"). Filtering ranks prefix matches first; Arrow/Home/End/Enter/Escape all work, and the list closes on an outside click. With `allowCustom`, text matching nothing is offered as its own row ("Use this branch") so a hand-typed value still commits.
+
 ### Tables & lists
 Prefer borderless rows separated by `--border` hairlines inside a card; row hover `--surface-2`; 56px row height; first cell often icon chip + name; right-aligned meta (relative time, chevron `ArrowRight` ghosted).
 

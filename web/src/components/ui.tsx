@@ -3,17 +3,18 @@
  * composes these instead of reinventing them: buttons, fields, toggles, cards with icon-squircle
  * headers, badges, status dots, tabs, skeletons, empty states.
  */
-import { useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
+  KeyboardEvent,
   ReactNode,
   Ref,
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from 'react';
 import { Link } from 'wouter';
-import { Check, ChevronDown, Copy, GitBranch, LoaderCircle, Lock } from 'lucide-react';
+import { Check, ChevronDown, Copy, GitBranch, LoaderCircle, Lock, Search, X } from 'lucide-react';
 
 /** DESIGN.md iconography: lucide, strokeWidth 1.75, size 20 (18 in dense rows). */
 export const ICON_STROKE = 1.75;
@@ -186,17 +187,270 @@ export function Select({ mono = false, className = '', children, ...rest }: Sele
   );
 }
 
+// ---------------------------------------------------------------------------
+// Combobox — searchable dropdown, replacing the browser's native <select> where
+// the list can be long (branches, above all). A native select renders the OS's
+// own list: no filtering, no styling, and unusable once a repo has a few dozen
+// branches. This one is our own popover: a search field, keyboard navigation,
+// and the full list scrolled in-place.
+// ---------------------------------------------------------------------------
+
+export interface ComboboxProps {
+  value: string;
+  options: string[];
+  onChange: (value: string) => void;
+  /** Machine-ish values (branch names) render in IBM Plex Mono per DESIGN.md. */
+  mono?: boolean;
+  /** Rendered at the left of the trigger and of every row (a `GitBranch`, typically). */
+  icon?: ReactNode;
+  placeholder?: string;
+  searchPlaceholder?: string;
+  /** Word for one row, used in the search placeholder and the empty state ("branch"). */
+  noun?: string;
+  /**
+   * Lets the typed text be committed as the value even when it matches nothing in `options` — for
+   * a remote whose listing is incomplete (or stale), where a hand-typed ref still deploys fine.
+   */
+  allowCustom?: boolean;
+  disabled?: boolean;
+  id?: string;
+  className?: string;
+}
+
+export function Combobox({
+  value,
+  options,
+  onChange,
+  mono = false,
+  icon,
+  placeholder = 'Select…',
+  searchPlaceholder,
+  noun = 'option',
+  allowCustom = false,
+  disabled = false,
+  id,
+  className = '',
+}: ComboboxProps) {
+  const [open, setOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [activeIndex, setActiveIndex] = useState(0);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const generatedId = useId();
+  const listId = `${id ?? generatedId}-list`;
+
+  const trimmedQuery = query.trim();
+  const matches = useMemo(() => {
+    if (trimmedQuery === '') return options;
+    const needle = trimmedQuery.toLowerCase();
+    // Prefix matches first, then anything containing the query — typing "rel" should reach
+    // `release/2.1` before `hotfix/prerelease`, which is what a branch search is usually after.
+    const prefix: string[] = [];
+    const rest: string[] = [];
+    for (const option of options) {
+      const haystack = option.toLowerCase();
+      if (haystack.startsWith(needle)) prefix.push(option);
+      else if (haystack.includes(needle)) rest.push(option);
+    }
+    return [...prefix, ...rest];
+  }, [options, trimmedQuery]);
+
+  // The typed text as its own row, offered only when it isn't already one of the matches.
+  const customValue = allowCustom && trimmedQuery !== '' && !matches.includes(trimmedQuery) ? trimmedQuery : null;
+  const rows = customValue === null ? matches : [...matches, customValue];
+
+  // Every reopen and every keystroke lands the highlight on the row Enter should take: the current
+  // value when the list is untouched, otherwise the best match at the top.
+  useEffect(() => {
+    if (!open) return;
+    const selectedIndex = rows.indexOf(value);
+    setActiveIndex(trimmedQuery === '' && selectedIndex >= 0 ? selectedIndex : 0);
+    // `rows` is derived from the query, so keying off the query keeps this to one run per keystroke.
+  }, [open, trimmedQuery]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Close on an outside click or on Escape — the two ways a popover is expected to go away.
+  useEffect(() => {
+    if (!open) return;
+    function onPointerDown(event: MouseEvent) {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    }
+    document.addEventListener('mousedown', onPointerDown);
+    return () => document.removeEventListener('mousedown', onPointerDown);
+  }, [open]);
+
+  useEffect(() => {
+    if (open) searchRef.current?.focus();
+    else setQuery('');
+  }, [open]);
+
+  // Keep the highlighted row in view while arrowing through a list taller than the panel.
+  useEffect(() => {
+    if (!open) return;
+    listRef.current?.querySelector<HTMLElement>('[data-active="true"]')?.scrollIntoView({ block: 'nearest' });
+  }, [open, activeIndex]);
+
+  function commit(next: string) {
+    onChange(next);
+    setOpen(false);
+  }
+
+  function onKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.key === 'Escape') {
+      if (open) {
+        event.stopPropagation();
+        setOpen(false);
+      }
+      return;
+    }
+    if (!open) {
+      if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        setOpen(true);
+      }
+      return;
+    }
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+      event.preventDefault();
+      if (rows.length === 0) return;
+      const delta = event.key === 'ArrowDown' ? 1 : -1;
+      setActiveIndex((current) => (current + delta + rows.length) % rows.length);
+      return;
+    }
+    if (event.key === 'Home' || event.key === 'End') {
+      event.preventDefault();
+      setActiveIndex(event.key === 'Home' ? 0 : rows.length - 1);
+      return;
+    }
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      const picked = rows[activeIndex];
+      if (picked !== undefined) commit(picked);
+      return;
+    }
+    if (event.key === 'Tab') {
+      setOpen(false);
+    }
+  }
+
+  const monoClass = mono ? 'font-mono text-sm' : '';
+
+  return (
+    <div ref={rootRef} className={`relative ${className}`} onKeyDown={onKeyDown}>
+      <button
+        type="button"
+        id={id}
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-controls={open ? listId : undefined}
+        onClick={() => setOpen((current) => !current)}
+        className={`${FIELD_CLASSES} flex items-center gap-2 pr-9 text-left ${open ? 'ring-2 ring-focus' : ''}`}
+      >
+        {icon && <span className="shrink-0 text-icon">{icon}</span>}
+        <span className={`min-w-0 flex-1 truncate ${value === '' ? 'text-faint' : 'text-ink'} ${monoClass}`}>
+          {value === '' ? placeholder : value}
+        </span>
+        <ChevronDown
+          size={16}
+          strokeWidth={ICON_STROKE}
+          aria-hidden
+          className={`pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-icon transition-transform duration-150 ${
+            open ? 'rotate-180' : ''
+          }`}
+        />
+      </button>
+
+      {open && (
+        <div className="absolute z-30 mt-1.5 w-full overflow-hidden rounded-xl border border-line bg-surface shadow-lg">
+          <div className="flex items-center gap-2 border-b border-line px-3">
+            <Search size={15} strokeWidth={ICON_STROKE} aria-hidden className="shrink-0 text-icon" />
+            <input
+              ref={searchRef}
+              value={query}
+              onChange={(event) => setQuery(event.target.value)}
+              placeholder={searchPlaceholder ?? `Search ${noun}s…`}
+              aria-label={`Search ${noun}s`}
+              aria-controls={listId}
+              className="h-10 w-full bg-transparent text-sm text-ink placeholder:text-faint focus-visible:outline-none"
+            />
+            {query !== '' && (
+              <button
+                type="button"
+                aria-label="Clear search"
+                onClick={() => {
+                  setQuery('');
+                  searchRef.current?.focus();
+                }}
+                className="shrink-0 rounded-md p-1 text-icon hover:bg-surface-2"
+              >
+                <X size={14} strokeWidth={ICON_STROKE} />
+              </button>
+            )}
+          </div>
+
+          <div ref={listRef} id={listId} role="listbox" className="max-h-64 overflow-y-auto p-1.5">
+            {rows.length === 0 ? (
+              <p className="px-2.5 py-6 text-center text-sm text-soft">No {noun} matches “{trimmedQuery}”.</p>
+            ) : (
+              rows.map((option, index) => {
+                const selected = option === value;
+                const active = index === activeIndex;
+                return (
+                  <button
+                    key={option}
+                    type="button"
+                    role="option"
+                    aria-selected={selected}
+                    data-active={active}
+                    onMouseEnter={() => setActiveIndex(index)}
+                    onClick={() => commit(option)}
+                    className={`flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left transition-colors duration-100 ${
+                      active ? 'bg-surface-2' : ''
+                    }`}
+                  >
+                    {icon && <span className="shrink-0 text-icon">{icon}</span>}
+                    <span className={`min-w-0 flex-1 truncate text-sm ${selected ? 'font-medium text-ink' : 'text-ink'} ${monoClass}`}>
+                      {option}
+                    </span>
+                    {option === customValue && <span className="shrink-0 text-[12.5px] text-soft">Use this {noun}</span>}
+                    {selected && <Check size={15} strokeWidth={2.25} aria-hidden className="shrink-0 text-ink" />}
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {options.length > 0 && (
+            <div className="border-t border-line px-3 py-2 text-[12.5px] text-soft">
+              {trimmedQuery === ''
+                ? `${options.length} ${noun}${options.length === 1 ? '' : 's'}`
+                : `${matches.length} of ${options.length} ${noun}${options.length === 1 ? '' : 's'}`}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export interface FieldProps {
   label: string;
   hint?: string;
   error?: string;
+  /**
+   * `div` for controls that aren't a single labelable element — a `Combobox`, whose trigger button
+   * and popover (search field included) would otherwise be nested inside a `<label>`, where a click
+   * anywhere in the field gets forwarded to the popover's input.
+   */
+  as?: 'label' | 'div';
   children: ReactNode;
 }
 
 /** Label (13.5px/500) above the control, helper/error line below (DESIGN.md Forms). */
-export function Field({ label, hint, error, children }: FieldProps) {
+export function Field({ label, hint, error, as: Wrapper = 'label', children }: FieldProps) {
   return (
-    <label className="flex flex-col gap-1.5">
+    <Wrapper className="flex flex-col gap-1.5">
       <span className="text-sm font-medium text-ink">{label}</span>
       {children}
       {error ? (
@@ -204,7 +458,7 @@ export function Field({ label, hint, error, children }: FieldProps) {
       ) : hint ? (
         <span className="text-[13px] text-soft">{hint}</span>
       ) : null}
-    </label>
+    </Wrapper>
   );
 }
 

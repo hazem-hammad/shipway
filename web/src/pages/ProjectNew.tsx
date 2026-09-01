@@ -88,6 +88,7 @@ import {
   Card,
   CardHeader,
   Checkbox,
+  Combobox,
   Field,
   ICON_STROKE,
   IconChip,
@@ -2694,14 +2695,16 @@ function GitUrlBranchField({ repoUrl, branch, onChange }: { repoUrl: string; bra
   const options = branches.includes(branch) ? branches : [branch, ...branches];
 
   return (
-    <Field label="Branch">
-      <Select mono value={branch} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </Select>
+    <Field label="Branch" as="div" hint={`${branches.length} ${branches.length === 1 ? 'branch' : 'branches'} on this remote — type to search.`}>
+      <Combobox
+        mono
+        noun="branch"
+        allowCustom
+        icon={<GitBranch size={15} strokeWidth={ICON_STROKE} />}
+        value={branch}
+        options={options}
+        onChange={onChange}
+      />
     </Field>
   );
 }
@@ -2720,17 +2723,19 @@ function GithubBranchField({ repo, branch, onChange }: { repo: string; branch: s
     );
   }
 
-  const options = branchesQuery.data?.includes(branch) ? branchesQuery.data : [branch, ...(branchesQuery.data ?? [])];
+  const branches = branchesQuery.data ?? [];
+  const options = branches.includes(branch) ? branches : [branch, ...branches];
 
   return (
-    <Field label="Branch">
-      <Select mono value={branch} onChange={(event) => onChange(event.target.value)}>
-        {options.map((option) => (
-          <option key={option} value={option}>
-            {option}
-          </option>
-        ))}
-      </Select>
+    <Field label="Branch" as="div" hint={`${branches.length} ${branches.length === 1 ? 'branch' : 'branches'} in this repo — type to search.`}>
+      <Combobox
+        mono
+        noun="branch"
+        icon={<GitBranch size={15} strokeWidth={ICON_STROKE} />}
+        value={branch}
+        options={options}
+        onChange={onChange}
+      />
     </Field>
   );
 }
