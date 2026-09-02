@@ -27,6 +27,7 @@ import { githubRoutes } from './routes/github.js';
 import { mailRoutes } from './routes/mail.js';
 import { projectNotificationRoutes } from './routes/projectnotifications.js';
 import { overviewRoutes } from './routes/overview.js';
+import { folderRoutes } from './routes/folders.js';
 import { projectRoutes } from './routes/projects.js';
 import { serverRoutes } from './routes/server.js';
 import { settingsRoutes } from './routes/settings.js';
@@ -443,6 +444,7 @@ export async function buildApp(
   await app.register(mailRoutes);
   await app.register(gitRoutes);
   await app.register(githubRoutes, { fetchImpl: deps.fetchImpl, stateTtlMs: deps.githubStateTtlMs });
+  await app.register(folderRoutes);
   await app.register(projectRoutes);
   await app.register(deploymentRoutes);
   await app.register(dbConnectionRoutes);

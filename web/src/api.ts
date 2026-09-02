@@ -327,6 +327,9 @@ export interface Project {
   authEnabled: boolean;
   authUser: string | null;
   authPasswordSet: boolean;
+  /** Which folder the project is filed under (`Folder.id`), or `null` for ungrouped. Grouping only
+   * — it has no bearing on who can see the project. */
+  folderId: number | null;
   createdAt: number;
 }
 
@@ -359,6 +362,8 @@ export interface CreateProjectBody {
   postDeployScript?: string;
   healthCheckPath?: string | null;
   autoDeploy?: boolean;
+  /** Files the project into a folder as it is created; omitted (or null) leaves it ungrouped. */
+  folderId?: number | null;
 }
 
 /**
@@ -411,10 +416,47 @@ export interface PatchProjectBody {
   authUser?: string;
   /** Write-only. Omit to leave an already-stored password unchanged. */
   authPassword?: string;
+  /** `null` takes the project out of whatever folder it is in. */
+  folderId?: number | null;
 }
 
 export function patchProject(id: number, body: PatchProjectBody): Promise<Project> {
   return apiFetch<Project>(`/api/projects/${String(id)}`, { method: 'PATCH', body });
+}
+
+// ---------------------------------------------------------------------------
+// Folders
+// ---------------------------------------------------------------------------
+
+/**
+ * A group of projects that make up one product — "brandspace" being a backend, a dashboard and a
+ * website. `projectCount` is scoped to what the caller can see, so it matches what the folder
+ * actually opens to rather than reporting rows they'd be 404'd on.
+ */
+export interface Folder {
+  id: number;
+  name: string;
+  /** Stable across renames — it is the `?folder=` in every link already shared. */
+  slug: string;
+  projectCount: number;
+  createdAt: number;
+}
+
+export function fetchFolders(): Promise<Folder[]> {
+  return apiFetch<Folder[]>('/api/folders');
+}
+
+export function createFolder(name: string): Promise<Folder> {
+  return apiFetch<Folder>('/api/folders', { method: 'POST', body: { name } });
+}
+
+export function renameFolder(id: number, name: string): Promise<Folder> {
+  return apiFetch<Folder>(`/api/folders/${String(id)}`, { method: 'PATCH', body: { name } });
+}
+
+/** The projects inside are emptied out to ungrouped, never deleted. */
+export function deleteFolder(id: number): Promise<void> {
+  return apiFetch<void>(`/api/folders/${String(id)}`, { method: 'DELETE' });
 }
 
 /** What moving a project to another subdomain did on the host — the DNS side of

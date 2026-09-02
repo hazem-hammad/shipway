@@ -21,9 +21,21 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { Link, useLocation, useSearch } from 'wouter';
 import { useQueryClient } from '@tanstack/react-query';
-import { ArrowDown, ArrowRight, ArrowUp, ExternalLink, GitBranch, Plus, Search } from 'lucide-react';
-import { ApiError, deployProject, type DeploymentStatus, type LastDeployment, type ProjectListItem, type ProjectType } from '../api';
-import { useProjects, useSettings } from '../hooks';
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, ExternalLink, Folder as FolderIcon, FolderPlus, GitBranch, Plus, Search } from 'lucide-react';
+import {
+  ApiError,
+  createFolder,
+  deleteFolder,
+  deployProject,
+  patchProject,
+  renameFolder,
+  type DeploymentStatus,
+  type Folder,
+  type LastDeployment,
+  type ProjectListItem,
+  type ProjectType,
+} from '../api';
+import { useFolders, useIsAdmin, useProjects, useSettings } from '../hooks';
 import { formatRelativeTime, shortSha } from '../lib/format';
 import { projectDomain } from '../../../server/src/lib/domain.js';
 import {
@@ -34,8 +46,10 @@ import {
   Chip,
   EmptyState,
   ICON_STROKE,
+  IconChip,
   Input,
   PageHeader,
+  SectionLabel,
   Select,
   Skeleton,
   StatusDot,
@@ -107,9 +121,16 @@ interface View {
   type: TypeFilter;
   sort: SortKey;
   dir: SortDir;
+  /**
+   * The open folder's slug, `''` for the top level. In the query string with the rest of the view
+   * because it is the same kind of thing — a link that opens the page already narrowed — but it is
+   * NAVIGATION rather than a filter: it doesn't count toward `viewNarrows`, and Clear leaves it
+   * alone, because clearing filters inside a folder should not also throw you out of the folder.
+   */
+  folder: string;
 }
 
-const DEFAULT_VIEW: View = { q: '', status: 'all', type: 'all', sort: 'deployed', dir: 'desc' };
+const DEFAULT_VIEW: View = { q: '', status: 'all', type: 'all', sort: 'deployed', dir: 'desc', folder: '' };
 
 const STATUS_TABS: { id: StatusFilter; label: string }[] = [
   { id: 'all', label: 'All' },
@@ -153,6 +174,7 @@ const COLUMNS: Column[] = [
   { id: 'project', label: 'Project', sort: 'name', defaultDir: 'asc' },
   { id: 'branch', label: 'Branch', showFrom: 'lg' },
   { id: 'runtime', label: 'Runtime', sort: 'type', defaultDir: 'asc', showFrom: 'md' },
+  { id: 'folder', label: 'Folder', showFrom: 'lg' },
   { id: 'deploy', label: 'Last deploy', sort: 'deployed', defaultDir: 'desc' },
   { id: 'created', label: 'Created', sort: 'created', defaultDir: 'desc', showFrom: 'xl' },
   { id: 'actions', label: '', align: 'right' },
@@ -187,6 +209,7 @@ function parseView(search: string): View {
   const dir = params.get('dir') ?? '';
   return {
     q: params.get('q') ?? '',
+    folder: params.get('folder') ?? '',
     status: isStatusFilter(status) ? status : DEFAULT_VIEW.status,
     type: isTypeFilter(type) ? type : DEFAULT_VIEW.type,
     sort: isSortKey(sort) ? sort : DEFAULT_VIEW.sort,
@@ -202,6 +225,7 @@ function parseView(search: string): View {
 function viewToSearch(view: View, deletedSlug: string | null): string {
   const params = new URLSearchParams();
   if (deletedSlug !== null) params.set('deleted', deletedSlug);
+  if (view.folder !== '') params.set('folder', view.folder);
   if (view.q !== '') params.set('q', view.q);
   if (view.status !== DEFAULT_VIEW.status) params.set('status', view.status);
   if (view.type !== DEFAULT_VIEW.type) params.set('type', view.type);
@@ -287,6 +311,8 @@ function applyView(projects: ProjectListItem[], view: View): ProjectListItem[] {
 export default function ProjectsPage() {
   const projectsQuery = useProjects();
   const settingsQuery = useSettings();
+  const foldersQuery = useFolders();
+  const isAdmin = useIsAdmin();
   const queryClient = useQueryClient();
   const [, navigate] = useLocation();
   const search = useSearch();
@@ -294,23 +320,58 @@ export default function ProjectsPage() {
   const [deployError, setDeployError] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
+  // Folder editing state. All of it is transient UI — the folders themselves live in the query
+  // cache — so it is plain `useState` rather than anything in the URL.
+  const [folderError, setFolderError] = useState<string | null>(null);
+  const [folderBusy, setFolderBusy] = useState(false);
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [newFolderName, setNewFolderName] = useState('');
+  const [renamingFolder, setRenamingFolder] = useState(false);
+  const [renameDraft, setRenameDraft] = useState('');
+  const [confirmingFolderDelete, setConfirmingFolderDelete] = useState(false);
+
   const baseDomain = settingsQuery.data?.base_domain ?? null;
   const deletedSlug = new URLSearchParams(search).get('deleted');
   const view = parseView(search);
 
   const projects = useMemo(() => projectsQuery.data ?? [], [projectsQuery.data]);
+  const folders = useMemo(() => foldersQuery.data ?? [], [foldersQuery.data]);
+
+  const activeFolder = folders.find((folder) => folder.slug === view.folder) ?? null;
+  /** `?folder=` names something that isn't there — deleted, or a bad link. Only once the list has
+   * actually loaded, so the real folder view doesn't flash "not found" on the way in. */
+  const folderMissing = view.folder !== '' && activeFolder === null && foldersQuery.isSuccess;
+
+  /**
+   * A search at the top level looks through EVERYTHING, folders included: a box that says "search
+   * projects" and then silently omits the ones that happen to be filed away is a box that lies.
+   * Inside a folder the search stays inside it, which is what the folder was opened for.
+   */
+  const searchingAll = activeFolder === null && view.q.trim() !== '';
+
+  /**
+   * Which projects this page is about right now. The top level lists the UNGROUPED ones under the
+   * folder cards — a foldered project is represented by its card, and listing it twice would make
+   * the counts on the page disagree with each other.
+   */
+  const scope = useMemo(() => {
+    if (activeFolder !== null) return projects.filter((project) => project.folderId === activeFolder.id);
+    if (searchingAll) return projects;
+    return projects.filter((project) => project.folderId === null);
+  }, [projects, activeFolder, searchingAll]);
+
   const visible = useMemo(
-    () => applyView(projects, view),
-    [projects, view.q, view.status, view.type, view.sort, view.dir],
+    () => applyView(scope, view),
+    [scope, view.q, view.status, view.type, view.sort, view.dir],
   );
 
-  // Counts describe the whole list, not the filtered one — a tab has to say how much is behind it,
+  // Counts describe the whole scope, not the filtered one — a tab has to say how much is behind it,
   // including the tab you are not currently standing on.
   const counts = useMemo(() => {
     const byBucket: Record<StatusBucket, number> = { live: 0, building: 0, failed: 0, idle: 0 };
-    for (const project of projects) byBucket[statusBucket(project)] += 1;
-    return { all: projects.length, ...byBucket };
-  }, [projects]);
+    for (const project of scope) byBucket[statusBucket(project)] += 1;
+    return { all: scope.length, ...byBucket };
+  }, [scope]);
 
   function setView(next: Partial<View>): void {
     // `replace` so typing in the search box doesn't bury the previous page under one history entry
@@ -365,22 +426,161 @@ export default function ProjectsPage() {
     }
   }
 
+  /** Every folder mutation ends the same way: both lists are stale (a project's `folderId` and a
+   * folder's `projectCount` are two views of one fact), so both are refetched together. */
+  async function refreshFolders(): Promise<void> {
+    await Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['projects'] }),
+      queryClient.invalidateQueries({ queryKey: ['folders'] }),
+    ]);
+  }
+
+  function folderErrorMessage(err: unknown, fallback: string): string {
+    return err instanceof ApiError ? err.message : fallback;
+  }
+
+  async function handleCreateFolder(): Promise<void> {
+    const name = newFolderName.trim();
+    if (name === '') return;
+    setFolderError(null);
+    setFolderBusy(true);
+    try {
+      const created = await createFolder(name);
+      await refreshFolders();
+      setCreatingFolder(false);
+      setNewFolderName('');
+      // Straight into the new folder: it is empty, and the next thing anyone wants is to put
+      // something in it.
+      setView({ folder: created.slug });
+    } catch (err) {
+      setFolderError(folderErrorMessage(err, 'Could not create the folder.'));
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  async function handleRenameFolder(folder: Folder): Promise<void> {
+    const name = renameDraft.trim();
+    if (name === '' || name === folder.name) {
+      setRenamingFolder(false);
+      return;
+    }
+    setFolderError(null);
+    setFolderBusy(true);
+    try {
+      await renameFolder(folder.id, name);
+      await refreshFolders();
+      setRenamingFolder(false);
+    } catch (err) {
+      setFolderError(folderErrorMessage(err, 'Could not rename the folder.'));
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  async function handleDeleteFolder(folder: Folder): Promise<void> {
+    setFolderError(null);
+    setFolderBusy(true);
+    try {
+      await deleteFolder(folder.id);
+      await refreshFolders();
+      setConfirmingFolderDelete(false);
+      setView({ folder: '' });
+    } catch (err) {
+      setFolderError(folderErrorMessage(err, 'Could not delete the folder.'));
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  async function handleMoveProject(project: ProjectListItem, folderId: number | null): Promise<void> {
+    setFolderError(null);
+    setFolderBusy(true);
+    try {
+      await patchProject(project.id, { folderId });
+      await refreshFolders();
+    } catch (err) {
+      setFolderError(folderErrorMessage(err, `Could not move ${project.name}.`));
+    } finally {
+      setFolderBusy(false);
+    }
+  }
+
+  /** Clearing filters must not also close the folder — see `View.folder`. */
+  function clearFilters(): void {
+    setView({ ...DEFAULT_VIEW, folder: view.folder });
+  }
+
   // The controls are only worth their space once there is something to narrow — a first project
   // shouldn't arrive behind a search box that can only ever find it.
-  const showControls = projects.length > 1;
+  //
+  // At the top level that test is against EVERY project, not just the ungrouped ones: with one
+  // project loose and five filed away, a scope-only test would take the search box away precisely
+  // when it is the only way to reach the other five without opening folders one at a time.
+  const showControls = scope.length > 1 || (activeFolder === null && projects.length > 1);
+
+  /** Cards belong to the top level only: inside a folder the page is already about one of them. */
+  const showFolderGrid = activeFolder === null && !searchingAll && (folders.length > 0 || creatingFolder);
+
+  const newProjectButton = (
+    <ButtonLink href="/projects/new" variant="primary">
+      <Plus size={18} strokeWidth={2} aria-hidden />
+      New project
+    </ButtonLink>
+  );
 
   return (
     <div>
-      <PageHeader
-        title="Projects"
-        subtitle="Everything Shipway deploys from your repositories"
-        actions={
-          <ButtonLink href="/projects/new" variant="primary">
-            <Plus size={18} strokeWidth={2} aria-hidden />
-            New project
-          </ButtonLink>
-        }
-      />
+      {activeFolder !== null ? (
+        <FolderHeader
+          folder={activeFolder}
+          projectCount={scope.length}
+          canManage={isAdmin}
+          busy={folderBusy}
+          renaming={renamingFolder}
+          renameDraft={renameDraft}
+          confirmingDelete={confirmingFolderDelete}
+          onRenameStart={() => {
+            setRenameDraft(activeFolder.name);
+            setRenamingFolder(true);
+          }}
+          onRenameDraftChange={setRenameDraft}
+          onRenameCancel={() => {
+            setRenamingFolder(false);
+          }}
+          onRenameSubmit={() => void handleRenameFolder(activeFolder)}
+          onDeleteRequest={() => {
+            setConfirmingFolderDelete(true);
+          }}
+          onDeleteCancel={() => {
+            setConfirmingFolderDelete(false);
+          }}
+          onDeleteConfirm={() => void handleDeleteFolder(activeFolder)}
+          actions={newProjectButton}
+        />
+      ) : (
+        <PageHeader
+          title="Projects"
+          subtitle="Everything Shipway deploys from your repositories"
+          actions={
+            <>
+              {isAdmin && (
+                <Button
+                  variant="secondary"
+                  onClick={() => {
+                    setNewFolderName('');
+                    setCreatingFolder(true);
+                  }}
+                >
+                  <FolderPlus size={18} strokeWidth={2} aria-hidden />
+                  New folder
+                </Button>
+              )}
+              {newProjectButton}
+            </>
+          }
+        />
+      )}
 
       {deletedSlug && (
         <p role="status" className="mb-4 flex items-center gap-2 text-sm text-ok">
@@ -394,6 +594,12 @@ export default function ProjectsPage() {
         </p>
       )}
 
+      {folderError && (
+        <p role="alert" className="mb-4 text-sm text-danger">
+          {folderError}
+        </p>
+      )}
+
       {projectsQuery.isPending ? (
         <ProjectsTableShell>
           <ProjectsSkeletonRows />
@@ -402,10 +608,47 @@ export default function ProjectsPage() {
         <p role="alert" className="text-sm text-danger">
           Could not load projects.
         </p>
+      ) : folderMissing ? (
+        <EmptyState
+          title="That folder is gone"
+          message="It may have been deleted. The projects that were in it are safe — they are back in the ungrouped list."
+          action={{
+            label: 'All projects',
+            onClick: () => {
+              setView({ folder: '' });
+            },
+          }}
+        />
       ) : projects.length === 0 ? (
         <ProjectsEmptyState />
       ) : (
         <div className="flex flex-col gap-4">
+          {showFolderGrid && (
+            <FolderGrid
+              folders={folders}
+              projects={projects}
+              creating={creatingFolder}
+              draft={newFolderName}
+              busy={folderBusy}
+              onDraftChange={setNewFolderName}
+              onSubmit={() => void handleCreateFolder()}
+              onCancel={() => {
+                setCreatingFolder(false);
+                setNewFolderName('');
+              }}
+            />
+          )}
+
+          {showFolderGrid && (
+            <SectionLabel className="mt-2">Ungrouped{scope.length > 0 ? ` · ${String(scope.length)}` : ''}</SectionLabel>
+          )}
+
+          {searchingAll && (
+            <p role="status" className="text-sm text-soft">
+              Searching every project, folders included.
+            </p>
+          )}
+
           {showControls && (
             <>
               <div className="flex flex-wrap items-center justify-between gap-3">
@@ -419,12 +662,10 @@ export default function ProjectsPage() {
 
                 {viewNarrows(view) && (
                   <p role="status" className="flex items-center gap-2 text-sm text-soft">
-                    {visible.length} of {projects.length}
+                    {visible.length} of {scope.length}
                     <button
                       type="button"
-                      onClick={() => {
-                        setView(DEFAULT_VIEW);
-                      }}
+                      onClick={clearFilters}
                       className="rounded font-medium text-link transition-colors duration-150 ease-out hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
                     >
                       Clear
@@ -483,16 +724,29 @@ export default function ProjectsPage() {
           )}
 
           {visible.length === 0 ? (
-            <EmptyState
-              title="No matching projects"
-              message="Nothing here matches the current search and filters."
-              action={{
-                label: 'Clear filters',
-                onClick: () => {
-                  setView(DEFAULT_VIEW);
-                },
-              }}
-            />
+            viewNarrows(view) ? (
+              <EmptyState
+                title="No matching projects"
+                message="Nothing here matches the current search and filters."
+                action={{ label: 'Clear filters', onClick: clearFilters }}
+              />
+            ) : activeFolder !== null ? (
+              <EmptyState
+                title={`Nothing in ${activeFolder.name} yet`}
+                message="Put a project in this folder with the Folder column on the projects list, or create one straight into it."
+                action={{
+                  label: 'All projects',
+                  onClick: () => {
+                    setView({ folder: '' });
+                  },
+                }}
+              />
+            ) : (
+              <EmptyState
+                title="Everything is in a folder"
+                message="No ungrouped projects left — open a folder above to see what is in it."
+              />
+            )
           ) : (
             <ProjectsTableShell sort={view.sort} dir={view.dir} onSort={toggleSort}>
               {visible.map((project) => (
@@ -500,8 +754,11 @@ export default function ProjectsPage() {
                   key={project.id}
                   project={project}
                   baseDomain={baseDomain}
+                  folders={folders}
+                  folderBusy={folderBusy}
                   deploying={deployingId === project.id}
                   onDeploy={() => void handleDeploy(project)}
+                  onMove={(folderId) => void handleMoveProject(project, folderId)}
                 />
               ))}
             </ProjectsTableShell>
@@ -596,13 +853,19 @@ function ProjectsTableShell({
 function ProjectRow({
   project,
   baseDomain,
+  folders,
+  folderBusy,
   deploying,
   onDeploy,
+  onMove,
 }: {
   project: ProjectListItem;
   baseDomain: string | null;
+  folders: Folder[];
+  folderBusy: boolean;
   deploying: boolean;
   onDeploy: () => void;
+  onMove: (folderId: number | null) => void;
 }) {
   const dotStatus: StatusDotStatus = project.lastDeployment ? DOT_STATUS_BY_DEPLOY[project.lastDeployment.status] : 'idle';
   const href = `/projects/${String(project.id)}`;
@@ -649,6 +912,32 @@ function ProjectRow({
         <Badge>{PROJECT_TYPE_LABEL[project.type]}</Badge>
       </td>
 
+      {/* Filing a project is a one-control job, so it is the control itself in the cell rather than
+          a label you have to click through to a menu to change. A native select: the list is short,
+          and it comes with keyboard and touch behaviour that a hand-rolled menu would have to
+          reimplement. */}
+      <td className="hidden px-4 lg:table-cell">
+        <div className="w-40">
+          <Select
+            aria-label={`Folder for ${project.name}`}
+            value={project.folderId === null ? '' : String(project.folderId)}
+            disabled={folderBusy}
+            onChange={(event) => {
+              const next = event.target.value;
+              onMove(next === '' ? null : Number(next));
+            }}
+            className="h-9 py-0 text-sm"
+          >
+            <option value="">No folder</option>
+            {folders.map((folder) => (
+              <option key={folder.id} value={String(folder.id)}>
+                {folder.name}
+              </option>
+            ))}
+          </Select>
+        </div>
+      </td>
+
       <td className="px-4">
         <LastDeployCell lastDeployment={project.lastDeployment} />
       </td>
@@ -670,6 +959,290 @@ function ProjectRow({
         </div>
       </td>
     </tr>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Folders
+//
+// A folder is one product — "brandspace" is a backend, a dashboard and a marketing site, three
+// repos with three subdomains that the flat list could only ever show as three unrelated rows.
+// The cards are the top level of the page and each one opens to `?folder=<slug>`, so a folder is a
+// link someone can send, and the table underneath keeps doing what it did for what is left over.
+// ---------------------------------------------------------------------------
+
+/** The card grid, plus the new-folder card when one is being made. */
+function FolderGrid({
+  folders,
+  projects,
+  creating,
+  draft,
+  busy,
+  onDraftChange,
+  onSubmit,
+  onCancel,
+}: {
+  folders: Folder[];
+  projects: ProjectListItem[];
+  creating: boolean;
+  draft: string;
+  busy: boolean;
+  onDraftChange: (value: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+      {folders.map((folder) => (
+        <FolderCard key={folder.id} folder={folder} projects={projects.filter((project) => project.folderId === folder.id)} />
+      ))}
+      {creating && <NewFolderCard draft={draft} busy={busy} onDraftChange={onDraftChange} onSubmit={onSubmit} onCancel={onCancel} />}
+    </div>
+  );
+}
+
+/**
+ * One folder. The dots are the same `StatusDot` the rows use, one per project, so a folder reports
+ * the health of what is inside it at a glance — which is the question a product-level card is
+ * actually being asked. Capped at eight with a `+n`, because past that the dots stop being
+ * countable and start being texture.
+ */
+function FolderCard({ folder, projects }: { folder: Folder; projects: ProjectListItem[] }) {
+  const shown = projects.slice(0, 8);
+  const overflow = projects.length - shown.length;
+  const lastDeployedAt = projects.reduce<number | null>((latest, project) => {
+    const at = project.lastDeployment?.finishedAt ?? null;
+    if (at === null) return latest;
+    return latest === null || at > latest ? at : latest;
+  }, null);
+
+  return (
+    <Link
+      href={`/projects?folder=${encodeURIComponent(folder.slug)}`}
+      className="group block rounded-xl border border-line bg-surface p-4 transition-colors duration-150 ease-out hover:bg-surface-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+    >
+      <div className="flex items-start justify-between gap-3">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <IconChip size={36}>
+            <FolderIcon size={18} strokeWidth={ICON_STROKE} />
+          </IconChip>
+          <div className="min-w-0">
+            <span className="block truncate text-base font-semibold text-ink transition-colors duration-150 ease-out group-hover:text-link">
+              {folder.name}
+            </span>
+            <span className="block text-xs text-soft">
+              {projects.length} {projects.length === 1 ? 'project' : 'projects'}
+            </span>
+          </div>
+        </div>
+        <ArrowRight
+          size={18}
+          strokeWidth={ICON_STROKE}
+          aria-hidden
+          className="mt-1 shrink-0 text-icon opacity-60 transition-opacity duration-150 ease-out group-hover:opacity-100"
+        />
+      </div>
+
+      <div className="mt-4 flex items-center justify-between gap-3">
+        <span className="flex items-center gap-1.5">
+          {shown.map((project) => (
+            <StatusDot
+              key={project.id}
+              status={project.lastDeployment ? DOT_STATUS_BY_DEPLOY[project.lastDeployment.status] : 'idle'}
+              label={project.name}
+            />
+          ))}
+          {overflow > 0 && <span className="text-xs text-soft">+{overflow}</span>}
+          {projects.length === 0 && <span className="text-xs text-soft">Empty</span>}
+        </span>
+        {lastDeployedAt !== null && <span className="text-xs text-soft">{formatRelativeTime(lastDeployedAt)}</span>}
+      </div>
+    </Link>
+  );
+}
+
+/** The new-folder card: the same footprint as a real one, so the grid doesn't reflow when it
+ * appears. Submitting on Enter and cancelling on Escape, because it is one field. */
+function NewFolderCard({
+  draft,
+  busy,
+  onDraftChange,
+  onSubmit,
+  onCancel,
+}: {
+  draft: string;
+  busy: boolean;
+  onDraftChange: (value: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <form
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSubmit();
+      }}
+      className="rounded-xl border border-line border-dashed bg-surface p-4"
+    >
+      <label className="block text-xs font-medium tracking-wide text-soft uppercase" htmlFor="new-folder-name">
+        New folder
+      </label>
+      <Input
+        id="new-folder-name"
+        autoFocus
+        required
+        maxLength={60}
+        value={draft}
+        placeholder="Brandspace"
+        onChange={(event) => {
+          onDraftChange(event.target.value);
+        }}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') {
+            event.preventDefault();
+            onCancel();
+          }
+        }}
+        className="mt-2"
+      />
+      <div className="mt-3 flex items-center gap-2">
+        <Button type="submit" size="sm" loading={busy} disabled={draft.trim() === ''}>
+          Create
+        </Button>
+        <Button type="button" size="sm" variant="outline" onClick={onCancel}>
+          Cancel
+        </Button>
+      </div>
+    </form>
+  );
+}
+
+/**
+ * The page header when a folder is open. Its own component rather than `PageHeader` because the
+ * title has to become an input while renaming, and because the way back out belongs above the
+ * title where a breadcrumb goes.
+ *
+ * Deleting is a two-click confirm rather than a typed one (the pattern `Danger.tsx` uses for a
+ * project): a folder holds no data of its own and its projects survive it, so the cost of an
+ * accidental click is re-making a folder, not losing anything.
+ */
+function FolderHeader({
+  folder,
+  projectCount,
+  canManage,
+  busy,
+  renaming,
+  renameDraft,
+  confirmingDelete,
+  onRenameStart,
+  onRenameDraftChange,
+  onRenameCancel,
+  onRenameSubmit,
+  onDeleteRequest,
+  onDeleteCancel,
+  onDeleteConfirm,
+  actions,
+}: {
+  folder: Folder;
+  projectCount: number;
+  canManage: boolean;
+  busy: boolean;
+  renaming: boolean;
+  renameDraft: string;
+  confirmingDelete: boolean;
+  onRenameStart: () => void;
+  onRenameDraftChange: (value: string) => void;
+  onRenameCancel: () => void;
+  onRenameSubmit: () => void;
+  onDeleteRequest: () => void;
+  onDeleteCancel: () => void;
+  onDeleteConfirm: () => void;
+  actions: ReactNode;
+}) {
+  return (
+    <div className="mb-8">
+      <Link
+        href="/projects"
+        className="inline-flex items-center gap-1.5 rounded text-sm text-soft transition-colors duration-150 ease-out hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+      >
+        <ArrowLeft size={14} strokeWidth={ICON_STROKE} aria-hidden />
+        All projects
+      </Link>
+
+      <div className="mt-2 flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          {renaming ? (
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                onRenameSubmit();
+              }}
+              className="flex flex-wrap items-center gap-2"
+            >
+              <Input
+                autoFocus
+                required
+                maxLength={60}
+                aria-label="Folder name"
+                value={renameDraft}
+                onChange={(event) => {
+                  onRenameDraftChange(event.target.value);
+                }}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') {
+                    event.preventDefault();
+                    onRenameCancel();
+                  }
+                }}
+                className="w-64"
+              />
+              <Button type="submit" size="sm" loading={busy}>
+                Save
+              </Button>
+              <Button type="button" size="sm" variant="outline" onClick={onRenameCancel}>
+                Cancel
+              </Button>
+            </form>
+          ) : (
+            <h1 className="truncate text-3xl font-semibold text-ink">{folder.name}</h1>
+          )}
+          <p className="mt-1 text-lg text-soft">
+            {projectCount} {projectCount === 1 ? 'project' : 'projects'} in this folder
+          </p>
+        </div>
+
+        <div className="flex shrink-0 items-center gap-2">
+          {canManage &&
+            !renaming &&
+            (confirmingDelete ? (
+              <>
+                <Button variant="danger" size="sm" loading={busy} onClick={onDeleteConfirm}>
+                  Delete folder
+                </Button>
+                <Button variant="outline" size="sm" onClick={onDeleteCancel}>
+                  Cancel
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="secondary" size="sm" onClick={onRenameStart}>
+                  Rename
+                </Button>
+                <Button variant="outline" size="sm" onClick={onDeleteRequest}>
+                  Delete
+                </Button>
+              </>
+            ))}
+          {actions}
+        </div>
+      </div>
+
+      {confirmingDelete && (
+        <p role="status" className="mt-3 text-sm text-soft">
+          The {projectCount} {projectCount === 1 ? 'project' : 'projects'} in this folder will go back to ungrouped. Nothing is deleted.
+        </p>
+      )}
+    </div>
   );
 }
 

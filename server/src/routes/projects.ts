@@ -1,7 +1,7 @@
 import { and, desc, eq } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { cronJobs, deployments, projectNotificationEvents, projects, workers } from '../db/schema.js';
+import { cronJobs, deployments, folders, projectNotificationEvents, projects, workers } from '../db/schema.js';
 import { sqliteFallbackPath } from '../services/envapply.js';
 import { DEFAULT_SUBSCRIBED_EVENTS } from '../services/notifybus.js';
 import { rewritePhpCommand } from './cron.js';
@@ -77,6 +77,12 @@ const publicDirSchema = z.string().refine(isValidPublicDir, { message: 'invalid 
 
 const projectIdParamsSchema = z.object({ id: z.coerce.number().int() });
 
+/** Which folder a project is filed under (`routes/folders.ts`). `null` means ungrouped, and is a
+ * value the client sends deliberately — "take it out of its folder" — so it is nullable rather
+ * than merely optional. The id is checked against the table before it is written; a FK violation
+ * would otherwise surface as a 500 on what is really a bad request. */
+const folderIdSchema = z.number().int().nullable();
+
 // `repo` (GitHub App source, "owner/name") and `repoUrl` (Task 8's Git-URL source, any http(s) git
 // URL) are mutually exclusive project sources: exactly one is required, enforced by the `.refine`
 // below rather than a zod union so a bad request always 400s with one consistent shape instead of
@@ -102,6 +108,7 @@ const createProjectSchema = z
     healthCheckPath: z.string().nullable().optional(),
     autoDeploy: z.boolean().optional(),
     notifyWebhookUrl: z.string().optional(),
+    folderId: folderIdSchema.optional(),
   })
   .refine((data) => (data.repo !== undefined) !== (data.repoUrl !== undefined), {
     message: 'exactly one of "repo" or "repoUrl" is required',
@@ -129,6 +136,7 @@ const patchProjectSchema = z
     authUser: z.string().refine(isValidAuthUser, { message: 'invalid authUser' }),
     /** Write-only: hashed into `authHash` and never stored or returned in plaintext. */
     authPassword: z.string().min(1),
+    folderId: folderIdSchema,
   })
   .partial();
 
@@ -278,6 +286,12 @@ function toPublicProject(
   return { ...rest, authPasswordSet: !!authHash };
 }
 
+/** Whether `folderId` names a real folder. Checked before the write so a stale id from a client
+ * whose folder list is a few seconds old comes back as a 400 rather than as a foreign-key 500. */
+function folderExists(app: FastifyInstance, folderId: number): boolean {
+  return app.db.select({ id: folders.id }).from(folders).where(eq(folders.id, folderId)).get() !== undefined;
+}
+
 function toErrorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -376,6 +390,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
       return reply.code(409).send({ error: 'slug already in use' });
     }
 
+    if (body.folderId != null && !folderExists(app, body.folderId)) {
+      return reply.code(400).send({ error: 'folder not found' });
+    }
+
     const defaults = defaultsForType(body.type);
     const isNodeLike = body.type === 'node' || body.type === 'nextjs';
 
@@ -419,6 +437,7 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
         autoDeploy: body.autoDeploy ?? true,
         smtpMode: 'mailpit',
         notifyWebhookUrl: body.notifyWebhookUrl ?? null,
+        folderId: body.folderId ?? null,
       })
       .run();
 
@@ -584,6 +603,10 @@ export async function projectRoutes(app: FastifyInstance): Promise<void> {
     const existing = app.db.select().from(projects).where(eq(projects.id, id)).get();
     if (!existing) {
       return reply.code(404).send({ error: 'project not found' });
+    }
+
+    if (parsed.data.folderId != null && !folderExists(app, parsed.data.folderId)) {
+      return reply.code(400).send({ error: 'folder not found' });
     }
 
     // `authPassword` is not a column: hash it here and persist `authHash` instead, so the plaintext

@@ -55,6 +55,28 @@ export const settings = sqliteTable('settings', {
   value: text('value').notNull(),
 });
 
+/**
+ * A grouping of projects that belong to one product. A product like "brandspace" is several
+ * Shipway projects — a backend, a dashboard, a marketing site — each with its own repo, subdomain
+ * and unit, and nothing in the schema said they were related; the Projects page listed them beside
+ * everything else with only a shared name prefix to hint at it.
+ *
+ * Deliberately flat (no parent_id) and deliberately not an access boundary: a folder is a label
+ * the Projects page groups by, nothing more. Who can see a project is still `project_members` /
+ * `users.project_access`, so putting a project in a folder can never widen or narrow access to it.
+ */
+export const folders = sqliteTable('folders', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  name: text('name').notNull(),
+  /** URL identity, so a folder view is a linkable `/projects?folder=<slug>`. Derived from `name` on
+   * create and left alone by a later rename: an existing link keeps working, which is the whole
+   * reason the URL carries the slug and not the name. */
+  slug: text('slug').notNull().unique(),
+  createdAt: integer('created_at', { mode: 'number' })
+    .notNull()
+    .$defaultFn(() => Date.now()),
+});
+
 export const projects = sqliteTable('projects', {
   id: integer('id').primaryKey({ autoIncrement: true }),
   name: text('name').notNull(),
@@ -73,6 +95,13 @@ export const projects = sqliteTable('projects', {
    * applied in exactly one place.
    */
   subdomain: text('subdomain').unique(),
+  /** Which product this project is part of (see `folders`). `NULL` — the default, and the value on
+   * every row that predates this column — means ungrouped, which is a first-class state and not a
+   * missing value: an instance that never makes a folder shows the same flat list it always did.
+   *
+   * `set null` and not `cascade`: deleting a folder is a filing decision, and must never be a way
+   * to delete the projects inside it. */
+  folderId: integer('folder_id').references(() => folders.id, { onDelete: 'set null' }),
   repo: text('repo').notNull(), // "owner/name"
   branch: text('branch').notNull(),
   type: text('type', { enum: ['php', 'node', 'nextjs', 'static'] }).notNull(),

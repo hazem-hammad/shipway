@@ -48,6 +48,7 @@ import {
   type CreateProjectBody,
   type DatabaseListItem,
   type DbConnection,
+  type Folder,
   type DnsOutcome,
   type GithubRepo,
   type ProjectSmtpMode,
@@ -59,6 +60,7 @@ import {
   useCloudflareVerify,
   useDatabases,
   useDbConnections,
+  useFolders,
   useGitBranches,
   useGithubBranches,
   useGithubDirs,
@@ -479,6 +481,8 @@ export default function ProjectNewPage() {
   const [, navigate] = useLocation();
   const settingsQuery = useSettings();
   const cloudflareQuery = useCloudflareVerify();
+  const foldersQuery = useFolders();
+  const folders = foldersQuery.data ?? [];
 
   const [step, setStep] = useState<'source' | 'configure'>('source');
   const [sourceTab, setSourceTab] = useState<'github' | 'url'>('github');
@@ -524,6 +528,10 @@ export default function ProjectNewPage() {
 
   const [name, setName] = useState('');
   const [slug, setSlug] = useState('');
+  /** Which folder the project is filed into as it is created — `null` for ungrouped. A project
+   * that is the third piece of an existing product is usually created knowing that, so asking here
+   * saves a trip back to the list to file it afterwards. */
+  const [folderId, setFolderId] = useState<number | null>(null);
   const [slugTouched, setSlugTouched] = useState(false);
   const [slugApiError, setSlugApiError] = useState<string | null>(null);
 
@@ -920,6 +928,7 @@ export default function ProjectNewPage() {
       ...(showPublicDir ? { publicDir } : {}),
       ...(type === 'php' ? { phpVersion } : {}),
       ...(isNodeLike ? { nodeVersion, startCmd } : {}),
+      folderId,
     };
 
     try {
@@ -1130,7 +1139,16 @@ export default function ProjectNewPage() {
           {/* Name/slug first: the project's domain, its suggested database name, and the APP_URL in
               the env below are all derived from the slug, so they should be settled before the user
               reads any of them. */}
-          <ProjectNameCard name={name} slug={slug} slugError={slugError} onNameChange={handleNameChange} onSlugChange={handleSlugChange} />
+          <ProjectNameCard
+            name={name}
+            slug={slug}
+            slugError={slugError}
+            folders={folders}
+            folderId={folderId}
+            onNameChange={handleNameChange}
+            onSlugChange={handleSlugChange}
+            onFolderChange={setFolderId}
+          />
 
           <FrameworkTiles type={type} onChange={handleTypeChange} />
 
@@ -2350,14 +2368,20 @@ function ProjectNameCard({
   name,
   slug,
   slugError,
+  folders,
+  folderId,
   onNameChange,
   onSlugChange,
+  onFolderChange,
 }: {
   name: string;
   slug: string;
   slugError: string | undefined;
+  folders: Folder[];
+  folderId: number | null;
   onNameChange: (v: string) => void;
   onSlugChange: (v: string) => void;
+  onFolderChange: (id: number | null) => void;
 }) {
   return (
     <Card>
@@ -2369,6 +2393,25 @@ function ProjectNameCard({
         <Field label="Subdomain" hint={slugError ? undefined : 'Lowercase letters, numbers, and hyphens.'} error={slugError}>
           <Input mono required value={slug} onChange={(event) => onSlugChange(event.target.value)} />
         </Field>
+        {/* Only once there is somewhere to file it: a folder picker with nothing in it is a control
+            that can only be left alone. Folders are made on the Projects page. */}
+        {folders.length > 0 && (
+          <Field label="Folder" hint="Groups this project with the rest of its product on the Projects page.">
+            <Select
+              value={folderId === null ? '' : String(folderId)}
+              onChange={(event) => {
+                onFolderChange(event.target.value === '' ? null : Number(event.target.value));
+              }}
+            >
+              <option value="">No folder</option>
+              {folders.map((folder) => (
+                <option key={folder.id} value={String(folder.id)}>
+                  {folder.name}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
       </div>
     </Card>
   );

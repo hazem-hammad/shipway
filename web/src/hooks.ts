@@ -21,6 +21,7 @@ import {
   fetchProject,
   fetchProjectEnv,
   fetchProjectEnvPreview,
+  fetchFolders,
   fetchProjects,
   fetchServerStats,
   fetchServicesInfo,
@@ -36,6 +37,7 @@ import {
   type DatabaseListItem,
   type DbConnection,
   type Deployment,
+  type Folder,
   type GitRemoteBranches,
   type GithubRepo,
   type GithubStatus,
@@ -129,6 +131,14 @@ export function useProjects(): UseQueryResult<ProjectListItem[]> {
     refetchInterval: (query) =>
       query.state.data?.some((project) => isPendingDeploymentStatus(project.lastDeployment?.status)) ? 10_000 : false,
   });
+}
+
+/**
+ * The folders the Projects page groups by (`GET /api/folders`). Unpolled: folders change when
+ * someone makes one, not on their own, and every mutation invalidates this key.
+ */
+export function useFolders(): UseQueryResult<Folder[]> {
+  return useQuery({ queryKey: ['folders'], queryFn: fetchFolders });
 }
 
 /**

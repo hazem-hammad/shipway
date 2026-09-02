@@ -168,6 +168,12 @@ function metaStr(meta: unknown, key: string): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
 
+/** The numeric counterpart of `metaStr` — meta is JSON, so a count recorded as a number stays one. */
+function metaNum(meta: unknown, key: string): number | undefined {
+  const value = metaObj(meta)[key];
+  return typeof value === 'number' ? value : undefined;
+}
+
 const ACTION_SENTENCES: Record<string, (row: AuditEvent) => string> = {
   'audit.config': (row) => `${row.actorName} changed the audit log settings`,
   'auth.login_failed': (row) => `${row.actorName} failed to sign in`,
@@ -188,6 +194,17 @@ const ACTION_SENTENCES: Record<string, (row: AuditEvent) => string> = {
   'notification.migrated': (row) => `${row.actorName} migrated the legacy webhook to a notification channel`,
   'notification.subscribe': (row) => `${row.actorName} subscribed a channel to ${humanizeEventKey(row.targetName.split(':')[0] ?? row.targetName)} notifications`,
   'notification.unsubscribe': (row) => `${row.actorName} unsubscribed a channel from ${humanizeEventKey(row.targetName.split(':')[0] ?? row.targetName)} notifications`,
+  'folder.create': (row) => `${row.actorName} created folder ${row.targetName}`,
+  'folder.update': (row) => {
+    const from = metaStr(row.meta, 'from');
+    return from ? `${row.actorName} renamed folder ${from} to ${row.targetName}` : `${row.actorName} renamed folder ${row.targetName}`;
+  },
+  'folder.delete': (row) => {
+    const released = metaNum(row.meta, 'releasedProjects') ?? 0;
+    return released > 0
+      ? `${row.actorName} deleted folder ${row.targetName}, ungrouping ${String(released)} project${released === 1 ? '' : 's'}`
+      : `${row.actorName} deleted folder ${row.targetName}`;
+  },
   'project.create': (row) => `${row.actorName} created project ${row.targetName}`,
   'project.update': (row) => `${row.actorName} updated project ${row.targetName}`,
   'project.scripts.update': (row) => `${row.actorName} updated the deploy scripts for ${row.targetName}`,
