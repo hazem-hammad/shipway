@@ -238,7 +238,7 @@ export function renderNginxVhost(i: VhostInput): string {
     `    ssl_certificate /etc/letsencrypt/live/${i.certName}/fullchain.pem;`,
     `    ssl_certificate_key /etc/letsencrypt/live/${i.certName}/privkey.pem;`,
     ``,
-    `    client_max_body_size 100m;`,
+    `    client_max_body_size 200m;`,
     ``,
     `    access_log /var/log/nginx/shipway-${i.slug}.access.log;`,
     `    error_log /var/log/nginx/shipway-${i.slug}.error.log;`,

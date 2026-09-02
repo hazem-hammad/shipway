@@ -64,6 +64,16 @@ readonly SHIPWAY_DIR=/opt/shipway
 readonly NODE_VERSIONS=(18 20 22)
 readonly PHP_VERSIONS=(8.1 8.2 8.3 8.4)
 readonly PHP_EXTENSIONS=(fpm cli mysql pgsql sqlite3 redis mbstring xml curl zip gd bcmath intl)
+# Upload ceiling every PHP-FPM pool is configured with (configure_php_limits). Deliberately the
+# same figure as the vhosts' `client_max_body_size`, so a file that is too big is refused by
+# whichever of nginx and PHP sees it first instead of one accepting what the other then rejects.
+readonly PHP_MAX_UPLOAD=200M
+# A multipart POST is buffered in memory while PHP parses it, so this has to clear PHP_MAX_UPLOAD
+# with room to spare or a full-size upload dies after nginx has already accepted it.
+readonly PHP_MEMORY_LIMIT=512M
+# Matches the fastcgi_read_timeout the dashboard vhost sets for phpMyAdmin, so a slow import is not
+# cut short by whichever half of that pair has the lower ceiling.
+readonly PHP_MAX_INPUT_SECONDS=300
 # phpMyAdmin, served at ship.<base-domain>/db/phpmyadmin. Checksum is the one phpmyadmin.net
 # publishes alongside the tarball, verified before anything is extracted.
 #
@@ -313,6 +323,33 @@ install_php_bin_shims() {
   for v in "${PHP_VERSIONS[@]}"; do
     install -d -m 0755 "/opt/php/${v}/bin"
     ln -sf "/usr/bin/php${v}" "/opt/php/${v}/bin/php"
+  done
+}
+
+# Writes /etc/php/<version>/fpm/conf.d/99-shipway.ini for every installed PHP version. Debian's
+# stock php.ini allows a 2M upload inside an 8M POST, which is the ceiling actually behind a
+# "file too large" in phpMyAdmin's import tab or in a project's own upload form long before
+# nginx's client_max_body_size comes into it.
+#
+# A conf.d drop-in rather than an edit to php.ini: the ini is a dpkg conffile, so editing it earns
+# a merge prompt on every PHP upgrade, while conf.d is read afterwards and is left alone. The 99-
+# prefix sorts it last, so it wins over anything the extension packages drop in beside it.
+configure_php_limits() {
+  log "setting PHP upload limit to ${PHP_MAX_UPLOAD} (${PHP_VERSIONS[*]})"
+  local v
+  for v in "${PHP_VERSIONS[@]}"; do
+    [[ -d "/etc/php/${v}/fpm/conf.d" ]] || continue
+    cat > "/etc/php/${v}/fpm/conf.d/99-shipway.ini" <<PHPINI
+; Managed by Shipway (setup/install.sh, configure_php_limits). Rewritten on every run.
+upload_max_filesize = ${PHP_MAX_UPLOAD}
+post_max_size = ${PHP_MAX_UPLOAD}
+memory_limit = ${PHP_MEMORY_LIMIT}
+max_execution_time = ${PHP_MAX_INPUT_SECONDS}
+max_input_time = ${PHP_MAX_INPUT_SECONDS}
+PHPINI
+    # try-restart and not restart: on a re-run against a host where an FPM version is deliberately
+    # stopped, this should leave it stopped rather than quietly starting it.
+    systemctl try-restart "php${v}-fpm"
   done
 }
 
@@ -1267,6 +1304,7 @@ consoles_only() {
   fi
   [[ -n "$BASE_DOMAIN" ]] || die "a base domain is required"
 
+  configure_php_limits
   install_phpmyadmin
   install_db_signon
   install_pgadmin
@@ -1299,6 +1337,7 @@ main() {
   install_base_packages
   install_php
   install_php_bin_shims
+  configure_php_limits
   install_composer
 
   install_databases

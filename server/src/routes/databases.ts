@@ -55,7 +55,7 @@ const injectBodySchema = z.object({ projectId: z.number().int() });
  * is too big is refused by whichever of the two sees it first with the same number in the message
  * rather than by nginx with a bare 413 the dashboard can't explain.
  */
-const MAX_IMPORT_BYTES = 100 * 1024 * 1024;
+const MAX_IMPORT_BYTES = 200 * 1024 * 1024;
 
 /** What an uploaded dump is posted as. `application/sql` and not `text/plain`, so the raw parser
  * below can be added without changing how anything else in the API is read. */

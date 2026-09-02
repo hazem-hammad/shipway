@@ -136,8 +136,8 @@ describe('renderNginxVhost — shared across all vhost types', () => {
     expect(out).toContain('return 301 https://$host$request_uri;');
   });
 
-  it('emits client_max_body_size 100m', () => {
-    expect(renderNginxVhost(base)).toContain('client_max_body_size 100m;');
+  it('emits client_max_body_size 200m', () => {
+    expect(renderNginxVhost(base)).toContain('client_max_body_size 200m;');
   });
 
   it('emits access_log and error_log named by slug', () => {
