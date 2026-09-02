@@ -932,7 +932,7 @@ const SQL_CONTENT_TYPE = 'application/sql';
 
 /** Largest dump the server will accept (`MAX_IMPORT_BYTES` in `routes/databases.ts`), so the
  * dashboard can say so before spending minutes uploading one it will refuse. */
-export const MAX_SQL_IMPORT_BYTES = 100 * 1024 * 1024;
+export const MAX_SQL_IMPORT_BYTES = 200 * 1024 * 1024;
 
 export interface RedisInfo {
   host: string;
