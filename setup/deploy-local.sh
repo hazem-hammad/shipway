@@ -232,6 +232,13 @@ if [[ -n "$pgadmin_drift" ]]; then
   done
 fi
 
+# Cheap, idempotent, and root-only: re-grants www-data AND deployer write access on every PHP
+# project's shared runtime directories. A deploy (running as deployer) cannot set an ACL on a file
+# php-fpm owns, so a host provisioned before the deployer half of that grant existed keeps a
+# storage/logs/laravel.log its own queue workers cannot append to. See setup/repair-app-acls.sh.
+log "repairing app runtime ACLs"
+"${REPO_ROOT}/setup/repair-app-acls.sh"
+
 log "installing dependencies (as deployer)"
 sudo -u deployer bash -lc "export PATH=${NODE_BIN}:\$PATH && cd ${SHIPWAY_DIR} && npm ci"
 

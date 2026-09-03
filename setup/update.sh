@@ -48,6 +48,12 @@ sudo -u deployer git pull --ff-only
 
 sudo -u deployer bash -lc "export PATH=/opt/node/22/bin:\$PATH && cd /opt/shipway && npm ci && npm run build"
 
+# Re-grants www-data AND deployer write access on every PHP project's shared runtime directories:
+# a deploy runs as deployer and cannot set an ACL on a file php-fpm owns, so a host provisioned
+# before the deployer half of that grant existed keeps a storage/logs/laravel.log its own queue
+# workers cannot append to. Idempotent; see setup/repair-app-acls.sh.
+/opt/shipway/setup/repair-app-acls.sh
+
 systemctl restart shipway
 
 echo "update.sh: done."

@@ -327,6 +327,14 @@ async function runScript(
  */
 const WEB_USER = 'www-data';
 
+/**
+ * The user everything Shipway runs runs as: the deploy itself, and — via the `User=deployer` in
+ * every unit `system/templates.ts` renders — each app process and each queue worker. So for a PHP
+ * project it is the *second* user writing into `shared/`, alongside php-fpm's `www-data`: an
+ * `artisan queue:work` worker appends to the same `storage/logs/laravel.log` a web request does.
+ */
+const DEPLOY_USER = 'deployer';
+
 /** Laravel compiles its package/service manifests here, and writes them at runtime if a deploy
  * didn't. Relative to the release, not shared: it is per-release build output. */
 const PHP_RUNTIME_WRITE_PATHS = ['bootstrap/cache'];
@@ -342,13 +350,21 @@ function shellQuote(value: string): string {
 }
 
 /**
- * Gives php-fpm write access to the paths a PHP app writes to while it is *running*.
+ * Gives both users that write into a PHP app at runtime — php-fpm's `www-data` and Shipway's own
+ * `deployer` — write access to the paths it writes to while it is *running*.
  *
  * The deploy runs as `deployer` and everything it creates is `deployer:deployer` 0755, but the
- * requests that follow are served as `www-data` — so without this a Laravel app comes up and dies
- * on its first page render with "Failed to open stream: Permission denied" trying to compile a
- * Blade view. The build itself never hits this, which is what makes the failure so easy to ship: a
- * fully green deploy, and a 500 on the first request.
+ * requests that follow are served as `www-data` — so without the `www-data` half a Laravel app
+ * comes up and dies on its first page render with "Failed to open stream: Permission denied"
+ * trying to compile a Blade view. The build itself never hits this, which is what makes the
+ * failure so easy to ship: a fully green deploy, and a 500 on the first request.
+ *
+ * The `deployer` half is the mirror image, and it is not redundant even though `deployer` owns
+ * these directories: a file php-fpm creates inside them at runtime is owned `www-data:www-data`
+ * with php-fpm's 022 umask, i.e. group- and other-readable but writable by nobody else. Directory
+ * ownership grants nothing over a file inside it. So `storage/logs/laravel.log`, first written by
+ * a web request, is a file the project's own queue workers (`User=deployer`) then cannot append
+ * to: `artisan queue:work` dies on its first log line, restarts, and dies again.
  *
  * POSIX ACLs rather than `chown`/`chgrp`: the `default:` entries make everything *later* created
  * inside these directories carry the same access, so a file written by `www-data` at runtime and a
@@ -358,11 +374,18 @@ function shellQuote(value: string): string {
  * no privilege is needed to set this; `X` (capital) grants directory traversal without marking
  * every plain file executable.
  *
+ * The one thing this cannot repair by itself is a file that already exists, is owned by `www-data`,
+ * and lacks the entries: changing an ACL takes ownership, not write access, so `setfacl` reports
+ * "Operation not permitted" for it and the warning below fires. That is a host provisioned before
+ * this grant existed; `setup/repair-app-acls.sh` repairs those once, as root. Files created *after* the
+ * default entries are in place inherit them, and `setfacl` skips a file whose ACL already says
+ * what it is being asked to say — so the recursive pass here stays quiet once a tree is healthy.
+ *
  * Failure is logged, not fatal: a PHP project that never writes anything at runtime deploys fine
  * without this, and refusing to release working code over it would be the wrong trade. The log line
  * is what points at this when an app does need it.
  */
-async function grantWebWriteAccess(
+async function grantRuntimeWriteAccess(
   deps: PipelineDeps,
   project: ProjectRow,
   projectDir: string,
@@ -388,21 +411,24 @@ async function grantWebWriteAccess(
     return;
   }
 
+  const users = [WEB_USER, DEPLOY_USER];
+  const entries = users.map((user) => `-m u:${user}:rwX -m d:u:${user}:rwX`).join(' ');
   const quoted = targets.map(shellQuote).join(' ');
   const { exitCode } = await deps.runShell(
-    `setfacl -R -m u:${WEB_USER}:rwX -m d:u:${WEB_USER}:rwX -- ${quoted}`,
+    `setfacl -R ${entries} -- ${quoted}`,
     { cwd: releaseDir, env, signal, onOutput: (line) => { logger.line(line); } },
   );
 
   if (exitCode !== 0) {
     logger.line(
-      `WARNING: could not grant ${WEB_USER} write access to ${targets.join(', ')} (setfacl exited ${String(exitCode)}). ` +
-        'A PHP app that writes at runtime (Laravel\'s storage/, for one) will fail with "Permission denied" on its first request.',
+      `WARNING: could not grant ${users.join(' and ')} write access to ${targets.join(', ')} (setfacl exited ${String(exitCode)}). ` +
+        'A PHP app that writes at runtime (Laravel\'s storage/, for one) will fail with "Permission denied" on its first request, ' +
+        'and its queue workers will fail on their first log line.',
     );
     return;
   }
 
-  logger.line(`granted ${WEB_USER} write access to ${targets.join(', ')}`);
+  logger.line(`granted ${users.join(' and ')} write access to ${targets.join(', ')}`);
 }
 
 /**
@@ -656,7 +682,7 @@ async function runBuildPhase(
     // first request to reach the new release already has somewhere to write.
     logger.section('permissions');
     checkAborted(signal);
-    await grantWebWriteAccess(deps, project, projectDir, releaseDir, shellEnv, signal, logger);
+    await grantRuntimeWriteAccess(deps, project, projectDir, releaseDir, shellEnv, signal, logger);
 
     return { releaseDir, commitMessage: message };
   } catch (err) {

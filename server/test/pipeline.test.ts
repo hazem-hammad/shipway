@@ -413,12 +413,12 @@ describe('runDeploy — happy path (php)', () => {
     expect(fs.lstatSync(storageLink).isSymbolicLink()).toBe(true);
     expect(fs.realpathSync(storageLink)).toBe(fs.realpathSync(path.join(cfg.appsDir, 'shop', 'shared', 'storage')));
 
-    // install ran in the release dir, then the php runtime was given write access to what it
-    // writes at runtime (see `grantWebWriteAccess`).
+    // install ran in the release dir, then both runtime users were given write access to what the
+    // app writes at runtime (see `grantRuntimeWriteAccess`).
     expect(shell.calls).toEqual([
       { cmd: 'composer install', cwd: releaseDir },
       {
-        cmd: `setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX -- '${path.join(cfg.appsDir, 'shop', 'shared', 'storage')}'`,
+        cmd: `setfacl -R -m u:www-data:rwX -m d:u:www-data:rwX -m u:deployer:rwX -m d:u:deployer:rwX -- '${path.join(cfg.appsDir, 'shop', 'shared', 'storage')}'`,
         cwd: releaseDir,
       },
     ]);
@@ -483,6 +483,11 @@ describe('runDeploy — runtime write access for php', () => {
     // by deployer on the next deploy both stay accessible to the other.
     expect(setfacl?.cmd).toContain('-m u:www-data:rwX');
     expect(setfacl?.cmd).toContain('-m d:u:www-data:rwX');
+    // And deployer, not just www-data: php-fpm creates storage/logs/laravel.log as www-data:www-data
+    // with a 022 umask, and the project's queue workers run as deployer — without this entry they
+    // die on their first log line.
+    expect(setfacl?.cmd).toContain('-m u:deployer:rwX');
+    expect(setfacl?.cmd).toContain('-m d:u:deployer:rwX');
     // Every shared path, plus the release's own bootstrap/cache.
     expect(setfacl?.cmd).toContain(`'${path.join(cfg.appsDir, 'shop', 'shared', 'storage')}'`);
     expect(setfacl?.cmd).toContain(`'${path.join(cfg.appsDir, 'shop', 'shared', 'uploads')}'`);
@@ -536,7 +541,7 @@ describe('runDeploy — runtime write access for php', () => {
     logger.on('line', (l: string) => lines.push(l));
 
     expect(await runDeploy(deps, deploymentId, logger, new AbortController().signal)).toBe('success');
-    expect(lines.join('\n')).toContain('WARNING: could not grant www-data write access');
+    expect(lines.join('\n')).toContain('WARNING: could not grant www-data and deployer write access');
   });
 
   it('quotes a shared path containing a single quote instead of breaking the command', async () => {
